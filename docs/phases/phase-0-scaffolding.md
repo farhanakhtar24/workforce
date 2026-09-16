@@ -55,13 +55,15 @@ Rate yourself **🟢 / 🟡 / 🔴** next to each. This phase is mostly review �
 ## Scaffold checklist (tick when done)
 
 - [x] Folder structure in place
-- [ ] Root `package.json` (workspaces: `apps/*`, `packages/*`)
-- [ ] Root `tsconfig.json` with `strict: true`
-- [ ] `.gitignore` (node_modules, .env, dist, .next)
-- [ ] `.nvmrc` → `20`
-- [ ] `.editorconfig`
-- [ ] `docs/` skeleton complete
-- [ ] Git init + first commit
+- [x] Root `package.json` (workspaces: `apps/*`, `packages/*`)
+- [x] Root `tsconfig.json` with `strict: true`
+- [x] `.gitignore` (node_modules, .env, dist, .next)
+- [x] `.nvmrc` → `20`
+- [x] `.editorconfig`
+- [x] `docs/` skeleton complete
+- [x] Git init + first commit
+- [ ] Self-assessment ratings filled in above
+- [ ] Q&A: can answer the 4 "what you should be able to answer" questions
 
 ---
 
