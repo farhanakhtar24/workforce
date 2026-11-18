@@ -307,6 +307,36 @@ test('aborts after timeoutMs and throws a key-safe timeout error', async () => {
   assert.ok(aborted, 'abort signal must have fired');
 });
 
+test('maps a stalled body read aborted after headers to the key-safe timeout error', async () => {
+  const cfg: Config = { ...config, timeoutMs: 30 };
+
+  // Deterministic: fetch resolves (headers arrived), but text() stays pending
+  // until the request controller's abort signal fires, then rejects with an
+  // AbortError — no server, no network, no timers beyond the client's own.
+  const fetchImpl: typeof fetch = (_input, init) => {
+    const signal = init?.signal;
+    const stalled = {
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            reject(new DOMException('This operation was aborted', 'AbortError'));
+          });
+        }),
+    };
+    return Promise.resolve(stalled as unknown as Response);
+  };
+
+  const client = createOllamaClient(cfg, fetchImpl);
+
+  await assert.rejects(client.complete(baseMessages, []), (error: Error) => {
+    assert.match(error.message, /timed out after 30ms/);
+    assert.ok(!error.message.includes('dummy-key-123'), 'must never leak the API key');
+    return true;
+  });
+});
+
 test('non-abort fetch rejections propagate without leaking the key', async () => {
   const fetchImpl: typeof fetch = async () => {
     throw new Error('socket hang up');

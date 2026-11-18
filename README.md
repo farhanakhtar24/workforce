@@ -95,8 +95,19 @@ Full curriculum: [`docs/learning/CURRICULUM.md`](./docs/learning/CURRICULUM.md).
 ## Quick start
 
 ```bash
-# Phase 0 (current) — nothing to run yet
-# Phase 1 onwards, see docs/phases/
+# Phase 1 (LLM core) — work in progress
+
+npm install
+
+# Set your own API key in your shell (no default; never commit it):
+export OLLAMA_API_KEY="..."
+
+# Run the Phase 1 CLI (REPL against Ollama Cloud):
+npm run dev --workspace @workforce/cli
+
+# Offline tests and CLI build:
+npm test
+npm run build --workspace @workforce/cli
 ```
 
 ---

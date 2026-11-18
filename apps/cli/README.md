@@ -117,7 +117,7 @@ Tool results always sit directly after the assistant `tool_calls` they answer, a
 | Request exceeds `OLLAMA_TIMEOUT_MS` | Treated as a per-turn error (`request timed out after Nms`), same recovery as above. |
 | 10 LLM round-trips in one user turn | The loop executes any pending tool calls, records them in history, then returns a stop message; the CLI prints it as `[stop]` on stderr, not as model output. The turn counter resets on the next user message. |
 
-Stack traces and configuration values (including the API key) are never printed.
+Stack traces are omitted from normal errors, and secrets (including the API key) are never logged. Non-secret configuration such as the model name and the timeout value intentionally appear in output and error messages (for example, a timeout error reports the configured `Nms` value).
 
 ## Scope note
 

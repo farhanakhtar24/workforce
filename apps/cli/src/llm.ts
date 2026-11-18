@@ -133,7 +133,23 @@ export function createOllamaClient(
           throw new Error('Ollama Cloud request failed with a non-Error rejection');
         }
 
-        const raw: string = await response.text();
+        let raw: string;
+        try {
+          raw = await response.text();
+        } catch (error) {
+          if (controller.signal.aborted) {
+            throw new Error(
+              `Ollama Cloud request timed out after ${config.timeoutMs}ms`,
+            );
+          }
+          // A body-read failure unrelated to our abort re-throws the original
+          // error: the key only ever travels in the header, and text() errors
+          // decode the body stream, never the request.
+          if (error instanceof Error) {
+            throw error;
+          }
+          throw new Error('Ollama Cloud request failed with a non-Error rejection');
+        }
 
         if (!response.ok) {
           throw new Error(

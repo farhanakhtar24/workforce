@@ -2,8 +2,8 @@
  * Tool registry for the Workforce agent loop.
  *
  * Phase 1 registers exactly one tool: `calculate`. The agent loop reads
- * `registeredTools` to build the `tools` payload for the LLM and uses
- * `toolRegistry.get(name)` to dispatch incoming tool calls.
+ * `registeredTools` to build the `tools` payload for the LLM and dispatches
+ * incoming tool calls through its own Map built from the tools it was given.
  */
 
 import type { ToolDefinition, ToolRegistry } from '../types.js';
