@@ -144,6 +144,20 @@ test('compactor maps 1001-char output to COMPACTION_OUTPUT_TOO_LONG and exposes 
   );
 });
 
+/** Shared prompt-text extraction used by multi-call capture tests. */
+function capturedPromptText(options: { prompt: unknown }): string {
+  const messages = options.prompt as ReadonlyArray<{
+    content: string | ReadonlyArray<{ type: string; text?: string }>;
+  }>;
+  const firstMessage = messages.at(0);
+  const firstPart = typeof firstMessage?.content === 'string'
+    ? undefined
+    : Array.isArray(firstMessage?.content)
+      ? firstMessage.content[0]
+      : undefined;
+  return firstPart?.type === 'text' ? (firstPart.text ?? '') : JSON.stringify(options.prompt);
+}
+
 test('compactor prompt carries oldest block contents, scope/path, and plain-text rules', async () => {
   let capturedPrompt = '';
   const model = new MockLanguageModelV3({
@@ -175,9 +189,154 @@ test('compactor prompt carries oldest block contents, scope/path, and plain-text
   assert.ok(capturedPrompt.includes('default'));
   assert.ok(capturedPrompt.includes('no JSON'));
   assert.ok(capturedPrompt.includes('1000'));
-  assert.ok(capturedPrompt.includes('700-900'));
+  assert.ok(capturedPrompt.includes('500-700'));
   // Prompt asks for plain text, never JSON/structured output/tools.
   assert.ok(!capturedPrompt.includes('tool_choice'));
+  // Synthesis framing, not the overlong "keep every fact" framing.
+  assert.ok(capturedPrompt.includes('Synthesize'));
+  assert.ok(!capturedPrompt.includes('Keep every fact'));
+});
+
+test('valid first draft returns after exactly one provider call', async () => {
+  let calls = 0;
+  const model = new MockLanguageModelV3({
+    provider: 'mock',
+    modelId: 'mock-compactor',
+    doGenerate: async () => {
+      calls += 1;
+      return {
+        finishReason: { unified: 'stop', raw: undefined },
+        content: [{ type: 'text', text: 'summary' }],
+        usage: mockUsage(),
+        warnings: [],
+      };
+    },
+  });
+  const compactor = createOllamaCompactor({ model });
+  const summary = await compactor.compact(compactionRequest());
+  assert.equal(summary, 'summary');
+  assert.equal(calls, 1);
+});
+
+test('overlong first draft triggers exactly one repair call with the draft only', async () => {
+  const draft = 'DRAFT-MARKER' + 'x'.repeat(1200);
+  const calls: Array<{ prompt: string; abortSignal?: AbortSignal; options: unknown }> = [];
+  let call = 0;
+  const model = new MockLanguageModelV3({
+    provider: 'mock',
+    modelId: 'mock-compactor',
+    doGenerate: async (options) => {
+      call += 1;
+      calls.push({
+        prompt: capturedPromptText(options),
+        abortSignal: options.abortSignal,
+        options: {
+          providerOptions: options.providerOptions,
+          maxOutputTokens: options.maxOutputTokens,
+          temperature: options.temperature,
+          tools: options.tools,
+          toolChoice: options.toolChoice,
+        },
+      });
+      return {
+        finishReason: { unified: 'stop', raw: undefined },
+        content: [{ type: 'text', text: call === 1 ? draft : 'tight synthesis' }],
+        usage: mockUsage(),
+        warnings: [],
+      };
+    },
+  });
+  const compactor = createOllamaCompactor({ model });
+  const summary = await compactor.compact(compactionRequest());
+  assert.equal(summary, 'tight synthesis');
+  // Exactly one extra call: never a third call, never a resend of sources.
+  assert.equal(calls.length, 2);
+  // Repair prompt: carries the overlong draft, the 500-700 target and the
+  // hard 1000 limit, and none of the source-block text (the draft does not
+  // contain it either, so any source leak would be detectable).
+  const repairPrompt = calls[1]!.prompt;
+  assert.ok(repairPrompt.includes('DRAFT-MARKER'));
+  assert.ok(repairPrompt.includes('500-700'));
+  assert.ok(repairPrompt.includes(String(1000)));
+  assert.ok(!repairPrompt.includes('Atlas runs Postgres 16.'));
+  assert.ok(!repairPrompt.includes('Atlas runs Postgres 18.'));
+  // Both calls share the SAME abort signal object and identical generation
+  // options.
+  assert.ok(calls[0]!.abortSignal instanceof AbortSignal);
+  assert.equal(calls[1]!.abortSignal, calls[0]!.abortSignal);
+  assert.deepEqual(calls[1]!.options, calls[0]!.options);
+});
+
+test('draft overlong twice fails COMPACTION_OUTPUT_TOO_LONG after exactly two calls', async () => {
+  const firstSentinel = 'FIRST-LOREM-MARKER';
+  const repairSentinel = 'REPAIR-LOREM-MARKER';
+  let call = 0;
+  const model = new MockLanguageModelV3({
+    provider: 'mock',
+    modelId: 'mock-compactor',
+    doGenerate: async () => {
+      call += 1;
+      return {
+        finishReason: { unified: 'length', raw: undefined },
+        content: [{ type: 'text', text: `${call === 1 ? firstSentinel : repairSentinel}${'x'.repeat(1100)}` }],
+        usage: mockUsage(),
+        warnings: [],
+      };
+    },
+  });
+  const compactor = createOllamaCompactor({ model });
+  await assert.rejects(
+    () => compactor.compact(compactionRequest()),
+    (thrown: unknown) => {
+      assert.ok(thrown instanceof CompactionOutputError);
+      assert.equal(thrown.code, 'COMPACTION_OUTPUT_TOO_LONG');
+      assert.equal(thrown.name, 'CompactionOutputError');
+      // Fixed safe surface only: draft, source text, URLs, cause absent.
+      assert.ok(!thrown.message.includes('FIRST-LOREM-MARKER'));
+      assert.ok(!thrown.message.includes('REPAIR-LOREM-MARKER'));
+      assert.ok(!thrown.message.includes('xxxxx'));
+      assert.ok(!thrown.message.includes('Atlas runs Postgres'));
+      assert.ok(!thrown.message.includes('http'));
+      assert.ok(!('cause' in thrown));
+      return true;
+    },
+  );
+  assert.equal(call, 2);
+});
+
+test('overlong first then empty second keeps deterministic empty codes (2 calls)', async () => {
+  const draft = 'y'.repeat(1100);
+  for (const finishReason of ['length', 'stop'] as const) {
+    let call = 0;
+    const model = new MockLanguageModelV3({
+      provider: 'mock',
+      modelId: 'mock-compactor',
+      doGenerate: async () => {
+        call += 1;
+        return {
+          finishReason: { unified: call === 1 ? 'stop' : finishReason, raw: undefined },
+          content: [{ type: 'text', text: call === 1 ? draft : '   ' }],
+          usage: { ...mockUsage(), outputTokens: { total: 3, text: 0, reasoning: 3 } },
+          warnings: [],
+        };
+      },
+    });
+    const compactor = createOllamaCompactor({ model });
+    await assert.rejects(
+      () => compactor.compact(compactionRequest()),
+      (thrown: unknown) => {
+        assert.ok(thrown instanceof CompactionOutputError);
+        assert.equal(
+          thrown.code,
+          finishReason === 'length'
+            ? 'COMPACTION_EMPTY_OUTPUT_LENGTH'
+            : 'COMPACTION_EMPTY_OUTPUT_STOP',
+        );
+        return true;
+      },
+    );
+    assert.equal(call, 2);
+  }
 });
 
 test('compactor passes a bounded abort signal (120s) and no tool options', async () => {

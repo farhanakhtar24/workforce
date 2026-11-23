@@ -54,6 +54,40 @@ export function resolveEmbeddingCacheDir(raw: string): string {
   return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
 }
 
+/**
+ * Blank-to-undefined preprocessing for environment input: a string value that
+ * is empty or whitespace-only becomes `undefined`, so it is treated exactly
+ * as absent and every existing default / optional transform applies. This
+ * keeps older local env files (whose tracked template shipped blank lines for
+ * the optional variables) compatible with startup. Any other value passes
+ * through unchanged — nonempty strings (even with inner whitespace) and
+ * non-string values — and is validated by the schema exactly as before, so
+ * malformed nonempty values are still rejected with the safe variable-name
+ * errors and no value is ever echoed.
+ */
+function blankToUndefined(value: unknown): unknown {
+  if (typeof value === 'string' && value.trim() === '') {
+    return undefined;
+  }
+  return value;
+}
+
+/**
+ * The environment variables whose blank values count as absent (see
+ * {@link blankToUndefined}). Applied before schema validation in
+ * {@link loadApiConfig}.
+ */
+const BLANK_AS_ABSENT_ENV_KEYS = [
+  'OLLAMA_API_KEY',
+  'OLLAMA_BASE_URL',
+  'OLLAMA_MODEL',
+  'REDIS_URL',
+  'PORT',
+  'WEB_ORIGIN',
+  'DATABASE_URL',
+  'EMBEDDING_CACHE_DIR',
+] as const;
+
 const envSchema = z.object({
   OLLAMA_API_KEY: z
     .string({ message: 'OLLAMA_API_KEY must be a string' })
@@ -97,10 +131,16 @@ const envSchema = z.object({
 
 /**
  * Validates `process.env` (or an explicit environment, for tests) and returns
- * a frozen {@link ApiConfig}. Does not load dotenv files.
+ * a frozen {@link ApiConfig}. Does not load dotenv files. Blank (empty or
+ * whitespace-only) values for the supported variables are normalized to
+ * absent first, so defaults/optional transforms apply instead of a rejection.
  */
 export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
-  const parsed = envSchema.safeParse(env);
+  const normalized: Record<string, unknown> = { ...env };
+  for (const key of BLANK_AS_ABSENT_ENV_KEYS) {
+    normalized[key] = blankToUndefined(normalized[key]);
+  }
+  const parsed = envSchema.safeParse(normalized);
   if (!parsed.success) {
     const details = parsed.error.issues
       .map((issue) => `${issue.path.map(String).join('.') || '(env)'}: ${issue.message}`)

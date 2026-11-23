@@ -7,7 +7,9 @@
  *   service trims it and enforces 1..1000 characters. This module also
  *   classifies its own output defects (empty / overlong) with safe fixed
  *   codes before returning, so the failure cause is visible without any
- *   summary text in logs.
+ *   summary text in logs. An overlong first draft gets exactly ONE bounded
+ *   shortening retry that sees the draft only; both provider calls share one
+ *   abort signal so total compaction work stays inside the timeout.
  * - `generateText` only: no structured output, no tool calls, no JSON. The
  *   prompt demands plain prose.
  * - Never logs request contents or provider response bodies: the only
@@ -21,7 +23,11 @@ import type { MemoryCompactionRequest, MemoryCompactor } from '@workforce/core/m
 /** Hard char budget the core service also enforces after trimming. */
 const MAX_SUMMARY_CHARS = 1000;
 
-/** Upper bound for one compaction LLM call (the store lock waits for it). */
+/**
+ * Upper bound for the WHOLE compaction provider interaction (the store lock
+ * waits for it): the first summary call and the optional repair call share
+ * ONE abort signal created before the first call.
+ */
 export const COMPACTION_TIMEOUT_MS = 120_000;
 
 /**
@@ -30,7 +36,7 @@ export const COMPACTION_TIMEOUT_MS = 120_000;
  * too-small cap the model can spend the whole budget thinking and finish with
  * `finishReason: 'length'` before emitting any summary text. The final answer
  * is capped at ${MAX_SUMMARY_CHARS} characters, so the generous headroom keeps
- * reasoning plus the plain summary inside one bounded call.
+ * reasoning plus the plain summary inside one bounded provider interaction.
  */
 export const COMPACTION_MAX_OUTPUT_TOKENS = 8_000;
 
@@ -89,13 +95,47 @@ export function buildCompactionPrompt(request: MemoryCompactionRequest): string 
     contents,
     '',
     'Write ONE plain-text summary of the source blocks:',
-    '- Keep every fact, correction, decision, preference, and stated uncertainty that is currently true.',
-    '- Drop superseded or outdated details resolved by newer blocks.',
-    '- Target 700-900 characters so the response stays below the hard limit.',
+    '- Synthesize the CURRENT conclusions, corrections, decisions, preferences, and stated uncertainty from the blocks.',
+    '- Omit redundancy and any detail already captured by the conclusions; drop superseded or outdated details resolved by newer blocks.',
+    '- Target 500-700 characters so the response stays below the hard limit.',
     '- At most ' + String(MAX_SUMMARY_CHARS) + ' characters.',
     '- Plain text only: no JSON, no markdown headings, no code fences, no lists, no tool calls.',
     '- Output only the summary text.',
   ].join('\n');
+}
+
+/**
+ * Prompt for the single overlong-output repair pass: it receives ONLY the
+ * overlong draft (never the source blocks) and asks for a shorter plain-text
+ * rewrite with the same hard limit. Pure helper kept separately so the
+ * first-call prompt builder stays untouched.
+ */
+export function buildCompactionRepairPrompt(draft: string): string {
+  return [
+    'You are shortening one overlong memory summary draft into its final form.',
+    '',
+    'Overlong draft:',
+    draft,
+    '',
+    'Rewrite the draft as ONE shorter plain-text summary:',
+    '- Preserve the current conclusions, corrections, decisions, preferences, and stated uncertainty.',
+    '- Remove redundancy and merge repeated details.',
+    '- Target 500-700 characters so the response stays below the hard limit.',
+    '- At most ' + String(MAX_SUMMARY_CHARS) + ' characters.',
+    '- Plain text only: no JSON, no markdown headings, no code fences, no lists, no tool calls.',
+    '- Output only the summary text.',
+  ].join('\n');
+}
+
+/**
+ * Deterministic empty-output classification: budget exhaustion (`length`)
+ * points at the reasoning headroom problem; any other finish reason (stop,
+ * error, content-filter, other) is a separate fixed code.
+ */
+function classifyEmptyOutput(finishReason: string): CompactionOutputErrorCode {
+  return finishReason === 'length'
+    ? 'COMPACTION_EMPTY_OUTPUT_LENGTH'
+    : 'COMPACTION_EMPTY_OUTPUT_STOP';
 }
 
 /** Builds a `MemoryCompactor` that asks the model for a plain summary. */
@@ -103,42 +143,58 @@ export function createOllamaCompactor(options: OllamaCompactorOptions): OllamaCo
   const { model } = options;
   return {
     compact: async (request: MemoryCompactionRequest): Promise<string> => {
-      const result = await generateText({
+      // Both provider calls (first summary + optional repair) share ONE abort
+      // signal created before the first call: total compaction provider work
+      // stays bounded at COMPACTION_TIMEOUT_MS instead of the timeout per
+      // call. Bounded: the compaction runs under the store's path lock, so a
+      // hung provider must not hold it forever. Plain text only — no
+      // structured output, no tools.
+      const abortSignal = AbortSignal.timeout(COMPACTION_TIMEOUT_MS);
+      const generationOptions = () => ({
         model,
-        prompt: buildCompactionPrompt(request),
         maxRetries: 0,
         // Reasoning tokens share the output budget; see
         // COMPACTION_MAX_OUTPUT_TOKENS above.
         maxOutputTokens: COMPACTION_MAX_OUTPUT_TOKENS,
         temperature: 0.2,
-        // Bounded call: the compaction runs under the store's path lock, so a
-        // hung provider must not hold it forever. Plain text only — no
-        // structured output, no tools.
-        abortSignal: AbortSignal.timeout(COMPACTION_TIMEOUT_MS),
+        abortSignal,
         // glm-5.3-flash reasoning is ALWAYS ON; only low/high/max efforts are
         // documented. `low` keeps the compactor fast and deterministic.
-        providerOptions: { ollama: { reasoningEffort: 'low' } },
+        providerOptions: { ollama: { reasoningEffort: 'low' as const } },
       });
       // Validate the model's text before returning: the core service enforces
       // 1..1000 chars after trimming, and failing there loses which side of
       // the contract broke. Classify deterministically here instead.
       // `result.reasoningText` is never a substitute for the summary.
-      const summary = result.text.trim();
+      const first = await generateText({
+        ...generationOptions(),
+        prompt: buildCompactionPrompt(request),
+      });
+      const firstSummary = first.text.trim();
+      if (firstSummary.length >= 1 && firstSummary.length <= MAX_SUMMARY_CHARS) {
+        // Valid first draft: done after one provider call, no repair pass.
+        return firstSummary;
+      }
+      if (firstSummary.length === 0) {
+        throw new CompactionOutputError(classifyEmptyOutput(first.finishReason));
+      }
+      // Overlong first draft: exactly ONE additional shortening call that sees
+      // the draft only (never the source blocks), then classify its output the
+      // same way. Never silently truncated, never a third call.
+      const second = await generateText({
+        ...generationOptions(),
+        prompt: buildCompactionRepairPrompt(firstSummary),
+      });
+      const summary = second.text.trim();
       if (summary.length >= 1 && summary.length <= MAX_SUMMARY_CHARS) {
         return summary;
       }
       if (summary.length === 0) {
-        // Empty output: budget exhaustion (`length`) points at the reasoning
-        // headroom problem; any other finish reason (stop, error,
-        // content-filter, other) is a separate fixed code.
-        throw new CompactionOutputError(
-          result.finishReason === 'length'
-            ? 'COMPACTION_EMPTY_OUTPUT_LENGTH'
-            : 'COMPACTION_EMPTY_OUTPUT_STOP',
-        );
+        throw new CompactionOutputError(classifyEmptyOutput(second.finishReason));
       }
-      // Overlong output: never silently truncated (core would otherwise catch
-      // it, but with the same code as every other contract failure).
+      // Still overlong after the repair pass: never silently truncated (core
+      // would otherwise catch it, but with the same code as every other
+      // contract failure).
       throw new CompactionOutputError('COMPACTION_OUTPUT_TOO_LONG');
     },
   };

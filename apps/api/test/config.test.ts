@@ -27,10 +27,36 @@ test('loadApiConfig strips trailing slashes from OLLAMA_BASE_URL (no /v1 duplica
   assert.equal(config.baseUrl, 'https://ollama.example/v1');
 });
 
-test('loadApiConfig accepts empty OLLAMA_API_KEY absence but not blank value', () => {
+test('loadApiConfig treats blank OLLAMA_API_KEY exactly as absent', () => {
   const ok = loadApiConfig({});
   assert.equal(ok.apiKey, null);
-  assert.throws(() => loadApiConfig({ ...BASE_ENV, OLLAMA_API_KEY: '   ' }), /OLLAMA_API_KEY/);
+  const blank = loadApiConfig({ ...BASE_ENV, OLLAMA_API_KEY: '   ' });
+  assert.equal(blank.apiKey, null);
+  // The other blank-driven defaults coexist with present values in BASE_ENV.
+  assert.equal(blank.baseUrl, 'https://ollama.example/v1');
+  assert.equal(blank.model, 'glm-5.3-flash');
+});
+
+test('loadApiConfig treats empty/whitespace values for every variable as defaults', () => {
+  const config = loadApiConfig({
+    OLLAMA_API_KEY: '',
+    OLLAMA_BASE_URL: '   ',
+    OLLAMA_MODEL: '\t\n  ',
+    REDIS_URL: ' ',
+    PORT: '  ',
+    WEB_ORIGIN: '\t',
+    DATABASE_URL: '\n',
+    EMBEDDING_CACHE_DIR: '\t ',
+  });
+  assert.equal(config.apiKey, null);
+  assert.equal(config.baseUrl, 'https://ollama.com/v1');
+  assert.equal(config.model, 'glm-5.3-flash');
+  assert.equal(config.redisUrl, 'redis://127.0.0.1:6379');
+  assert.equal(config.port, 3001);
+  assert.equal(config.webOrigin, 'http://localhost:3000');
+  assert.equal(config.databaseUrl, 'postgresql://workforce:workforce@127.0.0.1:55432/workforce');
+  assert.equal(config.embeddingCacheDir.startsWith('/'), true);
+  assert.match(config.embeddingCacheDir, /\.cache\/workforce-models$/);
 });
 
 test('loadApiConfig parses and bounds PORT', () => {
@@ -65,6 +91,12 @@ test('loadApiConfig error messages never contain secret values', () => {
 
 test('loadApiConfig validates base URL shape without echoing values', () => {
   assert.throws(() => loadApiConfig({ ...BASE_ENV, OLLAMA_BASE_URL: 'not-http' }), /OLLAMA_BASE_URL/);
+  // Only WHOLLY blank values become absent; a nonempty value with surrounding
+  // whitespace is still validated (and still rejected) untouched.
+  assert.throws(
+    () => loadApiConfig({ ...BASE_ENV, OLLAMA_BASE_URL: '  https://ollama.example/v1  ' }),
+    /OLLAMA_BASE_URL/,
+  );
 });
 
 test('loadApiConfig defaults DATABASE_URL to the local dev stack; env overrides it', () => {

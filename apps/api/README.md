@@ -82,7 +82,7 @@ Env files (startup hydration): before config, real startup loads the gitignored 
 3. `apps/api/.env`,
 4. `.env` (repo root, lowest precedence).
 
-Any value already in `process.env` wins over ALL files, including a shell-exported `OLLAMA_API_KEY` (empty values too — unset an export to let a file fill the key). Missing files are a no-op; directories are resolved from the module location (`tsx src/server.ts` and `node dist/server.js` behave identically), never from the current working directory. A present-but-unreadable env file fails startup safely with the fixed reason `Environment file could not be loaded` — paths, values and parser errors are never logged. Manual composition still works, e.g. `node --env-file=.env.local dist/server.js`. See the root `.env.example` to create your local keys file; `OLLAMA_API_KEY` is still read only through `process.env` after hydration.
+Any value already in `process.env` wins over ALL files, including a shell-exported `OLLAMA_API_KEY` (empty values too — unset an export to let a file fill the key). Blank values never block startup: an empty or whitespace-only value counts as absent at config time, so blank optional variables fall back to their documented defaults; a blank `OLLAMA_API_KEY` still refuses startup with the reason `OLLAMA_API_KEY is missing`, and a nonempty malformed value is still rejected with the safe variable-name errors. Missing files are a no-op; directories are resolved from the module location (`tsx src/server.ts` and `node dist/server.js` behave identically), never from the current working directory. A present-but-unreadable env file fails startup safely with the fixed reason `Environment file could not be loaded` — paths, values and parser errors are never logged. Manual composition still works, e.g. `node --env-file=.env.local dist/server.js`. See the root `.env.example` to create your local keys file; `OLLAMA_API_KEY` is still read only through `process.env` after hydration.
 
 ## Routes
 
@@ -184,17 +184,25 @@ Worker (concurrency 2, attempts 3, exponential backoff base 1000ms)
   `cache_dir` is what keeps downloads out of node_modules). A failed import
   or pipeline load resets the lazy singleton, so the next embed retries
   without a process restart.
-- **Compactor**: `generateText` against `OLLAMA_MODEL` with a bounded abort
-  signal (`AbortSignal.timeout(120_000)`) — compaction holds the store's path
-  lock, so a hung provider cannot hold it forever; `providerOptions`
-  `{ ollama: { reasoningEffort: 'low' } }` — glm-5.3-flash keeps reasoning
-  ALWAYS ON and `low` is the documented minimal effort (the first live attempt
-  without it spent the full 120s budget reasoning and all 3 BullMQ attempts
-  timed out); `maxOutputTokens: 2000` + `temperature: 0.2` for short
-  deterministic summaries; the prompt asks for a factual plain-text summary
-  (`<= 1000` chars) preserving current facts, corrections, decisions, and
-  uncertainty; no JSON/structured output/tool calls. The core service
-  trims/validates and supersedes the 30 oldest blocks.
+- **Compactor**: `generateText` against `OLLAMA_MODEL` with ONE shared abort
+  signal (`AbortSignal.timeout(120_000)`, created before the first call) for
+  at most TWO calls — a first summary, then exactly one shortening repair if
+  the first draft exceeds the hard limit — so total compaction provider work
+  stays inside 120s while compaction holds the store's path lock; the repair
+  call sends only the overlong draft, never the source blocks. Both calls use
+  `providerOptions` `{ ollama: { reasoningEffort: 'low' } }` — glm-5.3-flash
+  keeps reasoning ALWAYS ON and `low` is the documented minimal effort (the
+  first live attempt without it spent the full 120s budget reasoning and all
+  3 BullMQ attempts timed out); `maxOutputTokens: 8000` (reasoning tokens
+  share the same output budget) + `temperature: 0.2` for deterministic
+  summaries; the prompt asks for a plain-text synthesis of the current
+  conclusions, corrections, decisions, preferences, and uncertainty (target
+  500-700 chars, hard `<= 1000`) with redundancy omitted. The output is
+  validated on both calls with fixed codes (`COMPACTION_OUTPUT_TOO_LONG`
+  after an overlong repair, empty-output codes per finish reason); text is
+  never truncated and `reasoningText` is never used. No JSON/structured
+  output/tool calls. The core service trims/validates and supersedes the 30
+  oldest blocks.
 - **Honest statuses**: a block is `pending` → `ready` only on a store commit;
   provider/queue failures mark it `failed`. `POST /retry` 202 means the job
   was queued, nothing more; the block stays `failed` until a worker run

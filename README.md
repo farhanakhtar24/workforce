@@ -109,7 +109,7 @@ npm run dev:infra                # or: docker compose up -d redis postgres
 npm run dev                      # builds @workforce/core, applies the Prisma memory migration, then runs API + web together
 ```
 
-Exporting `OLLAMA_API_KEY` in the shell still works — a shell-exported value always wins over env files; export is only optional now.
+Exporting `OLLAMA_API_KEY` in the shell still works — a shell-exported value always wins over env files; export is only optional now. Blank values never block startup: an empty or whitespace-only optional value counts as absent, so its documented default applies — a blank `OLLAMA_API_KEY` still stops startup with the reason `OLLAMA_API_KEY is missing`.
 
 | Where | URL |
 |---|---|
