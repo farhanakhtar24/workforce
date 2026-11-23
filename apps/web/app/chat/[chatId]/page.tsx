@@ -1,56 +1,25 @@
-import { notFound } from 'next/navigation';
-import type { Metadata } from 'next';
-import { Chat } from '@/components/Chat';
-import { fetchChatHydration, isSafeChatId, resolveApiBaseUrl } from '@/lib/api';
-import type { WorkforceUIMessage } from '@/lib/messages';
-
-export const metadata: Metadata = {
-  title: 'Chat',
-};
+import { notFound, redirect } from 'next/navigation';
+import { isSafeChatId } from '@/lib/api';
+import { buildChatUrl, parseAgentSelection } from '@/lib/agents';
 
 export const dynamic = 'force-dynamic';
 
 /**
- * Server hydrator. Fetches hydration with `no-store` (ADR-008: whole-history
- * seeding) and hands validation-checked UIMessages plus the active-stream
- * flag to the client component. When the API is unreachable the page still
- * renders — a safe fixed retry hint is shown; no internal detail leaks, and
- * `next build` never talks to the API (fully dynamic rendering).
+ * LEGACY `/chat/:chatId` — the pre-Phase-4 chat URL. It meant the `general`
+ * agent, so it redirects to the canonical agent-scoped page. A valid
+ * `?agent=`/`?mode=` on the legacy URL is honored (so old hand-built links
+ * keep their selection); anything else falls back to the `general`/`action`
+ * defaults. Invalid ids render the safe 404, never an error page.
  */
-export default async function ChatPage({
+export default async function LegacyChatPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ chatId: string }>;
-}): Promise<React.ReactElement> {
+  searchParams: Promise<{ agent?: string; mode?: string }>;
+}): Promise<never> {
   const { chatId } = await params;
   if (!isSafeChatId(chatId)) notFound();
-
-  const result = await fetchChatHydration({
-    apiBaseUrl: resolveApiBaseUrl(process.env.NEXT_PUBLIC_API_URL),
-    chatId,
-  });
-
-  if (!result.ok) {
-    return (
-      <Chat
-        chatId={chatId}
-        initialMessages={[]}
-        hasActiveStream={false}
-        hydrationError={result.error}
-      />
-    );
-  }
-
-  // mapHydration performed the structural checks; the wire format is exactly
-  // a UIMessage<…, { calculate }>, so this cast only restores the narrowed
-  // static-tool key.
-  const initialMessages = result.hydration.messages as unknown as WorkforceUIMessage[];
-
-  return (
-    <Chat
-      chatId={chatId}
-      initialMessages={initialMessages}
-      hasActiveStream={result.hydration.hasActiveStream}
-    />
-  );
+  const selection = parseAgentSelection(await searchParams);
+  redirect(buildChatUrl(chatId, selection));
 }

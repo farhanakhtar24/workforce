@@ -91,3 +91,153 @@ model MemoryRelation {
   @@index([sourceId])
   @@index([targetId])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: work documents
+// ---------------------------------------------------------------------------
+// Documented choices:
+// - Documented content is versioned: every create/update/rollback writes an
+//   immutable WorkDocVersion snapshot and an audit WorkDocRevision inside one
+//   transaction. History is never rewritten or deleted.
+// - `WorkDoc.version` is the optimistic-concurrency (CAS) counter updated with
+//   a row lock (`FOR UPDATE` in the adapter) so concurrent updates of the same
+//   document produce exactly one success and typed conflicts for stale calls.
+// - Links are idempotent per (documentId, targetType, targetId) tuple.
+
+enum WorkDocType {
+  report
+  plan
+  analysis
+}
+
+enum WorkDocStatus {
+  draft
+  active
+  archived
+}
+
+enum WorkDocRevisionSource {
+  agent
+  user
+}
+
+enum WorkDocLinkTargetType {
+  memory_block
+  chat
+  delegation
+}
+
+model WorkDoc {
+  id        String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scope     String
+  chatId    String
+  type      WorkDocType
+  title     String
+  content   String
+  status    WorkDocStatus  @default(draft)
+  version   Int
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @default(now())
+
+  versions  WorkDocVersion[]
+  revisions WorkDocRevision[]
+  links     WorkDocLink[]
+
+  @@index([scope, chatId, updatedAt(sort: Desc)])
+  @@index([type])
+  @@index([status])
+}
+
+model WorkDocVersion {
+  id         String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  documentId String        @db.Uuid
+  version    Int
+  title      String
+  content    String
+  status     WorkDocStatus
+  createdAt  DateTime      @default(now())
+
+  document WorkDoc @relation(fields: [documentId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([documentId, version])
+}
+
+model WorkDocRevision {
+  id          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  documentId  String               @db.Uuid
+  source      WorkDocRevisionSource
+  actorId     String?
+  fromVersion Int?
+  toVersion   Int
+  summary     String
+  createdAt   DateTime             @default(now())
+
+  document WorkDoc @relation(fields: [documentId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([documentId, toVersion])
+}
+
+model WorkDocLink {
+  id         String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  documentId String               @db.Uuid
+  targetType WorkDocLinkTargetType
+  targetId   String
+  label      String?
+  createdAt  DateTime             @default(now())
+
+  document WorkDoc @relation(fields: [documentId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([documentId, targetType, targetId])
+  @@index([documentId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: delegations (record of parent->child task hand-offs)
+// ---------------------------------------------------------------------------
+// Documented choices:
+// - `childChatId` is globally unique: one child chat belongs to exactly one
+//   delegation record, so re-delegating creates a fresh child chat.
+// - `depth` is the CHILD agent's composition depth (1..2 per the agent
+//   hierarchy: parent depth 0 -> child depth 1, parent depth 1 -> child 2).
+// - Status transitions are enforced in the domain layer (see
+//   packages/core/src/delegation); the DB stays neutral (no enum-of-next
+//   states) so at-least-once queue semantics keep working.
+
+enum DelegationTargetAgent {
+  analyst
+  researcher
+}
+
+enum DelegationMode {
+  sync
+  async
+}
+
+enum DelegationStatus {
+  pending
+  running
+  completed
+  failed
+  timeout
+}
+
+model Delegation {
+  id              String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scope           String
+  parentChatId    String
+  childChatId     String               @unique
+  parentMessageId String
+  targetAgent     DelegationTargetAgent
+  mode            DelegationMode
+  status          DelegationStatus     @default(pending)
+  task            String
+  result          String?
+  error           String?
+  depth           Int
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @default(now())
+  completedAt     DateTime?
+
+  @@index([parentChatId, createdAt(sort: Desc)])
+  @@index([status])
+}

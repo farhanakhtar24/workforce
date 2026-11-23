@@ -20,6 +20,7 @@ import {
   streamText,
   stepCountIs,
   type LanguageModel,
+  type ToolSet,
   type UIMessage,
 } from 'ai';
 import type { ChatStore, ChatRef } from './store/types.js';
@@ -44,6 +45,21 @@ export interface CreateChatTurnStreamOptions {
   background: BackgroundTaskTracker;
   logger: SafeLogger;
   model: LanguageModel;
+  /**
+   * Phase 4: COMPOSED tools for this generation (plan/depth filtered) and the
+   * agent's FULL allowed action set used for transcript validation. Both
+   * default to the Phase 2 `{calculate}` set — `general` is unchanged.
+   */
+  tools?: ToolSet;
+  validationTools?: ToolSet;
+  /** Phase 4: definition system prompt for NEW agents; `null`/absent = none. */
+  systemPrompt?: string | null;
+  /**
+   * Phase 4: deadline abort signal for INTERNAL delegated child generations
+   * only. Ordinary browser disconnects still never abort (no signal from the
+   * public route path).
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface ChatTurn {
@@ -54,14 +70,38 @@ export interface ChatTurn {
 }
 
 export async function createChatTurnStream(options: CreateChatTurnStreamOptions): Promise<ChatTurn> {
-  const { chat: ref, messages, store, streamContext, background, logger, model } = options;
+  const {
+    chat: ref,
+    messages,
+    store,
+    streamContext,
+    background,
+    logger,
+    model,
+    tools = agentTools,
+    validationTools = agentTools,
+    systemPrompt = null,
+    abortSignal = undefined,
+  } = options;
 
-  const modelMessages = await validateAndConvertMessages(messages, agentTools);
+  const modelMessages = await validateAndConvertMessages(messages, validationTools);
   if (modelMessages === null) {
     // The caller validated the newest message shape already; this can only be
     // corrupt stored chat state, which must not reach the provider.
     throw new InvalidStoredChatError();
   }
+  // Phase 4: definition system prompt for NEW agents (general stays promptless)
+  // — passed through the SDK `system` option, never as a message.
+  const generation = {
+    model,
+    messages: modelMessages,
+    tools,
+    // Phase 4 (internal delegation only): the bounded deadline aborts the
+    // provider work itself. Browser disconnects still never abort (no
+    // signal from the public route path).
+    ...(abortSignal !== undefined ? { abortSignal } : {}),
+    ...(typeof systemPrompt === 'string' && systemPrompt.length > 0 ? { system: systemPrompt } : {}),
+  } as const;
 
   const streamId = createStreamId();
 
@@ -71,9 +111,7 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
     onError: () => STREAM_ERROR_TEXT,
     execute: ({ writer }) => {
       const result = streamText({
-        model,
-        messages: modelMessages,
-        tools: agentTools,
+        ...generation,
         stopWhen: stepCountIs(MAX_MODEL_STEPS),
         onError: (event) => {
           logger.error('provider-stream-failure', event.error);

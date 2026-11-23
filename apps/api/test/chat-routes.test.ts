@@ -602,6 +602,7 @@ test('redis unavailable: hydration, chat POST, and resume all return explicit 50
     clearActiveStreamId: failure,
     acquireIdempotencyKey: failure,
     releaseIdempotencyKey: failure,
+    answerPendingAskUser: failure,
   };
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }), store });
   const seen: unknown[] = [];

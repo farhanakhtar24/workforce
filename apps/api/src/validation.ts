@@ -4,22 +4,34 @@ import type { UIMessage } from 'ai';
 /**
  * Request-side validation at the trust edge.
  *
- * Rules (Phase 2 design, ADR-005/ADR-008):
+ * Rules (Phase 2 design, ADR-005/ADR-008; Phase 4 additions):
  * - IDs are bounded and restricted to a safe alphabet: 1–64 chars of
  *   `A-Z a-z 0-9 _ -` (chat/message/stream IDs). Redis key safety + URL safety.
- * - The POST body is exactly `{ id, message }` — additional wrapper keys are
- *   rejected — where `message` is a single user `UIMessage` (the newest).
+ * - The POST body is exactly `{ id, message }` plus an OPTIONAL
+ *   `mode: 'plan' | 'action'` (Phase 4); additional wrapper keys are rejected.
+ *   Absent mode = `action`. The field is NEVER read for depth — depth comes
+ *   only from the verified internal delegation context header.
  * - Idempotency keys must equal `${chatId}:${message.id}`, are bounded, and
  *   are scoped to the chat in the store.
- * - Only the `general` agent slug exists in Phase 2.
  */
-export const AGENT_SLUGS = ['general'] as const;
-export type AgentSlug = (typeof AGENT_SLUGS)[number];
+import { agentSlugs, agentModes, type AgentMode } from '@workforce/core';
 
-/** Phase 2 exposes exactly one agent; other slugs 404. */
-export function isKnownSlug(slug: string): slug is AgentSlug {
+export const AGENT_SLUGS: readonly string[] = agentSlugs;
+export type KnownAgentSlug = (typeof agentSlugs)[number];
+/** Back-compat alias (Phase 2 name); the list is now the Phase 4 roster. */
+export type AgentSlug = KnownAgentSlug;
+
+/**
+ * Whether the given slug is servable by THIS process: `general` always; the
+ * Phase 4 roster only when the agent runtime deps are wired (tests/buildApp
+ * callers without them keep the Phase 2 surface byte-compatible).
+ */
+export function isKnownSlug(slug: string): slug is KnownAgentSlug {
   return (AGENT_SLUGS as readonly string[]).includes(slug);
 }
+
+export const chatModeSchema = z.enum(agentModes);
+export type ChatMode = AgentMode;
 
 /** Safe identifier: never contains `/`, `:`, whitespace, or control chars. */
 const idSchema = z
@@ -53,10 +65,11 @@ const uiMessageSchema = z.object({
     .max(64, 'message.parts must contain at most 64 parts'),
 });
 
-/** POST body: exactly `{ id, message }`. */
+/** POST body: exactly `{ id, message }` plus optional `mode` (Phase 4). */
 export const chatRequestSchema = z.strictObject({
   id: idSchema,
   message: uiMessageSchema,
+  mode: chatModeSchema.optional(),
 });
 
 export type ChatRequest = z.infer<typeof chatRequestSchema>;

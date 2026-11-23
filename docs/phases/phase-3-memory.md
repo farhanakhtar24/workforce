@@ -3,14 +3,15 @@
 **Duration**: 1-2 weeks
 **Goal**: Build a memory system that survives past 50 entries — hierarchical, vector-searchable, LLM-compactable.
 
-> **Status: 🚧 Active — implementation complete, automated + real-service validation green, live gate pending (started 2026-11-19, last updated 2026-11-19).** Phase 2 validated 2026-11-19 and Farhan said "next"; this phase began the same day. Everything below is **implemented** (core memory + Prisma pgvector adapter + migrations, API memory routes + queue + worker + local embeddings, web `/memory` page, docker-compose Postgres/pgvector) with **339 offline tests green** (core 131, CLI 30, API 133, web 45). The automated real-stack validation is also green (see *Validation evidence*): real Postgres/pgvector+BullMQ integration 14/14 twice, real local-embedding smoke 5/5 twice (real HuggingFace download into the project cache), plus a real-service browser smoke and the `demo:memory` seeder. **The phase is still NOT complete**: compaction by the REAL Ollama model has not been run (the browser smoke used a dummy key), and the phase remains incomplete until Farhan explicitly approves the live gate.
+> **Status: ✅ Validated 2026-11-23 (started 2026-11-19).** Phase 2 validated 2026-11-19 and Farhan said "next"; this phase began the same day. Everything below is **implemented** (core memory + Prisma pgvector adapter + migrations, API memory routes + queue + worker + local embeddings, web `/memory` page, docker-compose Postgres/pgvector) with **374 offline tests green** (core 137, CLI 30, API 162, web 45). The automated real-stack validation is green (see *Validation evidence*): real Postgres/pgvector+BullMQ integration 14/14 and real local-MiniLM embedding smoke 5/5 (real HuggingFace download into the project cache). The phase closed on **2026-11-23**: a live demonstration with Farhan's REAL Ollama key ran the demo seeder — compaction by the real model succeeded (**one ready `learning` summary; the 30 observation sources compacted and retained as superseded**) and the `/memory` page showed the READY summary plus the superseded observations. Farhan confirmed the live flow and approved progression ("yes, next phase") on 2026-11-23.
+> Honesty note: the phase's topic **self-assessment was not completed** (remained waived, as in Phase 1) and no quiz/whiteboard session was held — the closing evidence is the automated suites, the real-service demo and Farhan's explicit approval, no more.
 > The design below is **fixed**, not open for re-litigation. It is recorded as decisions in [ADR-003](../decisions/ADR-003-memory-tree.md) (memory tree + relations + compaction) and [ADR-007](../decisions/ADR-007-pgvector.md) (pgvector + local MiniLM embeddings, `vector(384)`).
 
 ---
 
 ## What gets built in this phase
 
-"All built" summary (implementation is in place; validation still pending):
+"All built" summary (**validated 2026-11-23**):
 
 `packages/core/memory/` — domain contracts and `MemoryService`:
 
@@ -101,7 +102,7 @@ When **active** (non-superseded) blocks at an **exact path** exceed **30**:
 5. The summary block is embedded asynchronously like any write.
 6. Concurrency/duplicate-job protection — two compactions of the same path cannot interleave. **Sources are never deleted.**
 
-### REST routes (implemented — validation pending)
+### REST routes (implemented — validated)
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -118,7 +119,7 @@ Safe errors: 400 invalid payload, 404 unknown id/path, 409 conflict (duplicate i
 
 No automatic memory writes, no memory results injected into chat prompts — the memory tool/capability composition arrives in Phase 4. The chat agent keeps **exactly one tool: `calculate`**.
 
-### Web page (implemented — validation pending)
+### Web page (implemented — validated)
 
 The accessible `/memory` page: create a block; path/keyword browse; semantic search showing cosine, recency, score and status; related/superseded display; retry a failed block; compact a path. The chat UI is untouched.
 
@@ -145,38 +146,40 @@ No deployment, no auth, no multi-tenant SaaS, no graph DB, no Pinecone/Milvus/Cl
 - **Integration**: real Postgres with pgvector + real BullMQ/Redis; deterministic mock embeddings and model.
 - **Smoke**: real local MiniLM 384-dim embedding; browser UI smoke on `/memory`.
 
-Current state (2026-11-19):
+Current state (validated 2026-11-23):
 
-- Offline suites green: **339 tests** (core 131, CLI 30, API 133, web 45).
+- Offline suites green: **374 tests** (core 137, CLI 30, API 162, web 45).
 - Real Postgres/pgvector + real BullMQ/Redis integration (`test-live/`): **14/14 twice consecutively** — pending→ready pipeline across >50 run-scoped blocks, strict query/semantic behavior with exact 0.8/0.2 fields and no vectors, corrections + related graph, fresh-service persistence proof, queue retry (fail 2 → succeed 3rd, exactly 3 calls), exhausted-job + deterministic requeue, 31-block compaction (one summary, 30 sources retained + superseded, active 2, summary ready), concurrent duplicate-trigger compaction with no duplicate and independent Prisma reads under the session lock.
 - Real local embedding smoke (`npm run test:embedding`): **5/5 twice** (384 finite, unit norm, byte-for-byte determinism, robust relevance; first run downloaded the real MiniLM q8 model into the project cache; native onnxruntime-node runs).
 
 ### Real-service browser smoke (dummy key — recorded 2026-11-19, no real Ollama call)
 
-With the real API + web stack running against the local Postgres/Redis and a **dummy `OLLAMA_API_KEY`**: created observations showed `pending` → `ready` through the queue/worker; semantic search returned sensible rankings (example: cosine 0.557, recency 1.0, final score 0.646); a correction superseded its target and the `/memory` page showed the outgoing related edge with the full superseded block; the page passed a desktop/mobile accessibility pass with zero missing accessible names. **Limitation**: with the dummy key the real Ollama compaction and real chat streaming could not succeed — those remain on the live gate.
+With the real API + web stack running against the local Postgres/Redis and a **dummy `OLLAMA_API_KEY`**: created observations showed `pending` → `ready` through the queue/worker; semantic search returned sensible rankings (example: cosine 0.557, recency 1.0, final score 0.646); a correction superseded its target and the `/memory` page showed the outgoing related edge with the full superseded block; the page passed a desktop/mobile accessibility pass with zero missing accessible names. **Limitation (closed after this smoke)**: with the dummy key the real Ollama compaction and real chat streaming could not succeed. The real compaction was verified live in the 2026-11-23 closure (real key, seeder re-run — see *Live demo seeder / Closure*); real chat streaming through the memory stack was never live-tested and remains unclaimed.
 
 ### Live demo seeder (`npm run demo:memory`)
 
 `apps/api/scripts/seed-memory-demo.ts` drives the RUNNING API over plain HTTP (it reads no Ollama key): it refuses a partially-seeded `DEMO_PATH`, seeds 31 observation blocks (real local-MiniLM embeddings), the 31st triggers the real server-side Ollama compaction, and it polls bounded (180s/2s) until the 30-source learning summary is ready. Sources stay in place for UI inspection; details in `apps/api/README.md`.
 
-**Live finding + fix (2026-11-22):** the first real run (`scope=demo`, `path=compaction/small-models`, 31 ready blocks) produced no summary — the BullMQ compact job failed all 3 attempts, each burning the full 120s `AbortSignal` budget on the provider's always-on reasoning. Fix: the compactor now sends `providerOptions {ollama: {reasoningEffort: 'low'}}` (the documented minimal effort — `none` is unsupported), `maxOutputTokens: 2000`, `temperature: 0.2` (mock-tested; 120s bound and no-tools contract unchanged). **Not yet verified live.** The seeder is now RESUMABLE: rerunning `npm run demo:memory` on the existing 31-ready/no-summary state queues exactly one fresh compaction (new trigger, no new blocks); a pending/failed summary gets only its embedding requeued; a ready summary reports success immediately. The low-reasoning compaction still needs Farhan's live run.
+**Live finding + fix (2026-11-22):** the first real run (`scope=demo`, `path=compaction/small-models`, 31 ready blocks) produced no summary — the BullMQ compact job failed all 3 attempts, each burning the full 120s `AbortSignal` budget on the provider's always-on reasoning. Fix: the compactor now sends `providerOptions {ollama: {reasoningEffort: 'low'}}` (the documented minimal effort — `none` is unsupported), `maxOutputTokens: 2000`, `temperature: 0.2` (mock-tested; 120s bound and no-tools contract unchanged). The seeder is now RESUMABLE: rerunning `npm run demo:memory` on the existing 31-ready/no-summary state queues exactly one fresh compaction (new trigger, no new blocks); a pending/failed summary gets only its embedding requeued; a ready summary reports success immediately.
+
+**Closure (2026-11-23):** the fixed compactor **verified live** — with Farhan's real Ollama key, `npm run demo:memory` resumed on the 31-ready state, the real-model compaction **succeeded** (one ready `learning` summary; the 30 observation sources retained and superseded), and the `/memory` page showed the READY summary plus the superseded observations. Farhan approved the phase ("yes, next phase") on 2026-11-23.
 
 ---
 
-## Validation gate for Phase 3 (live)
+## Validation gate for Phase 3 (live) — ✅ closed 2026-11-23
 
 1. Write a block → status `pending` → `ready`. *(covered by integration + browser smoke)*
-2. Restart the API — memory survives (Postgres, not process memory). *(persistence proven via a fresh Prisma/store instance in the integration run; a live restart walkthrough is part of Farhan's gate)*
+2. Restart the API — memory survives (Postgres, not process memory). *(persistence proven via a fresh Prisma/store instance in the integration run; a separate live restart walkthrough was not run — optional item, not claimed)*
 3. Semantic search returns a result that is actually relevant. *(covered)*
 4. A correction supersedes the block it corrects; the superseded one drops from default queries. *(covered)*
 5. Relations are explorable — `supports` / `supersedes` / `contradicts`. *(supersedes covered by integration + browser smoke)*
-6. >30 blocks at a path → compaction produces a summary; the 30 sources are retained. *(automated compaction proven end-to-end with the mock compactor; the REAL Ollama compaction call is still pending — the first live attempt timed out on always-on reasoning and the compactor now sends `reasoningEffort: 'low'`, unverified live; run `npm run demo:memory` with your key — it is resumable on the existing 31-block state)*
+6. >30 blocks at a path → compaction produces a summary; the 30 sources are retained. *(automated compaction proven end-to-end with the mock compactor; the **real Ollama compaction verified live on 2026-11-23** — one ready summary, the 30 observation sources retained and superseded, after the `reasoningEffort: 'low'` fix)*
 7. Embedding failure and Postgres failure are **explicit** — `failed` status / 503, never silent. *(covered by offline suite; browser smoke saw honest pending states)*
 
-**Remaining before approval**: run the demo seeder against the REAL Ollama key (real compaction summary), optionally the API-restart walkthrough, and Farhan's explicit approval of this gate. **Phase 3 is NOT complete until Farhan explicitly approves it.**
+**Closed on 2026-11-23**: the live demo ran against Farhan's real Ollama key — the seeder completed, real-model compaction produced the ready summary, and the `/memory` page showed the READY summary plus the superseded observations; Farhan confirmed the flow and explicitly approved progression ("yes, next phase"). The browser evidence and the compaction fix are recorded above under *Tests*.
 
 ---
 
 ## When done
 
-→ Start [Phase 4 — Multi-Agent Systems](./phase-4-multi-agent.md)
+→ Start [Phase 4 — Multi-Agent Systems](./phase-4-multi-agent.md) *(started 2026-11-23 — design fixed, source not yet built)*

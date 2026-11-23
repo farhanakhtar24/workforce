@@ -6,6 +6,11 @@
       "@workforce/core": ["../../node_modules/@workforce/core/dist/index.d.ts"],
       "@workforce/core/memory": ["../../node_modules/@workforce/core/dist/memory/index.d.ts"],
       "@workforce/core/memory/postgres": ["../../node_modules/@workforce/core/dist/memory/postgres/index.d.ts"],
+      "@workforce/core/agents": ["../../node_modules/@workforce/core/dist/agents/index.d.ts"],
+      "@workforce/core/work-docs": ["../../node_modules/@workforce/core/dist/work-docs/index.d.ts"],
+      "@workforce/core/work-docs/postgres": ["../../node_modules/@workforce/core/dist/work-docs/postgres/index.d.ts"],
+      "@workforce/core/delegation": ["../../node_modules/@workforce/core/dist/delegation/index.d.ts"],
+      "@workforce/core/delegation/postgres": ["../../node_modules/@workforce/core/dist/delegation/postgres/index.d.ts"],
       "@workforce/core/generated/prisma": ["../../node_modules/@workforce/core/generated/prisma/index.d.ts"]
     }
   },

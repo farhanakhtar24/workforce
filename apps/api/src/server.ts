@@ -24,12 +24,16 @@
  * of started streams are intentionally NOT released (resume semantics).
  */
 import type { Server } from 'node:http';
+import { Pool } from 'pg';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { createClient } from 'redis';
 import type { RedisClientType } from 'redis';
 import { PrismaClient } from '@workforce/core/generated/prisma';
 import { MemoryService, type MemoryLogger } from '@workforce/core/memory';
 import { createPostgresMemoryStore } from '@workforce/core/memory/postgres';
+import { WorkDocService } from '@workforce/core/work-docs';
+import { createPrismaWorkDocStore } from '@workforce/core/work-docs/postgres';
+import { createPrismaDelegationRepository } from '@workforce/core/delegation/postgres';
 import { createBackgroundTracker } from './background.js';
 import { loadApiConfig } from './config.js';
 import { loadProjectEnvFiles } from './env.js';
@@ -41,6 +45,21 @@ import { createLocalEmbeddingProvider } from './memory/embedding.js';
 import { createOllamaCompactor } from './memory/ollama-compactor.js';
 import { BullMQMemoryJobQueue } from './memory/bullmq-queue.js';
 import { createMemoryWorker, type MemoryWorkerHandle } from './memory/worker.js';
+import {
+  createDataQueryService,
+  type DataQueryService,
+} from './agents/data-query.js';
+import { createDelegationContextSigner, generateEphemeralSecret } from './agents/delegation-context.js';
+import {
+  BullMQDelegationJobQueue,
+  createDelegationWorker,
+  type DelegationJobQueue,
+  type DelegationWorkerHandle,
+} from './agents/delegation-queue.js';
+import { createDelegationRunJobClient } from './agents/delegation-run-client.js';
+import { createDelegationRoutes } from './agents/delegation-routes.js';
+import { createWorkDocRoutes } from './agents/work-doc-routes.js';
+import type { FetchLike } from './agents/host-capabilities.js';
 
 /**
  * Maps a startup failure to a SAFE, human-readable reason for logs — the only
@@ -144,6 +163,12 @@ export interface ApiServerHandle {
   redis: RedisClientType;
   /** Memory pipeline handles (BullMQ + worker + service). */
   memory: { service: MemoryService };
+  /** Phase 4 handles (work docs, delegation, query_data). */
+  phase4: {
+    workDocs: WorkDocService;
+    delegations: { repo: ReturnType<typeof createPrismaDelegationRepository>; queue: DelegationJobQueue | null };
+    dataQuery: DataQueryService | null;
+  };
   server: Server;
   /** Closes everything; idempotent. */
   close(): Promise<void>;
@@ -226,6 +251,10 @@ export async function startServer(): Promise<ApiServerHandle> {
   const prisma = new PrismaClient({ datasourceUrl: config.databaseUrl });
   let queue: BullMQMemoryJobQueue | null = null;
   let worker: MemoryWorkerHandle | null = null;
+  let delegationQueue: BullMQDelegationJobQueue | null = null;
+  let delegationWorker: DelegationWorkerHandle | null = null;
+  let queryPool: Pool | null = null;
+  let dataQueryService: DataQueryService | null = null;
   try {
     // Bounded connect: fail startup safely when the DB is unreachable.
     await connectWithTimeout(
@@ -260,6 +289,52 @@ export async function startServer(): Promise<ApiServerHandle> {
     // Redis must fail startup instead of serving memory writes that all 503.
     await bullmqQueue.ping(REDIS_CONNECT_TIMEOUT_MS);
 
+    // -- Phase 4 agent runtime wiring ----------------------------------------
+    // Internal delegation context: the configured secret (validated at config
+    // load), or a throwaway per-boot random secret with a SAFE warning (never
+    // the value).
+    const delegationSecret =
+      config.delegationContextSecret !== null
+        ? Buffer.from(config.delegationContextSecret, 'utf8')
+        : generateEphemeralSecret();
+    if (config.delegationContextSecret === null) {
+      logger.warn('delegation-context-secret-ephemeral');
+    }
+    const signer = createDelegationContextSigner(delegationSecret);
+
+    // Tools/delegation call the OWN REST API (ADR-002): loopback base URL,
+    // defaulting to the configured PORT (INTERNAL_API_BASE_URL overrides).
+    const fetchFn: FetchLike = globalThis.fetch;
+    const hostDeps = {
+      fetchFn,
+      baseUrl: config.internalApiBaseUrl,
+      signer,
+      delegationTimeoutMs: config.delegationTimeoutMs,
+    } as const;
+
+    const workDocService = new WorkDocService({ store: createPrismaWorkDocStore(prisma) });
+    const delegationRepo = createPrismaDelegationRepository(prisma);
+    delegationQueue = new BullMQDelegationJobQueue({ redisUrl: config.redisUrl });
+    await delegationQueue.ping(REDIS_CONNECT_TIMEOUT_MS);
+    delegationWorker = createDelegationWorker({
+      runClient: createDelegationRunJobClient({
+        signer,
+        fetchFn,
+        baseUrl: config.internalApiBaseUrl,
+        delegationTimeoutMs: config.delegationTimeoutMs,
+      }),
+      redisUrl: config.redisUrl,
+      logger,
+    });
+
+    // Dedicated bounded read pool for `query_data` (read-only transactions).
+    queryPool = new Pool({ connectionString: config.databaseUrl, max: 2 });
+    dataQueryService = createDataQueryService({
+      pool: queryPool,
+      statementTimeoutMs: config.queryStatementTimeoutMs,
+      rowCap: config.queryRowCap,
+    });
+
     const app = buildApp({
       config,
       store,
@@ -268,6 +343,22 @@ export async function startServer(): Promise<ApiServerHandle> {
       background,
       logger,
       memory: { service: memoryService, queue: bullmqQueue },
+      agents: {
+        hostDeps,
+        signer,
+        workDocs: { service: workDocService, logger },
+        delegations: createDelegationRoutes({
+          repo: delegationRepo,
+          queue: delegationQueue,
+          chatStore: store,
+          signer,
+          fetchFn,
+          baseUrl: config.internalApiBaseUrl,
+          delegationTimeoutMs: config.delegationTimeoutMs,
+          logger,
+        }),
+        dataQuery: { service: dataQueryService, rowCap: config.queryRowCap },
+      },
     });
 
     const server = app.listen(config.port);
@@ -307,7 +398,8 @@ export async function startServer(): Promise<ApiServerHandle> {
       }
       // 1. Wait (bounded) for checkpoint/persistence background work.
       await background.waitForAll(SHUTDOWN_DRAIN_MS);
-      // 2. Close the memory worker (drains its active jobs) then the queue.
+      // 2. Close the memory + delegation workers (drain active jobs), then
+      //    both BullMQ queues; no socket leaks across queue lifecycles.
       try {
         await workerHandle.close();
       } catch (error) {
@@ -317,6 +409,27 @@ export async function startServer(): Promise<ApiServerHandle> {
         await bullmqQueue.close();
       } catch (error) {
         logger.error('memory-queue-close-failed', error);
+      }
+      if (delegationWorker !== null) {
+        try {
+          await delegationWorker.close();
+        } catch (error) {
+          logger.error('delegation-worker-close-failed', error);
+        }
+      }
+      if (delegationQueue !== null) {
+        try {
+          await delegationQueue.close();
+        } catch (error) {
+          logger.error('delegation-queue-close-failed', error);
+        }
+      }
+      if (queryPool !== null) {
+        try {
+          await queryPool.end();
+        } catch (error) {
+          logger.error('query-pool-close-failed', error);
+        }
       }
       // 3. Disconnect Postgres.
       try {
@@ -336,6 +449,11 @@ export async function startServer(): Promise<ApiServerHandle> {
       redis,
       server,
       memory: { service: memoryService },
+      phase4: {
+        workDocs: workDocService,
+        delegations: { repo: delegationRepo, queue: delegationQueue },
+        dataQuery: dataQueryService,
+      },
       close,
     };
   } catch (error) {
@@ -347,6 +465,21 @@ export async function startServer(): Promise<ApiServerHandle> {
     }
     try {
       await queue?.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      await delegationWorker?.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      await delegationQueue?.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      await queryPool?.end();
     } catch {
       /* best effort */
     }

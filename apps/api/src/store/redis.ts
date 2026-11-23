@@ -8,7 +8,8 @@
  * - `set` with the same options shape `resumable-stream`'s Publisher uses:
  *   `{ EX?: number; NX?: boolean }` (node-redis v6 accepts it; `expiration` /
  *   `condition` exist but `EX`/`NX` remain supported for clients like this one).
- * - `eval(script, { keys, arguments })` for the atomic compare-and-delete.
+ * - `eval(script, { keys, arguments })` for the atomic compare-and-delete and
+ *   the ask_user byte-CAS.
  *
  * Key layout (all namespaced under `workforce:phase2:`):
  * - `workforce:phase2:chat:{slug}:{chatId}:messages`       — Redis LIST, one JSON
@@ -22,7 +23,8 @@
  */
 import { StoreUnavailableError } from '../errors.js';
 import type { UIMessage } from 'ai';
-import type { ChatRef, ChatStore } from './types.js';
+import type { AskUserAnswerStatus, ChatRef, ChatStore } from './types.js';
+import { applyAskUserAnswer } from './ask-user.js';
 
 export const REDIS_KEY_PREFIX = 'workforce:phase2';
 
@@ -34,6 +36,23 @@ export const CLEAR_ACTIVE_STREAM_LUA = `
 local current = redis.call('GET', KEYS[1])
 if current == ARGV[1] then
   redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+`.trim();
+
+/**
+ * HITL resume (Phase 4, byte-exact CAS — NO cjson anywhere): the Lua script
+ * compares the current entry (LINDEX) against the EXACT original raw JSON
+ * captured by the Node side and LSETs the replacement only on an exact match.
+ * All JSON parsing/patching happens in Node (`./ask-user.js`) so co-located
+ * data (`options: []`, large integers, key order) is preserved byte-for-byte;
+ * cjson decode/encode round-trips corrupted both.
+ */
+export const ANSWER_PENDING_ASK_USER_LUA = `
+local current = redis.call('LINDEX', KEYS[1], tonumber(ARGV[1]))
+if current == ARGV[2] then
+  redis.call('LSET', KEYS[1], tonumber(ARGV[1]), ARGV[3])
   return 1
 end
 return 0
@@ -168,6 +187,37 @@ export function createRedisChatStore(client: RedisLike): ChatStore {
     async releaseIdempotencyKey(chat: ChatRef, key: string): Promise<void> {
       try {
         await client.del(idempotencyKey(chat, key));
+      } catch (error) {
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async answerPendingAskUser(chat: ChatRef, assistantMessageId: string, toolCallId: string, answer: string): Promise<AskUserAnswerStatus> {
+      try {
+        return await applyAskUserAnswer(
+          async () => {
+            const entries = await client.lRange(messagesKey(chat), 0, -1);
+            if (!Array.isArray(entries)) {
+              throw new StoreUnavailableError('Chat state could not be read (messages).');
+            }
+            return entries.map((entry) => {
+              if (typeof entry !== 'string') {
+                throw new StoreUnavailableError('Chat state could not be read (messages).');
+              }
+              return entry;
+            });
+          },
+          async (entryIndex, expectedRaw, nextRaw) => {
+            const result = await client.eval(ANSWER_PENDING_ASK_USER_LUA, {
+              keys: [messagesKey(chat)],
+              arguments: [String(entryIndex), expectedRaw, nextRaw],
+            });
+            return result === 1 || result === '1' || result === true;
+          },
+          assistantMessageId,
+          toolCallId,
+          answer,
+        );
       } catch (error) {
         rethrowAsUnavailable(error);
       }

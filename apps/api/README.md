@@ -2,16 +2,25 @@
 
 Phase 2 Express API for Workforce: streaming chat over AI SDK v6 UI message
 streams, with Redis-backed resumability (`resumable-stream`) and
-`Idempotency-Key` exactly-once generation. Agent `general` with the single
-`calculate` tool from `@workforce/core`.
+`Idempotency-Key` exactly-once generation. Phase 3 adds the memory domain
+(`@workforce/core/memory`) on the same process: a Postgres/pgvector store
+(Prisma), a local Transformers.js embedding provider, an Ollama-backed
+compactor, and a BullMQ worker over Redis.
 
-Phase 3 adds the memory domain (`@workforce/core/memory`) on top of the same
-process: a Postgres/pgvector store (Prisma), a local Transformers.js embedding
-provider, an Ollama-backed compactor, and a BullMQ worker over Redis.
+Phase 4 adds the multi-agent runtime (ADR-001/002/004): four agent slugs
+(`general` unchanged; `orchestrator`, `analyst`, `researcher`) composed ONCE
+per generation from the core registry (`composeAgentCapabilities`), plan vs
+action modes, server-trusted delegation depth with signed internal contexts,
+Work Documents (CAS versions/rollback/revisions/links), `query_data` over a
+read-only Postgres transaction, HITL `ask_user` (execute-less tool), and
+sync/async delegation that runs child chats through the SAME chat REST
+endpoint (no shadow runner).
 
 See `docs/phases/phase-2-streaming.md`, `docs/phases/phase-3-memory.md`,
-ADR-005 (SSE + idempotency), ADR-008 (UI message streams), and ADR-007
-(pgvector) for the fixed designs.
+`docs/phases/phase-4-multi-agent.md`, ADR-005 (SSE + idempotency), ADR-008
+(UI message streams), ADR-007 (pgvector), ADR-001 (composition gating),
+ADR-002 (tools call the own REST API), and ADR-004 (depth cap 2) for the
+fixed designs.
 
 ## Stack
 
@@ -23,10 +32,15 @@ ADR-005 (SSE + idempotency), ADR-008 (UI message streams), and ADR-007
 | Streams | `createUIMessageStreamResponse` → Web `Response` → tested Express adapter (no buffering) |
 | Resume | `resumable-stream` + Redis, full SSE replay |
 | Chat state | Redis (`redis` v6); keys under `workforce:phase2:*`; messages persist append-only (one JSON UIMessage per list entry) |
+| Agent composition | `composeAgentCapabilities` (core registry, ADR-001) — composed once per generation; plan mode omits write/delegate tools; `delegate_task` absent at depth ≥ 2 |
+| Delegation | Signed HMAC contexts (`X-Workforce-Delegation-Context`, 5 min TTL), depth 0/1/2, sync tool loop + async BullMQ `workforce-delegation` worker (max 2) — child chats via the SAME `POST /api/agents/:slug/chat` |
+| Work docs | `WorkDocService` over Prisma (`createPrismaWorkDocStore`): CAS updates, immutable versions, rollback → NEW version, revisions, typed links |
+| `query_data` | Dedicated bounded pg pool, `BEGIN READ ONLY`, `SET LOCAL statement_timeout`, one SELECT/WITH statement, row cap via `LIMIT cap+1` |
+| HITL | `ask_user` composed execute-less; the next user turn resolves pending parts to `output-available { answer }` atomically (Lua/CAS) before resume |
 | Memory store | Postgres + pgvector via Prisma (`createPostgresMemoryStore`, generated client from `@workforce/core/generated/prisma`) |
 | Embeddings | Local `Xenova/all-MiniLM-L6-v2` (384 dims) via `@huggingface/transformers`, q8 CPU, repo-local model cache |
 | Compaction | `generateText` on the same Ollama model; plain-text summary, no JSON/tools |
-| Jobs | BullMQ `workforce-memory` queue + worker (ioredis, `maxRetriesPerRequest: null`) |
+| Jobs | BullMQ `workforce-memory` queue + worker, and `workforce-delegation` queue + worker (both ioredis, `maxRetriesPerRequest: null`) |
 
 ## Scripts
 
@@ -74,6 +88,11 @@ node-redis clients (resumable-stream semantics preserved).
 | `EMBEDDING_CACHE_DIR` | `.cache/workforce-models` | Model cache for the local embedding provider. Relative values resolve against the app cwd; stored resolved-absolute in the config. The model downloads here on first use. |
 | `PORT` | `3001` | |
 | `WEB_ORIGIN` | `http://localhost:3000` | The only CORS origin; also the only origin that may send `Idempotency-Key`. |
+| `INTERNAL_API_BASE_URL` | `http://127.0.0.1:<PORT>` | Loopback base for capability tools/delegation (ADR-002) — the tools call the OWN REST API. |
+| `DELEGATION_CONTEXT_SECRET` | — | Optional ≥ 16 chars. Absent → per-boot random secret + safe log warning `delegation-context-secret-ephemeral`. Never logged as a value. |
+| `DELEGATION_TIMEOUT_MS` | `120000` | Bounded child-delegation budget (header TTL + fetch deadline). 1000..600000. |
+| `QUERY_STATEMENT_TIMEOUT_MS` | `2000` | Postgres `SET LOCAL statement_timeout` for `query_data`. 100..300000. |
+| `QUERY_ROW_CAP` | `200` | Row cap enforced as `LIMIT cap+1`; cap+1 rows → fixed 400. 1..10000. |
 
 Env files (startup hydration): before config, real startup loads the gitignored env files — the FIRST file that sets a key wins, in this order:
 
@@ -89,9 +108,25 @@ Any value already in `process.env` wins over ALL files, including a shell-export
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | `{ status: "ok" }`, no details. |
-| `POST` | `/api/agents/:slug/chat` | Send the newest user `UIMessage`, start generation, stream SSE. `slug` = `general` only. |
+| `POST` | `/api/agents/:slug/chat` | Send the newest user `UIMessage` (exact `{ id, message }` + optional `mode: 'plan' \| 'action'`, default `action`). Slugs: `general` (calculate-only, unchanged), `orchestrator`, `analyst`, `researcher` — the Phase 4 roster requires the agent runtime to be wired (otherwise only `general` is servable, byte-compatible legacy 404s). Depth is resolved ONLY from the verified `X-Workforce-Delegation-Context` header; client body fields like `depth` are rejected (400). |
 | `GET` | `/api/agents/:slug/chat/:clientChatId` | Hydration: `{ messages: UIMessage[], hasActiveStream: boolean }`, `Cache-Control: no-store`. |
 | `GET` | `/api/agents/:slug/chat/:clientChatId/stream` | Resume the active stream; `204` when none; full replay otherwise. |
+| `POST` | `/api/agents/orchestrator/delegations` | Create a tracked delegation (`{parentChatId, parentMessageId, target, task, mode}`). Signed internal context required (400 without); child depth `parentDepth+1` — 3+ → 403. Sync waits for the run and returns `201 { delegation, childChatId }`; async enqueues on `workforce-delegation` and returns `202 {…, status:'pending'}`. |
+| `GET` | `/api/agents/:slug/delegations?parentChatId&limit` | List a parent chat's delegations, newest first. |
+| `GET` | `/api/agents/:slug/delegations/:delegationId` | Status + result/error + child chat id. |
+| `POST` | `/api/agents/:slug/delegations/:delegationId/run` | INTERNAL: signed create/run context required. `pending → running → completed/failed/timeout`; running/terminal rows are returned unmolested (no second child generation — retries are safe). |
+| `GET` | `/api/agents/:slug/work-docs?scope&chatId&limit` | List documents (newest first). |
+| `POST` | `/api/agents/orchestrator/work-docs` | Create (agent-sourced): `{chatId, type, title, content}` → version 1 draft + v1 snapshot + creation revision. |
+| `GET` | `/api/agents/:slug/work-docs/:id?chatId=` | One doc + recent versions + links; ownership enforced (wrong chat → 404, no existence oracle). |
+| `PATCH` | `/api/agents/:slug/work-docs/:id` | USER metadata-only `{chatId, expectedVersion, title?, status?}` via CAS (content is versioned elsewhere). |
+| `POST` | `/api/agents/orchestrator/work-docs/:id/versions` | Agent content/title/status updates via CAS (`{chatId, expectedVersion, content, title?, status?, summary?}`) — the `write_doc` update path. |
+| `GET` | `/api/agents/:slug/work-docs/:id/versions` | Immutable version list (bounded). |
+| `GET` | `/api/agents/:slug/work-docs/:id/versions/:version` | One immutable snapshot. |
+| `POST` | `/api/agents/:slug/work-docs/:id/rollback` | `{chatId, expectedVersion, toVersion, summary?, source?}` — copies the OLD snapshot into a NEW current version; history never rewritten. |
+| `GET` | `/api/agents/:slug/work-docs/:id/revisions` | Audit trail (source, actorId, from/to, summary). |
+| `POST` | `/api/agents/:slug/work-docs/:id/links` | Add a typed link (`{targetType, targetId, label?}`), idempotent per (doc, type, target). |
+| `GET` | `/api/agents/:slug/work-docs/:id/links` | List typed links. |
+| `POST` | `/api/agents/:slug/data/query` | `query_data`: `{query, limit?}` — one SELECT/WITH statement, read-only transaction, statement timeout, row cap (`cap+1` → 400). Served only for slugs whose composition includes `query_data` (`orchestrator`, `analyst`; others 404). Success: `{ columns, rows, rowCount, truncated }`. |
 | `POST` | `/api/memory/blocks` | Write a memory block (optionally superseding one), enqueue its embed job. `201 {block}`. |
 | `GET` | `/api/memory/blocks` | List blocks, newest first. `scope`, `path` (prefix), `kind`, `keyword`, `includeSuperseded`, `limit` (1..100, default 20). `200 {blocks}`. |
 | `POST` | `/api/memory/search` | Hybrid semantic search: `query` (+ optional `scope`, `path`, `kind`, `limit`). `200 {results}` with `cosineSimilarity`, `recencyScore`, `score`. |
@@ -99,8 +134,9 @@ Any value already in `process.env` wins over ALL files, including a shell-export
 | `POST` | `/api/memory/blocks/:id/retry` | Requeue the embedding job of a `pending`/`failed` block. `202 {status:"queued", blockId}`; `409` when already `ready`. |
 | `POST` | `/api/memory/compact` | Enqueue compaction for one exact `(scope, path)`. `202 {status:"queued", scope, path, triggerBlockId}`. |
 
-Memory routes are registered ONLY when `buildApp` receives `memory: { service, queue }`
-(production `src/server.ts` always does). Without them the paths 404 — chat-only
+Agent routes (`agents.runtime`) are registered ONLY when `buildApp` receives
+`agents:` deps (production `src/server.ts` always does); memory routes only
+with `memory: { service, queue }`. Without them the paths 404 — chat-only
 callers and the Phase 2 tests are unaffected.
 
 ### POST contract
@@ -138,6 +174,60 @@ callers and the Phase 2 tests are unaffected.
    cannot delete each other's messages — and clear the active stream id **only
    if it equals this stream's id** (atomic Lua compare-and-del). Once streaming
    starts the idempotency key is never released — retries go through resume.
+
+## Phase 4 behaviors (multi-agent)
+
+- **Composition (ADR-001)** — tools are selected ONCE per generation by
+  `composeAgentCapabilities(slug, mode, depth, registry)`. Plan mode omits
+  `write_doc`/`delegate_task` entirely; `delegate_task` is absent at depth ≥ 2;
+  workers (`analyst`, `researcher`) never compose write/delegation tools;
+  `general` stays calculate-only with no system prompt (Phase 1-2 bit-for-bit).
+- **Transcript validation** — stored `UIMessage`s are validated/converted
+  against the agent's FULL action-set at depth 0 (mode/depth-independent), so
+  an action-mode transcript stays valid after a plan switch; the GENERATION
+  toolset remains the composed (filtered) one.
+- **Trusted depth (ADR-004)** — depth travels ONLY in
+  `X-Workforce-Delegation-Context`: `base64url(payload).base64url(hmac)` over
+  `{kind, parentChatId, childChatId?, targetAgent?, depth, expiresAt, …}`,
+  HMAC-SHA256 with `DELEGATION_CONTEXT_SECRET` (or a per-boot random secret +
+  `delegation-context-secret-ephemeral` warning). Invalid/expired/forged →
+  fixed 400; a verified context claiming depth 3+ → 403. Client body fields
+  are never consulted for depth. All internal headers/payload bytes are never
+  logged.
+- **HITL `ask_user`** — composed WITHOUT `execute`; the model turn ends with a
+  persisted `input-available` question (no `stop()` anywhere). Before the next
+  user turn is appended, pending questions are atomically resolved (byte-exact
+  compare-and-set of ONE list entry — `LINDEX` equality + `LSET` in Redis, no
+  `cjson` anywhere; the SAME raw-entry algorithm backs the in-memory store) to
+  `output-available`: the NEWEST pending question receives the newest user
+  text, every OLDER pending question receives the bounded sentinel
+  `(no answer given)` — before validation/conversion, after idempotency
+  acquisition, so invalid inputs never mutate the questions and duplicate
+  submits never double-answer. User messages stay append-only forever.
+- **Same-REST delegation** — sync `delegate_task` (tool) and the async worker
+  both POST `POST /api/agents/orchestrator/delegations/:id/run`; that route
+  verifies the signed context, persists the row (`pending → running`), then
+  calls the child chat exactly like a human client would
+  (`POST /api/agents/{target}/chat`, `Idempotency-Key`, signed child context,
+  action mode) and consumes its UI SSE with the AI SDK's
+  `parseJsonEventStream` + `uiMessageChunkSchema`. There is no shadow child
+  runner anywhere; children are real chats at `/chat/:childChatId`. The
+  bounded `DELEGATION_TIMEOUT_MS` deadline aborts the child fetch
+  (`timeout` status) — browser disconnects still never abort any generation.
+- **Worker lifecycle** — the `workforce-delegation` BullMQ worker (max 2,
+  attempts 3, exponential backoff, deterministic `delegation-<id>` job ids)
+  starts inside the API like the memory worker and closes with the same
+  shutdown order (HTTP → background drain → workers → queues → Postgres →
+  Redis). Row-level idempotency is now an ATOMIC claim
+  (`updateStatus { expectedFrom: 'pending' }` compare-and-set through the
+  repository), so concurrent runners — sync tool, create-wait, worker retries —
+  yield exactly ONE running claim and ONE child generation; losers receive the
+  untouched row (`executed: false`). A `running` row beyond the delegation
+  budget is treated as stale and recovered from the child chat's durable
+  transcript (`completed` with the recovered answer, or `failed`) — never a
+  duplicate generation, never a permanent wedge. The child user message id is
+  derived from the delegation id, so the child `Idempotency-Key` is stable
+  across every retry.
 
 ## Redis key layout
 
@@ -323,7 +413,9 @@ npm run typecheck:integration --workspace @workforce/api
 
 ### 1. Real memory pipeline — `npm run test:integration` (workspace: `apps/api`)
 
-`test-live/*` runs two real-stack files:
+`test-live/*` runs three real-stack suites — the root runner totals **23 tests**
+(3 Phase 2 Redis streaming + 11 memory + 9 Phase 4), passed twice with exact
+per-run cleanup:
 
 - `redis-stream.test.ts` — the Phase 2 chat/resume stack over real Redis.
 - `memory.test.ts` — the Phase 3 pipeline: real Prisma + pgvector Postgres,
@@ -332,6 +424,16 @@ npm run typecheck:integration --workspace @workforce/api
   `MemoryService`. Embedder and compactor are deterministic mocks (a
   keyword-axes 384-dim embedder and a 700ms-delayed mock compactor) — no
   Transformers, no Ollama.
+- **Phase 4 multi-agent tests** — real Prisma WorkDocs (create, CAS updates,
+  browser-style user-source updates, rollback with immutable history,
+  concurrent idempotent links), sync delegation through the same REST chat
+  contract, async delegation over the real BullMQ queue with the atomic
+  `expectedFrom: 'pending'` single-claim (exactly one execution) and
+  stale-`running` recovery, real-Redis `ask_user` byte-CAS resolution
+  (preserving `options: []` and huge numeric byte payloads, plus stale
+  resolutions), and `query_data` over real Postgres (rollback/discard,
+  statement timeout, row cap, dangerous-function rejection). Models stay
+  mocked — **no real provider anywhere**.
 
 Prerequisites:
 

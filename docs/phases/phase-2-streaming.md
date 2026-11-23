@@ -134,4 +134,4 @@ Recorded as: **Farhan confirmed the live Phase 2 web flow is working on 2026-11-
 
 ✅ Done — gate passed 2026-11-19 (see the Validation record above).
 
-Next: [Phase 3 — Memory, Embeddings, Hybrid Search](./phase-3-memory.md) — **not started**. It begins when Farhan asks to start it.
+Next: [Phase 3 — Memory, Embeddings, Hybrid Search](./phase-3-memory.md) — ✅ **validated 2026-11-23** (Farhan approved the live gate; details in its phase doc). It began the same day Phase 2 closed and Farhan asked for the next phase.

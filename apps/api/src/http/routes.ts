@@ -12,7 +12,13 @@
  */
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { UI_MESSAGE_STREAM_HEADERS, type UIMessage } from 'ai';
-import { IDEMPOTENCY_KEY_TTL_SECONDS, type ChatStore, type ChatRef } from '../store/types.js';
+import {
+  ASK_USER_NO_ANSWER,
+  IDEMPOTENCY_KEY_TTL_SECONDS,
+  type AskUserAnswerStatus,
+  type ChatStore,
+  type ChatRef,
+} from '../store/types.js';
 import type { StreamContext } from '../stream-context/types.js';
 import type { ApiConfig } from '../config.js';
 import type { CreateChatTurnStreamOptions } from '../generation.js';
@@ -24,7 +30,16 @@ import {
   clientIdSchema,
   idempotencyKeySchema,
   isKnownSlug,
+  toUIMessageInput,
+  type ChatMode,
 } from '../validation.js';
+import {
+  DELEGATION_CONTEXT_HEADER,
+  type DelegationContextSigner,
+} from '../agents/delegation-context.js';
+import { MAX_DELEGATION_DEPTH } from '@workforce/core';
+import type { HostCapabilityDeps } from '../agents/host-capabilities.js';
+import { prepareGeneration } from '../agents/toolsets.js';
 
 const IDEMPOTENCY_HEADER = 'Idempotency-Key';
 
@@ -36,6 +51,16 @@ export interface ChatRoutesDeps {
   model: CreateChatTurnStreamOptions['model'];
   background: CreateChatTurnStreamOptions['background'];
   logger: CreateChatTurnStreamOptions['logger'];
+  /**
+   * Phase 4 agent runtime. When absent, only `general` is servable and every
+   * other slug stays 404 (byte-compatible legacy surface for old callers).
+   */
+  agents?: {
+    /** Capability-tool composition dependencies (fetch/baseUrl/signer/...). */
+    hostDeps: HostCapabilityDeps;
+    /** Verifier for the internal delegation context header (mint happens in-process). */
+    signer: DelegationContextSigner;
+  };
 }
 
 /** Runs an async handler, forwarding rejections to Express' error handling. */
@@ -49,6 +74,129 @@ const NO_STORE_HEADERS: Record<string, string> = { 'Cache-Control': 'no-store' }
 
 function chatRefFromRequest(slug: string, clientChatId: string): ChatRef {
   return { slug, chatId: clientChatId };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: agent composition + trusted depth + HITL ask_user resolution
+// ---------------------------------------------------------------------------
+
+interface PendingAskUserPart {
+  readonly messageId: string;
+  readonly toolCallId: string;
+  /** true → newest pending question; receives the actual new user text. */
+  readonly newest: boolean;
+}
+
+/**
+ * Finds ALL pending (`input-available`) ask_user tool parts across stored
+ * assistant messages, newest first: the newest pending MESSAGE (even when the
+ * latest assistant message itself has none) receives the actual answer, and
+ * every OLDER pending question gets the bounded sentinel — so no stale tool
+ * call can permanently wedge the conversation.
+ */
+function findPendingAskUserParts(stored: unknown[]): PendingAskUserPart[] {
+  const pendingMessages: PendingAskUserPart[][] = []; // newest message group first
+  for (let index = stored.length - 1; index >= 0; index -= 1) {
+    const entry = stored[index];
+    if (entry === null || typeof entry !== 'object') {
+      continue;
+    }
+    const message = entry as { role?: unknown; id?: unknown; parts?: unknown };
+    if (message.role !== 'assistant' || typeof message.id !== 'string' || !Array.isArray(message.parts)) {
+      continue;
+    }
+    const pending: PendingAskUserPart[] = [];
+    for (const part of message.parts) {
+      if (
+        part !== null && typeof part === 'object' &&
+        (part as Record<string, unknown>)['type'] === 'tool-ask_user' &&
+        (part as Record<string, unknown>)['state'] === 'input-available' &&
+        typeof (part as Record<string, unknown>)['toolCallId'] === 'string'
+      ) {
+        pending.push({ messageId: message.id, toolCallId: (part as Record<string, unknown>)['toolCallId'] as string, newest: false });
+      }
+    }
+    if (pending.length > 0) {
+      pendingMessages.push(pending);
+    }
+  }
+  // The first (newest) pending MESSAGE carries the real answer; every older
+  // pending part gets the bounded sentinel at the call site.
+  return pendingMessages.flatMap((group, groupIndex) =>
+    group.map((part) => ({ messageId: part.messageId, toolCallId: part.toolCallId, newest: groupIndex === 0 })),
+  );
+}
+
+/** Joined text of the newest user message (the `ask_user` answer payload). */
+function newestUserText(message: UIMessage): string {
+  const text = message.parts
+    .filter((part): part is Extract<typeof part, { type: 'text' }> => part.type === 'text')
+    .map((part) => part.text)
+    .join('');
+  return text.length > 0 ? text : '(no text)';
+}
+
+interface ResolvedDelegationContext {
+  readonly depth: number;
+  readonly deadline: number;
+}
+
+type DelegationContextCheck =
+  | { ok: true; context: ResolvedDelegationContext | null }
+  | { ok: false; status: 400 | 403 };
+
+/**
+ * Verifies the internal delegation context header. Absent header = depth 0
+ * (root chat). A PRESENT but invalid/expired/forged/misbound header is a
+ * fixed 400 — depth can never enter through client body fields. A VALID
+ * signature claiming an impossible depth (> MAX_DELEGATION_DEPTH) is a 403.
+ */
+function resolveDelegationChatContext(
+  deps: ChatRoutesDeps,
+  headerValue: string | undefined,
+  slug: string,
+  chatId: string,
+): DelegationContextCheck {
+  if (headerValue === undefined || headerValue.length === 0) {
+    return { ok: true, context: null };
+  }
+  if (deps.agents === undefined) {
+    return { ok: false, status: 400 };
+  }
+  const expectedTarget = slug === 'analyst' || slug === 'researcher' ? (slug as 'analyst' | 'researcher') : undefined;
+  if (expectedTarget === undefined) {
+    // Only worker slugs may be delegation targets; a "child orchestrator" or
+    // child general context is forged regardless of its signature.
+    return { ok: false, status: 400 };
+  }
+  const verified = deps.agents.signer.verify(headerValue, {
+    kind: 'delegation-child-chat',
+    childChatId: chatId,
+    targetAgent: expectedTarget,
+  });
+  if (!verified.ok) {
+    return { ok: false, status: 400 };
+  }
+  const payload = verified.payload;
+  if (payload.kind !== 'delegation-child-chat') {
+    return { ok: false, status: 400 };
+  }
+  if (typeof payload.depth !== 'number' || !Number.isInteger(payload.depth) || payload.depth < 1) {
+    return { ok: false, status: 400 };
+  }
+  if (payload.depth > MAX_DELEGATION_DEPTH) {
+    // A grandchild (depth 2) + delegation → depth 3: the cap forbids it.
+    return { ok: false, status: 403 };
+  }
+  if (typeof payload.deadline !== 'number' || !Number.isFinite(payload.deadline) || payload.deadline <= Date.now()) {
+    return { ok: false, status: 400 };
+  }
+  return { ok: true, context: { depth: payload.depth, deadline: payload.deadline } };
+}
+
+/** Joins text parts of a UIMessage for validate helpers (structural, bounded). */
+function toUIMessages(values: readonly unknown[]): UIMessage[] {
+  return values as UIMessage[];
 }
 
 export interface ChatRouteHandlers {
@@ -118,7 +266,14 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
 
   const postChat = asyncRoute(async (req: Request, res: Response) => {
     const slug = req.params['slug'] ?? '';
+    const phase4Agent = isKnownSlug(slug) && slug !== 'general';
     if (!isKnownSlug(slug)) {
+      sendJsonError(res, 404, 'Unknown agent slug.');
+      return;
+    }
+    // Phase 4 roster requires the runtime deps; legacy callers without them
+    // must keep the exact Phase 2 surface (non-`general` slugs stay 404).
+    if (phase4Agent && deps.agents === undefined) {
       sendJsonError(res, 404, 'Unknown agent slug.');
       return;
     }
@@ -131,7 +286,21 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       sendJsonError(res, 400, 'Request body must be exactly { "id": string, "message": newest user message }.');
       return;
     }
-    const { id: chatId, message } = bodyCheck.data;
+    const { id: chatId, message: newestBodyMessage } = bodyCheck.data;
+    const message = toUIMessageInput(newestBodyMessage);
+
+    // Phase 4 modes: optional in the body; default action. NEVER depth.
+    const requestedMode: ChatMode = bodyCheck.data.mode ?? 'action';
+
+    // Trusted depth comes ONLY from the verified internal header.
+    const delegationHeader = req.get(DELEGATION_CONTEXT_HEADER);
+    const delegationCheck = resolveDelegationChatContext(deps, delegationHeader ?? undefined, slug, chatId);
+    if (!delegationCheck.ok) {
+      sendJsonError(res, delegationCheck.status, 'Invalid internal delegation context.');
+      return;
+    }
+    // Child chats always run in action mode (their contexts never carry plan).
+    const mode: ChatMode = delegationCheck.context !== null ? 'action' : requestedMode;
 
     const headerKey = req.get(IDEMPOTENCY_HEADER) ?? undefined;
     const headerCheck = typeof headerKey === 'string' ? idempotencyKeySchema.safeParse(headerKey) : null;
@@ -169,21 +338,35 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       return;
     }
 
-    // Validate the complete appended conversation BEFORE anything durable
-    // happens: an invalid newest message must acquire no key, append nothing,
-    // and brick no later turns. If the whole list fails, classify by
-    // validating the stored history alone — it failing means server-side
-    // corrupt state (503); it passing means the newest body is invalid (400).
-    // Neither path touches the provider.
+    // Phase 4 composition ONCE per generation (ADR-001): tools + full allowed
+    // validation set + system prompt, from slug + mode + VERIFIED depth.
+    const prepared =
+      deps.agents !== undefined
+        ? prepareGeneration(deps.agents.hostDeps, {
+            slug,
+            mode,
+            depth: delegationCheck.context?.depth ?? 0,
+            chatId,
+            parentMessageId: message.id,
+          })
+        : null;
+    const generationTools = prepared !== null ? prepared.tools : agentTools;
+    const validationTools = prepared !== null ? prepared.validationTools : agentTools;
+    const systemPrompt = prepared !== null ? prepared.systemPrompt : null;
+
+    // Validate the complete appended conversation (with the FULL allowed
+    // action toolset, so historical action-mode tool parts stay valid across
+    // plan switches) BEFORE anything durable happens. Invalid newest message
+    // must acquire no key, append nothing, answer no question. If the whole
+    // list fails, classify by validating the stored history alone — it failing
+    // means server-side corrupt state (503); it passing means the newest body
+    // is invalid (400). Neither path touches the provider NOR mutates state.
     const appendedConversation = [...stored, message] as UIMessage[];
-    const conversationValid = await validateAndConvertMessages(appendedConversation, agentTools);
+    const conversationValid = await validateAndConvertMessages(appendedConversation, validationTools);
     if (conversationValid === null) {
-      // Note: validateUIMessages rejects empty lists, so an empty stored
-      // history counts as valid-by-vacuity here — only genuinely corrupt
-      // entries must 503.
       const storedValid =
         stored.length === 0 ||
-        (await validateAndConvertMessages(stored as UIMessage[], agentTools)) !== null;
+        (await validateAndConvertMessages(toUIMessages(stored), validationTools)) !== null;
       if (!storedValid) {
         logger.warn('chat-stored-state-unreadable');
         sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
@@ -193,7 +376,9 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       return;
     }
 
-    // Exactly-once generation guard BEFORE any provider work (ADR-005).
+    // Exactly-once generation guard BEFORE any provider work or mutations
+    // (ADR-005). Acquiring here means only THIS turn can resolve the pending
+    // ask_user question / append.
     let acquired = false;
     try {
       acquired = await store.acquireIdempotencyKey(chat, headerKey, IDEMPOTENCY_KEY_TTL_SECONDS);
@@ -207,21 +392,66 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       return;
     }
 
-    // Persist the user message BEFORE generation starts: a single atomic
-    // append — concurrent turns cannot corrupt each other's list entries.
-    const messages = appendedConversation;
-    try {
-      await store.appendMessage(chat, message as unknown as UIMessage);
-    } catch (error) {
-      logger.error('chat-store-save', error);
+    const releaseKeyAndFail = async (logContext: string, error: unknown, status: number, message_: string): Promise<void> => {
+      logger.error(logContext, error);
       try {
         await store.releaseIdempotencyKey(chat, headerKey);
       } catch (releaseError) {
         logger.error('chat-idempotency-release', releaseError);
       }
-      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      sendJsonError(res, status, message_);
+    };
+
+    // HITL resume (Phase 4): resolve pending ask_user parts to
+    // `output-available { answer }` — a targeted, atomic, byte-CAS transcript
+    // update. The NEWEST pending question receives the newest user text; every
+    // OLDER pending question is resolved with the bounded sentinel so no stale
+    // tool call wedges the conversation. This happens BEFORE the newest user
+    // message is appended, and AFTER validation/key acquisition, so an invalid
+    // new input never mutates the questions and duplicate submits never
+    // double-answer ('unchanged' is an idempotent no-op; 'stale' after retries
+    // fails the turn safely instead of guessing).
+    const pendingAskUser = findPendingAskUserParts(stored);
+    const answerText = newestUserText(message);
+    if (pendingAskUser.length > 0) {
+      try {
+        for (const pending of pendingAskUser) {
+          const target = pending.newest ? answerText : ASK_USER_NO_ANSWER;
+          let outcome = await store.answerPendingAskUser(chat, pending.messageId, pending.toolCallId, target);
+          if (outcome === 'stale') {
+            // One fresh re-read + retry; the store itself re-reads on each call.
+            outcome = await store.answerPendingAskUser(chat, pending.messageId, pending.toolCallId, target);
+          }
+          if (outcome === 'stale') {
+            await releaseKeyAndFail('chat-ask-user-answer-stale', new Error('ask_user CAS stale'), 503, 'Chat state is temporarily unavailable.');
+            return;
+          }
+        }
+      } catch (error) {
+        await releaseKeyAndFail('chat-ask-user-answer', error, 503, 'Chat state is temporarily unavailable.');
+        return;
+      }
+    }
+
+    // Persist the user message BEFORE generation starts: a single atomic
+    // append — concurrent turns cannot corrupt each other's list entries.
+    try {
+      await store.appendMessage(chat, message as unknown as UIMessage);
+    } catch (error) {
+      await releaseKeyAndFail('chat-store-save', error, 503, 'Chat state is temporarily unavailable.');
       return;
     }
+
+    // Reload after the (optional) part-state update so the generation sees the
+    // ANSWERED transcript; conversion runs against the full validation toolset.
+    let storedAfter: unknown[] = stored;
+    try {
+      storedAfter = pendingAskUser.length > 0 ? await store.loadMessages(chat) : stored;
+    } catch (error) {
+      await releaseKeyAndFail('chat-store-reload', error, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    const messagesForGeneration = [...storedAfter, message] as UIMessage[];
 
     // Hand off to generation. From here on the key is never released: once the
     // stream has started, retries go through resume instead (ADR-005).
@@ -229,16 +459,27 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     try {
       turn = await createChatTurnStream({
         chat,
-        messages,
+        messages: messagesForGeneration,
         store,
         streamContext,
         background,
         logger,
         model,
+        tools: generationTools,
+        validationTools,
+        systemPrompt,
+        // Deadline abort for INTERNAL delegated children only: the verified
+        // context carries the run deadline. Browser disconnects still never
+        // abort generation (no signal is passed for ordinary chats).
+        ...(delegationCheck.context !== null
+          ? { abortSignal: AbortSignal.timeout(Math.max(0, delegationCheck.context.deadline - Date.now())) }
+          : {}),
       });
     } catch (error) {
       if (error instanceof InvalidStoredChatError) {
-        // Generation never started: release the key we acquired.
+        // Generation never started: release the key we acquired. The ask_user
+        // answer update + user append stand (honest persisted state); a retry
+        // is safe and idempotent.
         try {
           await store.releaseIdempotencyKey(chat, headerKey);
         } catch (releaseError) {
@@ -247,7 +488,6 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
         sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
         return;
       }
-      logger.error('chat-turn-setup', error);
       try {
         await store.releaseIdempotencyKey(chat, headerKey);
       } catch (releaseError) {

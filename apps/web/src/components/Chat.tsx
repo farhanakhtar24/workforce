@@ -1,21 +1,66 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
 import {
   buildReconnectRequest,
   buildSendRequest,
   describeChatError,
+  isSafeChatId,
   resolveApiBaseUrl,
   HYDRATION_ERROR_UNREACHABLE,
 } from '@/lib/api';
+import {
+  AGENT_GUIDANCE,
+  WEB_AGENT_SLUGS,
+  WEB_AGENT_MODES,
+  buildChatUrl,
+  buildNewChatUrl,
+  modeGuidance,
+  modeLabel,
+  type AgentSelection,
+  type WebAgentMode,
+  type WebAgentSlug,
+} from '@/lib/agents';
+import {
+  isWorkDocId,
+  workDocPagePath,
+} from '@/lib/workdocs';
 import { calculateStateLabel, formatCalculateInput, parseCalculateOutput } from '@/lib/calculate';
-import type { CalculateToolPart, WorkforceUIMessage } from '@/lib/messages';
+import {
+  formatAskUserInput,
+  formatDelegateInput,
+  formatGenericToolPart,
+  formatQueryDataInput,
+  formatSearchMemoryInput,
+  formatWriteDocInput,
+  findPendingAskUser,
+  parseAskUserOutput,
+  parseDelegateOutput,
+  parseQueryDataOutput,
+  parseSearchMemoryOutput,
+  parseWriteDocOutput,
+  toolStateLabel,
+} from '@/lib/tools';
+import type {
+  AskUserToolPart,
+  CalculateToolPart,
+  DelegateTaskToolPart,
+  QueryDataToolPart,
+  SearchMemoryToolPart,
+  WorkforceUIMessage,
+  WriteDocToolPart,
+} from '@/lib/messages';
 
 export interface ChatProps {
   /** Stable chat id, owned by the URL. */
   chatId: string;
+  /** Selected agent slug (server-validated; `general` for old URLs). */
+  agent: WebAgentSlug;
+  /** Selected mode (server-validated; `action` for old URLs). */
+  mode: WebAgentMode;
   /** Server-hydrated UIMessages (empty on hydration failure). */
   initialMessages: WorkforceUIMessage[];
   /** Whether the API reported an in-flight stream we should re-attach to. */
@@ -25,39 +70,54 @@ export interface ChatProps {
 }
 
 /**
- * Phase 2 chat UI. No stop button: refresh/disconnect must not abort the
- * provider generation (ADR-005), so nothing here calls abort. Mount-time
- * reconnect comes from `useChat({ resume: true })`, and the transport keeps
- * its `resumeStreamIsReplay` default — the API replays the full SSE stream
- * and the hook rebuilds the interrupted assistant message exactly once.
+ * Phase 4 chat UI on the Phase 2 streaming core. Agent (slug) and mode
+ * (plan/action) live in the URL; changing either re-navigates so the server
+ * re-hydrates for that (slug, chatId) key, and the next send is a NEW
+ * generation composed for the selection — there is no mid-turn escalation.
+ * No stop button: refresh/disconnect must not abort the provider generation
+ * (ADR-005), so nothing here calls abort. Mount-time reconnect comes from
+ * `useChat({ resume: true })` with the same slug, and the transport keeps its
+ * `resumeStreamIsReplay` default — the API replays the full SSE stream and
+ * the hook rebuilds the interrupted assistant message exactly once.
  */
 export function Chat({
   chatId,
+  agent,
+  mode,
   initialMessages,
   hasActiveStream,
   hydrationError,
 }: ChatProps): React.ReactElement {
   const apiBaseUrl = resolveApiBaseUrl(process.env.NEXT_PUBLIC_API_URL);
+  const router = useRouter();
+  const selection: AgentSelection = { agent, mode };
 
   const transport = useMemo(
     () =>
       new DefaultChatTransport<WorkforceUIMessage>({
-        api: `${apiBaseUrl}/api/agents/general/chat`,
+        api: `${apiBaseUrl}/api/agents/${agent}/chat`,
         prepareSendMessagesRequest: ({ id, messages }) => {
-          // Documented body: exactly `{ id, message }` with only the newest
-          // user UIMessage, plus the exact idempotency header (API 400s on
-          // any mismatch). No transcript is sent.
-          const prepared = buildSendRequest({ apiBaseUrl, chatId: id, messages });
+          // Documented body: exactly `{ id, message, mode }` with only the
+          // newest user UIMessage, plus the exact idempotency header (API
+          // 400s on any mismatch). No transcript is sent.
+          const prepared = buildSendRequest({
+            apiBaseUrl,
+            chatId: id,
+            messages,
+            slug: agent,
+            mode,
+          });
           return { api: prepared.url, body: prepared.body, headers: prepared.headers };
         },
         prepareReconnectToStreamRequest: ({ id }) => {
-          // Resume is a GET against the Express stream route; a 204 response
-          // means idle. Replay handling stays with the transport default.
-          const prepared = buildReconnectRequest({ apiBaseUrl, chatId: id });
+          // Resume is a GET against the Express stream route for the same
+          // slug; a 204 response means idle. Replay handling stays with the
+          // transport default.
+          const prepared = buildReconnectRequest({ apiBaseUrl, chatId: id, slug: agent });
           return { api: prepared.url };
         },
       }),
-    [apiBaseUrl],
+    [apiBaseUrl, agent, mode],
   );
 
   const { messages, sendMessage, status, error, clearError } = useChat({
@@ -69,6 +129,7 @@ export function Chat({
   });
 
   const [input, setInput] = useState('');
+  const [answerDraft, setAnswerDraft] = useState('');
   const [resumeNotice, setResumeNotice] = useState(hasActiveStream);
 
   useEffect(() => {
@@ -78,13 +139,32 @@ export function Chat({
   }, [status]);
 
   const busy = status === 'submitted' || status === 'streaming';
-  const canSend = !busy && input.trim().length > 0;
+  // HITL: an unanswered ask_user question from the newest assistant message
+  // gates the normal composer; the answer form below is the channel instead
+  // (its submit travels the same normal user-message path, so the API marks
+  // the part output-available and the generation resumes).
+  const pendingAsk = useMemo(() => findPendingAskUser(messages), [messages]);
+  const inputReady = input.trim().length > 0;
+  const answerReady = answerDraft.trim().length > 0;
+  const canSend = !busy && pendingAsk === null && inputReady;
+  const canAnswer = !busy && answerReady;
 
   const submit = (): void => {
     if (!canSend) return;
     const text = input.trim();
     setInput('');
     void sendMessage({ text });
+  };
+
+  const submitAnswer = (): void => {
+    if (!canAnswer) return;
+    const text = answerDraft.trim();
+    setAnswerDraft('');
+    void sendMessage({ text });
+  };
+
+  const navigateTo = (next: AgentSelection): void => {
+    router.push(buildChatUrl(chatId, next));
   };
 
   const statusText =
@@ -104,7 +184,16 @@ export function Chat({
           <a className="chat-new" href="/memory">
             Memory
           </a>
-          <a className="chat-new" href="/">
+          <a className="chat-new" href={`/work?chatId=${encodeURIComponent(chatId)}&agent=${agent}`}>
+            Work
+          </a>
+          <a
+            className="chat-new"
+            href={`/delegations?chatId=${encodeURIComponent(chatId)}&agent=${agent}`}
+          >
+            Delegations
+          </a>
+          <a className="chat-new" href={buildNewChatUrl(selection)}>
             New chat
           </a>
         </nav>
@@ -118,6 +207,58 @@ export function Chat({
           </p>
         </div>
       )}
+
+      <section aria-label="Agent and mode" className="chat-controls">
+        <div className="memory-field memory-field-grow">
+          <label htmlFor="chat-agent">Agent</label>
+          <select
+            id="chat-agent"
+            name="chat-agent"
+            className="memory-input"
+            aria-label="Agent"
+            value={agent}
+            onChange={(event) => {
+              const next = event.target.value;
+              if (next !== agent && (WEB_AGENT_SLUGS as readonly string[]).includes(next)) {
+                navigateTo({ agent: next as WebAgentSlug, mode });
+              }
+            }}
+          >
+            {WEB_AGENT_SLUGS.map((slug) => (
+              <option key={slug} value={slug}>
+                {slug}
+              </option>
+            ))}
+          </select>
+          <p className="memory-hint">{AGENT_GUIDANCE[agent]}</p>
+        </div>
+        <fieldset className="chat-mode-fieldset">
+          <legend>Mode for the next reply</legend>
+          <div className="chat-mode-options">
+            {WEB_AGENT_MODES.map((candidate) => (
+              <span key={candidate} className="chat-mode-option">
+                <input
+                  type="radio"
+                  id={`chat-mode-${candidate}`}
+                  name="chat-mode"
+                  value={candidate}
+                  aria-label={`Mode ${modeLabel(candidate)}`}
+                  checked={mode === candidate}
+                  onChange={() => {
+                    if (mode !== candidate) navigateTo({ agent, mode: candidate });
+                  }}
+                />
+                <label htmlFor={`chat-mode-${candidate}`}>{modeLabel(candidate)}</label>
+              </span>
+            ))}
+          </div>
+          <p className="memory-hint">{modeGuidance(selection)}</p>
+        </fieldset>
+      </section>
+
+      <p aria-live="polite" className="chat-status chat-muted">
+        Chat {chatId} · agent {agent} · {mode === 'plan' ? 'Plan mode' : 'Action mode'}
+      </p>
 
       {resumeNotice && (
         <p aria-live="polite" className="chat-status chat-muted">
@@ -142,6 +283,26 @@ export function Chat({
                   if (part.type === 'tool-calculate') {
                     return <CalculatePartView key={index} part={part} />;
                   }
+                  if (part.type === 'tool-write_doc') {
+                    return <WriteDocPartView key={index} part={part} chatId={chatId} />;
+                  }
+                  if (part.type === 'tool-delegate_task') {
+                    return <DelegatePartView key={index} part={part} />;
+                  }
+                  if (part.type === 'tool-query_data') {
+                    return <QueryDataPartView key={index} part={part} />;
+                  }
+                  if (part.type === 'tool-search_memory') {
+                    return <SearchMemoryPartView key={index} part={part} />;
+                  }
+                  if (part.type === 'tool-ask_user') {
+                    return <AskUserPartView key={index} part={part} />;
+                  }
+                  if (typeof part.type === 'string' && part.type.startsWith('tool-')) {
+                    return (
+                      <GenericToolPartView key={index} view={part as { type: string; state: string; input: unknown; output?: unknown; errorText?: string }} />
+                    );
+                  }
                   return null;
                 })}
               </div>
@@ -161,6 +322,58 @@ export function Chat({
             Dismiss
           </button>
         </div>
+      )}
+
+      {pendingAsk !== null && (
+        <form
+          className="chat-composer chat-answer-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitAnswer();
+          }}
+        >
+          <label htmlFor="chat-answer">Your answer to the agent's question</label>
+          <textarea
+            id="chat-answer"
+            name="chat-answer"
+            aria-label="Answer to the agent's question"
+            value={answerDraft}
+            onChange={(event) => setAnswerDraft(event.target.value)}
+            onKeyDown={(event) => {
+              // Enter submits the answer; Shift+Enter keeps newlines.
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                submitAnswer();
+              }
+            }}
+            rows={2}
+            placeholder="Type your answer here…"
+            disabled={busy}
+          />
+          {pendingAsk.options.length > 0 && (
+            <div className="chat-answer-options" role="group" aria-label="Suggested answers">
+              {pendingAsk.options.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  className="memory-button"
+                  aria-label={`Use suggested answer: ${option}`}
+                  onClick={() => setAnswerDraft(option)}
+                  disabled={busy}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          )}
+          <button type="submit" disabled={!canAnswer}>
+            Send answer
+          </button>
+          <p className="memory-hint">
+            The reply is sent as a normal message in this chat; the API records it as the
+            question's answer and the agent continues with it.
+          </p>
+        </form>
       )}
 
       <form
@@ -185,12 +398,22 @@ export function Chat({
             }
           }}
           rows={3}
-          placeholder="Ask about math, e.g. What is 21+21?"
-          disabled={busy}
+          placeholder={
+            pendingAsk !== null
+              ? "Answer the agent's question in the form above."
+              : 'Ask anything, e.g. What is 21+21?'
+          }
+          disabled={busy || pendingAsk !== null}
         />
         <button type="submit" disabled={!canSend}>
           Send
         </button>
+        {pendingAsk !== null && (
+          <p className="memory-hint">
+            Send is paused because the agent asked you a question above — answer it there.
+            The normal message channel resumes as soon as the question is answered.
+          </p>
+        )}
       </form>
     </main>
   );
@@ -225,4 +448,280 @@ function CalculateResultView({ output }: { output: unknown }): React.ReactElemen
     );
   }
   return <p className="chat-tool-result chat-tool-error">{view.text}</p>;
+}
+
+/* ------------------------------------------------------------------ */
+/* write_doc                                                           */
+/* ------------------------------------------------------------------ */
+
+function WriteDocPartView({ part, chatId }: { part: WriteDocToolPart; chatId: string }): React.ReactElement {
+  const inputView = formatWriteDocInput(part.input);
+  const outputView = part.state === 'output-available' ? parseWriteDocOutput(part.output) : null;
+  const docId =
+    inputView.ok && inputView.view.docId !== null
+      ? inputView.view.docId
+      : outputView?.ok === true && isWorkDocId(outputView.view.documentId)
+        ? outputView.view.documentId
+        : null;
+  return (
+    <div className="chat-tool" data-state={part.state}>
+      <span className="chat-tool-name">write_doc</span>
+      <p className="chat-tool-line">{inputView.ok ? inputView.view.summary : inputView.text}</p>
+      {inputView.ok && inputView.view.contentPreview !== null && (
+        <p className="chat-tool-detail">{inputView.view.contentPreview}</p>
+      )}
+      {part.state === 'output-available' && outputView !== null && (
+        outputView.ok ? (
+          <p className="chat-tool-result">
+            Saved as v{outputView.view.version} ({outputView.view.status_text ?? 'unknown status'})
+            {docId !== null && isSafeChatId(chatId) && (
+              <>
+                {' — '}
+                <a href={workDocPagePath(docId, chatId)}>open document</a>
+              </>
+            )}
+          </p>
+        ) : (
+          <p className="chat-tool-result chat-tool-error">{outputView.text ?? 'The document result could not be read.'}</p>
+        )
+      )}
+      {part.state === 'output-error' && (
+        <p className="chat-tool-error">{part.errorText ?? 'The document operation failed.'}</p>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* delegate_task                                                       */
+/* ------------------------------------------------------------------ */
+
+function DelegatePartView({ part }: { part: DelegateTaskToolPart }): React.ReactElement {
+  const inputView = formatDelegateInput(part.input);
+  const target = inputView.ok ? (inputView.view.targetAgent ?? '') : '';
+  const outputView = part.state === 'output-available' ? parseDelegateOutput(part.output, target) : null;
+  return (
+    <div className="chat-tool" data-state={part.state}>
+      <span className="chat-tool-name">delegate_task</span>
+      {inputView.ok ? (
+        <>
+          <p className="chat-tool-line">
+            {inputView.view.mode !== null ? `${inputView.view.mode} → ${inputView.view.targetAgent ?? '?'}` : inputView.view.targetAgent ?? '?'}
+          </p>
+          <p className="chat-tool-detail">{inputView.view.taskPreview}</p>
+        </>
+      ) : (
+        <p className="chat-tool-line">{inputView.text}</p>
+      )}
+      {part.state === 'output-available' && outputView !== null && (
+        outputView.ok ? (
+          <>
+            <p className="chat-tool-result">
+              Delegation {outputView.view.status ?? 'unknown status'}
+              {outputView.view.resultPreview !== null && ` — ${outputView.view.resultPreview}`}
+              {outputView.view.errorText !== null && (
+                <span className="chat-tool-error"> — {outputView.view.errorText}</span>
+              )}
+            </p>
+            {outputView.view.childChatUrl !== null && (
+              <p className="chat-tool-result">
+                <a href={outputView.view.childChatUrl}>Open the child chat</a>
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="chat-tool-result chat-tool-error">The delegation result could not be read.</p>
+        )
+      )}
+      {part.state === 'output-error' && (
+        <p className="chat-tool-error">{part.errorText ?? 'The delegation failed.'}</p>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* query_data                                                          */
+/* ------------------------------------------------------------------ */
+
+function QueryDataPartView({ part }: { part: QueryDataToolPart }): React.ReactElement {
+  const inputView = formatQueryDataInput(part.input);
+  const outputView = part.state === 'output-available' ? parseQueryDataOutput(part.output) : null;
+  return (
+    <div className="chat-tool" data-state={part.state}>
+      <span className="chat-tool-name">query_data</span>
+      <p className="chat-tool-line">{toolStateLabel(part.state)}</p>
+      {inputView.ok && <pre className="chat-tool-sql">{inputView.view.sql}</pre>}
+      {part.state === 'output-available' && outputView !== null && (
+        outputView.ok ? (
+          <>
+            <p className="chat-tool-result">
+              {outputView.view.rowCount !== null ? `${outputView.view.rowCount} row(s)` : 'Query finished'}
+              {outputView.view.displayTruncated && ' — showing the first rows only'}
+            </p>
+            <div className="chat-tool-tablewrap">
+              <table className="chat-tool-table">
+                <thead>
+                  <tr>
+                    {outputView.view.columns.map((column) => (
+                      <th key={column} scope="col">
+                        {column}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {outputView.view.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {row.cells.map((cellText, cellIndex) => (
+                        <td key={cellIndex}>{cellText}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : (
+          <p className="chat-tool-result chat-tool-error">{outputView.text ?? 'The query result could not be read.'}</p>
+        )
+      )}
+      {part.state === 'output-error' && (
+        <p className="chat-tool-error">{part.errorText ?? 'The query failed or was rejected.'}</p>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* search_memory                                                       */
+/* ------------------------------------------------------------------ */
+
+function SearchMemoryPartView({ part }: { part: SearchMemoryToolPart }): React.ReactElement {
+  const inputView = formatSearchMemoryInput(part.input);
+  const outputView = part.state === 'output-available' ? parseSearchMemoryOutput(part.output) : null;
+  return (
+    <div className="chat-tool" data-state={part.state}>
+      <span className="chat-tool-name">search_memory</span>
+      {inputView.ok ? (
+        <p className="chat-tool-line">
+          {inputView.view.query}
+          {inputView.view.path !== null && ` in ${inputView.view.path}`}
+        </p>
+      ) : (
+        <p className="chat-tool-line">{inputView.text}</p>
+      )}
+      {part.state === 'output-available' && outputView !== null && (
+        outputView.ok ? (
+          <>
+            <p className="chat-tool-result">
+              {outputView.view.results.length} of {outputView.view.total} result(s)
+              {outputView.view.displayTruncated && ' — more were found'}
+            </p>
+            <ul className="chat-tool-list">
+              {outputView.view.results.map((result) => (
+                <li key={result.id} className="chat-tool-item">
+                  <span className="chat-tool-mono">{result.path}</span> · {result.kind} · score{' '}
+                  {result.score} (cosine {result.cosine}, recency {result.recency})
+                  <p className="chat-tool-detail">{result.contentPreview}</p>
+                </li>
+              ))}
+            </ul>
+            <p className="chat-tool-result">
+              <a href="/memory">Open the memory workspace</a>
+            </p>
+          </>
+        ) : (
+          <p className="chat-tool-result chat-tool-error">{outputView.text ?? 'The search result could not be read.'}</p>
+        )
+      )}
+      {part.state === 'output-error' && (
+        <p className="chat-tool-error">{part.errorText ?? 'The memory search failed.'}</p>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* ask_user (HITL) — the composer is the answer channel                */
+/* ------------------------------------------------------------------ */
+
+function AskUserPartView({ part }: { part: AskUserToolPart }): React.ReactElement {
+  const inputView = formatAskUserInput(part.input);
+  const answered =
+    part.state === 'output-available' ? parseAskUserOutput(part.output) : null;
+  return (
+    <div className="chat-tool chat-tool-ask" data-state={part.state} role="status" aria-live="polite">
+      {part.state === 'input-available' ? (
+        <>
+          <p className="chat-tool-ask-label" aria-hidden="true">
+            The agent asks you
+          </p>
+          {inputView.ok ? (
+            <>
+              <p className="chat-tool-ask-question">{inputView.view.question}</p>
+              {inputView.view.options.length > 0 && (
+                <ul className="chat-tool-list">
+                  {inputView.view.options.map((option) => (
+                    <li key={option} className="chat-tool-item">
+                      {option}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <p className="chat-tool-ask-hint">
+                Answer in the reply form below — it is sent as a normal message, recorded as this
+                question's answer, and the agent continues with it.
+              </p>
+            </>
+          ) : (
+            <p className="chat-tool-line">{inputView.text}</p>
+          )}
+        </>
+      ) : part.state === 'output-available' ? (
+        <>
+          <p className="chat-tool-ask-label" aria-hidden="true">
+            Agent question
+          </p>
+          {inputView.ok && <p className="chat-tool-ask-question">{inputView.view.question}</p>}
+          {answered !== null ? (
+            answered.ok ? (
+              <p className="chat-tool-result">Your answer: {answered.answer}</p>
+            ) : (
+              <p className="chat-tool-result chat-tool-error">
+                {answered.text ?? 'The recorded answer could not be read.'}
+              </p>
+            )
+          ) : (
+            <p className="chat-tool-result chat-tool-error">The recorded answer could not be read.</p>
+          )}
+        </>
+      ) : (
+        <>
+          <span className="chat-tool-name">ask_user</span>
+          <p className="chat-tool-line">{toolStateLabel(part.state)}</p>
+          {part.state === 'output-error' && (
+            <p className="chat-tool-error">{part.errorText ?? 'The question could not be prepared.'}</p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Generic fallback for unknown tool-* parts                           */
+/* ------------------------------------------------------------------ */
+
+function GenericToolPartView({ view }: { view: { type: string; state: string; input: unknown; output?: unknown; errorText?: string } }): React.ReactElement {
+  const generic = formatGenericToolPart(view);
+  return (
+    <div className="chat-tool" data-state={view.state}>
+      <span className="chat-tool-name">tool: {generic.name}</span>
+      <p className="chat-tool-line">{generic.stateLabel}</p>
+      {generic.inputText !== null && <p className="chat-tool-detail">Input: {generic.inputText}</p>}
+      {generic.outputText !== null && <p className="chat-tool-detail">Output: {generic.outputText}</p>}
+      {generic.errorText !== null && <p className="chat-tool-error">{generic.errorText}</p>}
+    </div>
+  );
 }

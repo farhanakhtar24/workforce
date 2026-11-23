@@ -528,3 +528,250 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase 4: chat agent/mode controls + tool part cards                 */
+/* ------------------------------------------------------------------ */
+
+.chat-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: flex-start;
+}
+
+.chat-controls > .memory-field,
+.chat-mode-fieldset {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.chat-mode-fieldset {
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.chat-mode-fieldset legend {
+  font-weight: 600;
+  padding: 0 0.25rem;
+}
+
+.chat-mode-fieldset:focus-within {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+}
+
+.chat-mode-options {
+  display: flex;
+  gap: 0.8rem;
+}
+
+.chat-mode-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.chat-mode-option input:focus-visible + label {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+}
+
+.chat-selector:focus-visible,
+.chat-mode-option input:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+}
+
+.chat-tool-detail {
+  margin: 0.15rem 0 0;
+  color: var(--chat-muted-fg);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chat-tool-sql {
+  margin: 0.15rem 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  background: var(--chat-assistant-bg);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+  padding: 0.3rem 0.5rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chat-tool-tablewrap {
+  margin-top: 0.25rem;
+  overflow-x: auto;
+}
+
+.chat-tool-table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  min-width: 100%;
+}
+
+.chat-tool-table th,
+.chat-tool-table td {
+  border: 1px solid var(--chat-border);
+  padding: 0.15rem 0.4rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.chat-tool-table th {
+  background: var(--chat-assistant-bg);
+}
+
+.chat-tool-list {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.chat-tool-item {
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.chat-tool-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.chat-tool-ask {
+  border-width: 2px;
+  border-color: var(--chat-accent);
+}
+
+.chat-tool-ask-label {
+  margin: 0;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--chat-accent);
+  font-weight: 600;
+}
+
+.chat-tool-ask-question {
+  margin: 0.15rem 0 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.chat-tool-ask-hint {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: var(--chat-muted-fg);
+}
+
+.chat-answer-form {
+  border: 2px solid var(--chat-accent);
+  border-radius: var(--chat-radius);
+  padding: 0.6rem 0.75rem;
+}
+
+.chat-answer-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 4: Work Docs and Delegations pages                            */
+/* ------------------------------------------------------------------ */
+
+.memory-card-title {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.work-link {
+  color: var(--chat-accent);
+  text-decoration: underline;
+  font-size: 0.85rem;
+}
+
+.work-link:focus-visible,
+.chat-nav a:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+}
+
+.work-doc-content {
+  margin: 0;
+  font: inherit;
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+  background: var(--chat-assistant-bg);
+  padding: 0.5rem 0.75rem;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+
+.work-doc-content-small {
+  margin-top: 0.2rem;
+  max-height: 8rem;
+  font-size: 0.8rem;
+  padding: 0.3rem 0.5rem;
+}
+
+.work-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.work-history-item {
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+  padding: 0.35rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.work-links {
+  border-top: 1px solid var(--chat-border);
+  padding-top: 0.4rem;
+}
+
+.work-links h3 {
+  font-size: 0.95rem;
+  margin: 0 0 0.3rem;
+}
+
+.delegation-card[data-status='pending'] {
+  border-color: var(--chat-warning-fg);
+}
+
+.delegation-card[data-status='running'] {
+  border-color: var(--chat-accent);
+}
+
+.delegation-card[data-status='failed'],
+.delegation-card[data-status='timeout'] {
+  border-color: var(--chat-error-fg);
+}
+

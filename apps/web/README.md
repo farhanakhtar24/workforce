@@ -1,13 +1,17 @@
 # @workforce/web
 
-Phase 2/3 minimal Next.js + React client for the Workforce API (`@workforce/api`).
-Chat: agent `general`, single `calculate` tool — rendered part by part, streamed
-incrementally. Memory: `/memory` create/browse/search/related/retry/compact
-workspace for the Phase 3 memory routes.
+Phase 2/3/4 minimal Next.js + React client for the Workforce API (`@workforce/api`).
+Chat: four agents (`general` / `orchestrator` / `analyst` / `researcher`) with
+plan/action modes over the same streaming, idempotent, resumable chat core —
+rendered part by part. Memory: `/memory` create/browse/search/related/retry/compact
+workspace for the Phase 3 memory routes. Work Docs and Delegations are the Phase 4
+additions.
 
 See `docs/phases/phase-2-streaming.md`, `docs/phases/phase-3-memory.md`,
-ADR-005 (SSE + idempotency), ADR-008 (UI message streams), ADR-003 (memory tree
-+ relations + compaction), and ADR-007 (pgvector + local MiniLM embeddings).
+`docs/phases/phase-4-multi-agent.md`, ADR-005 (SSE + idempotency), ADR-008 (UI
+message streams), ADR-001/002 (composition + same-REST tools), ADR-004
+(delegation depth cap 2), ADR-003 (memory tree) and ADR-007 (pgvector + local
+MiniLM embeddings).
 
 ## Stack
 
@@ -35,157 +39,138 @@ npm test           # tsx --test test/*.test.ts
 | `NEXT_PUBLIC_API_URL` | `http://localhost:3001` | The only client-exposed value (the public Express API base). Never an API key. |
 
 No secrets reach the browser: `OLLAMA_API_KEY` lives only in the API process.
-Memory embeddings run entirely server-side too: the MiniLM model
-(`Xenova/all-MiniLM-L6-v2`, 384-dim) is downloaded to a server-local cache on
-first use by the **API** process; `/memory` never loads, stores, or requests an
-embedding model or vectors. Blocks arrive as metadata only — the client even
-rejects any payload that carries an `embedding`/`vector` key.
+Memory embeddings run entirely server-side too (local MiniLM, 384-dim); `/memory`
+never loads, stores, or requests an embedding model or vectors, and the client
+rejects any block payload that carries an `embedding`/`vector` key.
 
 Copy `.env.example` to `.env.local` for non-default values.
 
-## Run against the live stack
+## Routes
 
-```sh
-npm run dev                                  # in apps/web
-npm run dev                                  # in apps/api, with Redis + .env.local
-# or from the repo root: npm run dev (starts API + web together; needs Redis and OLLAMA_API_KEY exported)
-# open http://localhost:3000 → redirects to /chat/<fresh-uuid>
-```
+| Route | Purpose |
+|---|---|
+| `/` | Mints a fresh chat id (server-side `crypto.randomUUID`) and redirects to the canonical chat URL, carrying a valid `?agent=`/`?mode=` from "New chat". |
+| `/agents/[slug]/chat/[chatId]` | **Canonical stable chat URL.** `slug` ∈ general/orchestrator/analyst/researcher; `?mode=plan\|action` optional (default `action`). Unknown slug → safe 404; unsafe id → 404; unknown mode → default. Server hydration calls `GET /api/agents/<slug>/chat/:chatId` with `no-store` for the SAME slug. |
+| `/chat/[chatId]` | Legacy Phase 2 URL — redirects to `/agents/general/chat/<chatId>` (a valid `?agent=`/`?mode=` is honored), so pre-Phase-4 links keep their general transcript. |
+| `/memory` | Phase 3 memory workspace (unchanged). |
+| `/work` | Work Docs library: filter by scope/chat id/type/status, list, create (real orchestrator POST route, draft v1, requires a chat context). |
+| `/work/[workDocId]?chatId=…` | Work Doc detail: content, metadata edit via PATCH (CAS `expectedVersion`), versioned content edit via the REAL agent versions route (CAS `expectedVersion`, new immutable version), revisions, versions, typed links, rollback (`expectedVersion` + `toVersion` + confirm). The owning `chatId` is required by every doc-scoped API call — cross-chat access is a fixed 404, and the UI never links a detail view without it. |
+| `/delegations?chatId=…` | One parent chat's delegations through the real `GET /api/agents/orchestrator/delegations?parentChatId=…` route: target, mode, depth, status, task, result/error, timestamps, child-chat link. Polls only while a row is pending/running (tab visible, no overlapping requests, stops on error). No manual run/retry: `/run` is an internal signed route the browser never calls. |
+
+## Chat (Phase 2 core, Phase 4 surface)
+
+- **Agent picker + Plan/Action** on every chat page. Selecting an agent or mode
+  navigates to the canonical URL for that (slug, mode); the server page re-hydrates
+  that key's transcript (transcripts are stored per `(slug, chatId)`), and the client
+  component is keyed by slug+mode so `useChat` re-seeds. Plan is visibly labeled as a
+  NEXT-generation choice — there is no mid-turn escalation; the mode rides the next
+  POST only.
+- **Send** (`POST /api/agents/<slug>/chat`): body is exactly
+  `{ id: chatId, message: newestUserMessage, mode }` (mode omitted only when no
+  selection is made), with the unchanged header `Idempotency-Key: <chatId>:<messageId>`
+  (API 400s on any mismatch; duplicate message id → 409 surfaced safely).
+- **Resume**: `useChat({ resume: true })` reconnects at mount via
+  `prepareReconnectToStreamRequest` against `GET …/chat/:chatId/stream` for the same
+  slug. `resumeStreamIsReplay` stays at its default `true` (ADR-008): full SSE replay,
+  interrupted assistant message rebuilt exactly once, `204` = silent idle.
+- **No stop button.** Refresh/disconnect never aborts the provider generation
+  (ADR-005); reconnecting resumes it. There is no abort call in this codebase.
+- **Throttle**: `experimental_throttle: 50` (≈50 ms) for streamed UI updates.
+- **Tool-part rendering** (`src/lib/tools.ts` + component views): human-labeled cards,
+  all content bounded plain text (React escapes; no `dangerouslySetInnerHTML`):
+  - `calculate` — unchanged Phase 2 rendering (dedicated tested helper).
+  - `write_doc` — create/update/rollback operation, doc id, target/version; links to
+    `/work/<id>?chatId=<current chat>` when the id is a UUID.
+  - `delegate_task` — target/mode/task bounded; status, result/error rounded down to
+    safe bounded text; child chat links to `/agents/<target>/chat/<childChatId>` only
+    for safe ids and worker slugs.
+  - `query_data` — bounded SQL, column/row table (≤8 rows on screen), `rowCount`, and
+    an explicit "showing the first rows only" note when the display is truncated.
+  - `search_memory` — query, ≤5 bounded results with path/kind/scores, link to `/memory`.
+  - `ask_user` — prominent, screen-reader-announced question with options; the answer
+    form below the thread is the channel:
+- **HITL answering**: while the newest message is an assistant turn holding a pending
+  (`input-available`) `ask_user` part, the normal composer is disabled and a labeled
+  answer form (textarea + suggested-answer buttons + "Send answer") is shown. Submitting
+  sends a NORMAL user message through the same path — the API marks the part
+  `output-available { answer }` and resumes the generation. No fake local answer state.
+  Generic `tool-*` parts fall back to a bounded name/state/input/output card.
+
+## /memory workspace (Phase 3 — unchanged)
+
+Same panels and behaviors as the Phase 3 release: create (bounded fields, live
+counter), browse (filters + refresh + auto-poll while blocks are `pending`), semantic
+search (80% cosine + 20% recency, fixed 3-decimal display), related blocks, retry for
+failed embeddings, compaction with the >30-character expectation gate. Pure helpers in
+`src/lib/memory.ts` (tested); polling is 2 s, visibility-gated, non-overlapping.
 
 ## Architecture
 
 ```
-app/page.tsx               root → creates crypto.randomUUID() → redirect /chat/:id
-app/chat/[chatId]/page.tsx server hydration fetch (no-store) → <Chat> seed
-app/memory/page.tsx        /memory shell → mounts the client <Memory> workspace
-src/components/Chat.tsx    'use client': useChat + transport + all rendering
-src/components/Memory.tsx  'use client': create/browse/search/related/retry/compact
-src/lib/api.ts             pure chat request/response helpers (tested)
-src/lib/memory.ts          pure memory request/validation/format helpers (tested)
-src/lib/calculate.ts       pure tool-part formatting helpers (tested)
-src/lib/messages.ts        UIMessage typing for the calculate tool
+app/page.tsx                          root → crypto.randomUUID() → redirect to canonical chat URL (with selection)
+app/chat/[chatId]/page.tsx            legacy /chat/:id → redirect (general; honors a valid ?agent=/)
+app/agents/[slug]/chat/[chatId]/page.tsx server hydration fetch (no-store) → <Chat> seed; safe notFound boundaries
+app/memory/page.tsx                   /memory shell → <Memory>
+app/work/page.tsx                     /work shell → <WorkDocsList> (chatId/scope/agent params validated)
+app/work/[workDocId]/page.tsx         detail shell → <WorkDocDetailView> (chatId required)
+app/delegations/page.tsx              delegation panel shell → <DelegationsView>
+src/components/Chat.tsx               'use client': agent/mode controls, useChat + transport, tool-part and HITL rendering
+src/components/Memory.tsx             'use client': Phase 3 workspace (unchanged)
+src/components/WorkDocs.tsx           'use client': library list + create (real routes)
+src/components/WorkDocDetail.tsx      'use client': metadata PATCH, versioned content edit, versions/revisions/links, rollback
+src/components/Delegations.tsx        'use client': parent-chat delegation list + polling
+src/lib/api.ts                        chat request/response helpers (send/hydrate/resume, slug-aware; tested)
+src/lib/agents.ts                     agent/mode roster, URL builders, guidance (tested)
+src/lib/tools.ts                      tool-part formatting + pending-ask_user scan (tested)
+src/lib/workdocs.ts                   Work-Docs request/body/mapping helpers (tested)
+src/lib/delegations.ts                delegation list mapping/query/poll helpers (tested)
+src/lib/memory.ts                     Phase 3 memory helpers (tested, unchanged)
+src/lib/calculate.ts                  Phase 2 calculate formatting (tested, unchanged)
+src/lib/messages.ts                   UIMessage typing for the six Phase 4 tool keys
 ```
 
-- **Stable chat ID in the URL.** `/` minted a fresh UUID per visit;
-  `/chat/:id` pages own it. No localStorage; the server is the source of truth
-  (`GET …/chat/:id` → `{ messages, hasActiveStream }`).
-- **Send** (`POST /api/agents/general/chat`): `prepareSendMessagesRequest`
-  sends the documented body — exactly `{ id: chatId, message: newestUserMessage }`
-  — and the exact header `Idempotency-Key: <chatId>:<messageId>` (API 400s on
-  any mismatch; 409 on duplicates → the client shows the error and the user can
-  send a new message).
-- **Hydration** (`GET …/chat/:id`): the server page fetches with `no-store`,
-  validates the shape, and passes `initialMessages` + `hasActiveStream` to the
-  client. API down at page load → the page still renders with a safe fixed
-  retry banner; build never depends on a running API (route is dynamic).
-- **Resume** (`GET …/chat/:id/stream`): `useChat({ resume: true })` reconnects
-  at mount via `prepareReconnectToStreamRequest`. `resumeStreamIsReplay` stays
-  at its **default `true`** (ADR-008): the API replays the whole stream, the
-  hook rebuilds the interrupted assistant message exactly once, and nothing
-  appends replayed deltas by hand. `204` (idle) is a silent no-op.
-- **No stop button.** Refresh/disconnect never aborts the provider generation
-  (ADR-005); reconnecting resumes it. There is no abort call in this codebase.
-- **Throttle**: `experimental_throttle: 50` (≈50 ms) for streamed UI updates.
-- **Navigation**: the chat header links to `/memory` (and keeps `New chat`);
-  `/memory` links back to `/`. Root metadata is `Workforce` with a
-  `%s · Workforce` title template.
+Design rules kept from Phase 2/3: stable ids in URLs, server as source of truth,
+`no-store` hydration, full-replay resume, no stop/abort, explicit accessible names on
+every control, `role="status"`/`role="alert"` live regions, visible focus outlines,
+single-column responsive layout, text-only rendering (React escapes everything), safe
+fixed error strings only.
 
-## /memory workspace (Phase 3)
+## Tests (offline, pure — node:test)
 
-Client component `src/components/Memory.tsx` + pure helpers `src/lib/memory.ts`
-against the Phase 3 REST routes (`POST /api/memory/blocks`,
-`GET /api/memory/blocks`, `POST /api/memory/search`,
-`GET /api/memory/blocks/:id/related`, `POST /api/memory/blocks/:id/retry`,
-`POST /api/memory/compact`). No dependency added; no test stack added.
+`npm test` runs 94 tests across:
 
-- **Create**: scope (default `default`), path (placeholder
-  `research/small-language-models`), kind select (six fixed kinds), content
-  textarea (1–1000 chars, live counter), confidence number input (0–1,
-  step 0.05, default 0.8), optional supersedes UUID (native `pattern`). Native
-  validation plus bounded lengths; submit disabled while busy; success/error
-  notices are live regions. After a create, the browse panel focuses the new
-  block's exact scope/path/kind and refetches, showing its `pending` status.
-- **Browse**: scope/path (prefix — includes descendants)/kind/keyword filters,
-  include-superseded checkbox, limit select (5–100, API default 20), explicit
-  Refresh button. Cards show content, path, kind, confidence, embedding status,
-  created/updated/embedded/last-accessed timestamps, access count, embedding
-  model and a `superseded by <id>` marker when applicable.
-- **Semantic search**: query + optional path/kind/limit. Results show
-  content/path/kind plus cosine, recency and the final score, each formatted
-  with fixed 3 decimals. The page explains the formula: final score = **80%
-  semantic (cosine) + 20% recency**; only `ready` embeddings are searchable.
-- **Related**: per-block action fetches `{ block, outgoing, incoming }` and
-  renders each relation (`supports` / `supersedes` / `contradicts`) with the
-  neighbor's content.
-- **Retry**: per-block action, enabled only for `embeddingStatus: failed`
-  (disabled while retrying a request or for `pending`/`ready` blocks — the API
-  answers 409 for a ready block and the safe error is surfaced verbatim).
-- **Compact**: scope + **exact** path and a required expectation note (`>30`
-  chars). The response is only ever reported as `queued` (with the trigger
-  block id) — the UI never fabricates a summary.
-- **Live updates**: the open browse list polls every 2 s *only while* at least
-  one rendered block is `pending`, the tab is visible, and no prior poll is in
-  flight; it stops on error, when only `ready`/`failed` blocks remain, and on
-  unmount. A request-sequence guard discards stale responses. Manual refresh
-  always works.
-- **Accessibility & safety**: every control is labeled; async notices use
-  `role="status"` or `role="alert"` with `aria-live`; focus outlines and
-  keyboard operability come from native elements; layout is single-column and
-  responsive; all content renders as escaped text only (no
-  `dangerouslySetInnerHTML`, so no HTML injection path). Errors are always the
-  API's safe `{ error }` message or a fixed fallback — never stacks, payloads
-  or internals.
+- `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
+  hydration mapping, safe errors) — unchanged and green.
+- `test/calculate.test.ts` — `calculate` output formatting — unchanged and green.
+- `test/memory.test.ts` — Phase 3 memory helpers — unchanged and green.
+- `test/agents.test.ts` — roster/mode parsing, canonical + legacy URL building,
+  child-chat URL gating, slug-aware send/hydrate/resume endpoints, `{id,message,mode}`
+  body + unchanged idempotency header, plan/action guidance that names only composed tools.
+- `test/tools.test.ts` — lifecycle labels, bounded text/JSON shaping, write_doc /
+  delegate_task / query_data / search_memory / ask_user parsing, pending-ask_user
+  scan, generic unknown-tool fallback.
+- `test/workdocs.test.ts` — exact endpoint URLs (?chatId everywhere it is required),
+  list/PATCH/version/rollback/create body contracts (CAS `expectedVersion` +
+  `toVersion`), response mappers (valid/malformed), 409 conflict text + hint,
+  typed-link → in-app page mapping, display truncation.
+- `test/delegations.test.ts` — required `parentChatId` query, row validation against
+  the status machine, poll predicate (pending/running only), child-chat URL gating,
+  safe error collapse, no-retry stance (the guarded `/run` route is never surfaced).
 
-### First use, local model behavior
+## Validation limitations (honest — the phase gate is Farhan's live run)
 
-- Embeddings are computed **server-side** in the API process by local
-  Transformers.js (`Xenova/all-MiniLM-L6-v2`, 384-dim). On first use the API
-  downloads the model into a project-local ignored cache; afterwards it works
-  offline. The browser never downloads or runs any model, and no model name or
-  API key appears in the web bundle beyond the embedding-model string that the
-  API may include in a block's metadata field.
-- A freshly created block reports `embeddingStatus: pending`; the browse list
-  auto-polls until it turns `ready` (or `failed`, which can then be retried).
-  Semantic search returns nothing for pending/failed blocks by design.
-
-### /memory live validation checklist (not yet run — the gate below is manual)
-
-1. Create a block → card appears `pending` → auto-poll flips it to `ready`.
-2. Stop the API → browse/search show the fixed safe error banner; polling
-   stops; manual refresh recovers once the API is back.
-3. Path prefix: browse `research` lists `research/small-language-models` and
-   deeper descendants.
-4. Supersede: create a block with a supersedes UUID → default list hides the
-   old block; "Include superseded" shows it with the marker; Related on either
-   side shows the `supersedes` relation.
-5. Search: relevant result ranks first; cosine/recency/final displayed; a
-   query with no ready embeddings returns an empty-but-successful result.
-6. Retry: failed block can retry (notice + refreshed status); ready block's
-   retry button is disabled.
-7. Compact: expectation < 31 chars blocks submit; valid note queues the job
-   and reports `queued` + trigger id — no summary until the job finishes.
-- **Rendering**: messages render by parts — text streams incrementally;
-  `tool-calculate` parts show lifecycle state, input (`expression`), and the
-  output, which is currently the JSON string `{"result":14}` — parsed safely
-  and rendered as plain text only (no `dangerouslySetInnerHTML`, so no HTML
-  injection path). Status line shows `submitted / streaming / ready / error`;
-  error text goes through `describeChatError`, which surfaces only the API's
-  fixed safe `{"error": …}` message or a fixed fallback.
-
-## Validation limitations (honest)
-
-- Tests cover only the **pure helpers**: send body/headers, resume and
-  hydration URLs, base-URL resolution, id-format parity with the API,
-  hydration mapping, safe error mapping, `calculate` output formatting, and —
-  for `/memory` — endpoint/query/body mappings, response validation (including
-  rejection of vector-bearing payloads), safe error collapse, score/date
-  formatting, the compaction expectation gate, and the pending-poll predicate.
-  No React rendering tests were added (by design, no extra stack).
-- Live validation items **not yet manually verified** in this repo worktree:
-  actual browser streaming, mid-stream refresh → full replay with no
-  duplicated tokens, `204` resume, `409` double-submit surfacing, CORS
-  preflight, throttled rendering smoothness, and **every `/memory` item in the
-  checklist above** (the API routes and worker are being built concurrently —
-  nothing here has been run against the live Phase 3 stack). Run the API
-  `npm run dev` (with Redis + Postgres/pgvector) and `npm run dev` here, then
-  walk the phase-3 live checklist and gate.
+- Tests cover only the **pure helpers**. No React/browser tests were added
+  (by design, no extra stack).
+- Not yet run against the live Phase 4 stack: agent/mode switch navigation +
+  per-slug hydration, plan-mode generations actually WITHOUT write/delegation tools,
+  `write_doc` → Work Doc page round-trip, CAS conflict (409) behavior in the PATCH /
+  version forms, rollback creating a new version, delegation status polling
+  (`pending → running → completed/failed/timeout`), child-chat linking, and HITL
+  `ask_user` end-to-end (question asked → answer submitted through the normal POST →
+  part resolved → generation resumed). Run the API (`npm run dev` in `apps/api`, with
+  Redis + Postgres) and `npm run dev` here, then walk the phase-4 validation gate.
+- Content editing in the UI goes through the REAL agent versions route
+  (`POST …/work-docs/:id/versions`) with `source: 'user'` recorded in the
+  revision trail (the route accepts optional `source: 'agent' | 'user'`,
+  default `agent`; agent-originated `write_doc` calls stay server-side).
+  There is no shadow user-content endpoint.

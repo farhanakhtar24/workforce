@@ -2,17 +2,22 @@
  * Pure, testable request/response helpers for the @workforce/web client.
  *
  * Contract source of truth: `apps/api/src/http/routes.ts` and `apps/api/src/validation.ts`.
- * - POST /api/agents/general/chat          body exactly `{ id, message }` with the
- *   newest user `UIMessage`; header `Idempotency-Key` must equal
- *   `${chatId}:${message.id}` (400 otherwise).
- * - GET  /api/agents/general/chat/:chatId          hydration: `{ messages, hasActiveStream }`,
+ * - POST /api/agents/:slug/chat              body exactly `{ id, message }` with the
+ *   newest user `UIMessage` (plus the optional Phase 4 `mode`), header
+ *   `Idempotency-Key` must equal `${chatId}:${message.id}` (400 otherwise).
+ * - GET  /api/agents/:slug/chat/:chatId          hydration: `{ messages, hasActiveStream }`,
  *   Cache-Control no-store.
- * - GET  /api/agents/general/chat/:chatId/stream  resume; 204 when idle; full SSE
+ * - GET  /api/agents/:slug/chat/:chatId/stream  resume; 204 when idle; full SSE
  *   replay (`resumeStreamIsReplay` stays at its `true` default — see ADR-008).
+ *
+ * The slug is part of every chat URL: transcript hydration/resume keys are
+ * (slug, chatId), so the SAME slug must be used for send/hydrate/resume of a
+ * conversation. All builders default to `general`, which keeps every Phase 2
+ * call site and test byte-identical.
  */
 import type { UIMessage } from 'ai';
 
-/** The only agent slug that exists in Phase 2. */
+/** The Phase 2 slug — still the default for every endpoint builder. */
 export const AGENT_SLUG = 'general';
 
 /** Default browser-facing API base; overridden via NEXT_PUBLIC_API_URL. */
@@ -35,16 +40,16 @@ export function resolveApiBaseUrl(envValue: string | undefined): string {
   return trimmed.replace(/\/+$/, '');
 }
 
-export function sendMessagesEndpoint(apiBaseUrl: string): string {
-  return `${apiBaseUrl}/api/agents/${AGENT_SLUG}/chat`;
+export function sendMessagesEndpoint(apiBaseUrl: string, slug: string = AGENT_SLUG): string {
+  return `${apiBaseUrl}/api/agents/${encodeURIComponent(slug)}/chat`;
 }
 
-export function hydrationEndpoint(apiBaseUrl: string, chatId: string): string {
-  return `${apiBaseUrl}/api/agents/${AGENT_SLUG}/chat/${encodeURIComponent(chatId)}`;
+export function hydrationEndpoint(apiBaseUrl: string, chatId: string, slug: string = AGENT_SLUG): string {
+  return `${apiBaseUrl}/api/agents/${encodeURIComponent(slug)}/chat/${encodeURIComponent(chatId)}`;
 }
 
-export function resumeStreamEndpoint(apiBaseUrl: string, chatId: string): string {
-  return `${apiBaseUrl}/api/agents/${AGENT_SLUG}/chat/${encodeURIComponent(chatId)}/stream`;
+export function resumeStreamEndpoint(apiBaseUrl: string, chatId: string, slug: string = AGENT_SLUG): string {
+  return `${apiBaseUrl}/api/agents/${encodeURIComponent(slug)}/chat/${encodeURIComponent(chatId)}/stream`;
 }
 
 /** The API requires the key to be exactly `${chatId}:${messageId}`. */
@@ -67,30 +72,41 @@ export function newestUserMessage(messages: readonly UIMessage[]): UIMessage | n
 export interface PreparedSendRequest {
   /** Full URL for DefaultChatTransport's prepared `api`. */
   url: string;
-  /** Exactly `{ id, message }` — no wrapper keys (API rejects extras). */
-  body: { id: string; message: UIMessage };
+  /**
+   * Exactly `{ id, message }` — plus `mode` only when a selection is passed
+   * (Phase 4 `mode?: 'plan' | 'action'`; the API 400s on unknown keys).
+   */
+  body: { id: string; message: UIMessage; mode?: 'plan' | 'action' };
   headers: { 'Idempotency-Key': string };
 }
 
 /**
  * Builds the documented POST for the newest user message. Throws when no user
  * message exists (the API requires one); the hook surfaces the rejection as
- * chat error state.
+ * chat error state. `slug` selects the agent's send route (default `general`);
+ * `mode` — when provided — travels in the body as the Phase 4
+ * plan/action selection; the header contract is untouched.
  */
 export function buildSendRequest(options: {
   apiBaseUrl: string;
   chatId: string;
   messages: readonly UIMessage[];
+  slug?: string;
+  mode?: 'plan' | 'action';
 }): PreparedSendRequest {
-  const { apiBaseUrl, chatId, messages } = options;
-  const message = newestUserMessage(messages);
+  const { apiBaseUrl, slug, mode } = options;
+  const message = newestUserMessage(options.messages);
   if (!message) {
     throw new Error('A user message is required to start a chat turn.');
   }
   return {
-    url: sendMessagesEndpoint(apiBaseUrl),
-    body: { id: chatId, message },
-    headers: { 'Idempotency-Key': idempotencyKey(chatId, message.id) },
+    url: sendMessagesEndpoint(apiBaseUrl, slug),
+    body: {
+      id: options.chatId,
+      message,
+      ...(mode !== undefined ? { mode } : {}),
+    },
+    headers: { 'Idempotency-Key': idempotencyKey(options.chatId, message.id) },
   };
 }
 
@@ -102,14 +118,16 @@ export interface PreparedReconnectRequest {
 /**
  * Reconnect (resume) request: a GET against the Express stream route. The
  * replays/delta behavior is decided by the transport default
- * (`resumeStreamIsReplay: true`), which we never disable.
+ * (`resumeStreamIsReplay: true`), which we never disable. Resume streams are
+ * keyed (slug, chatId), so the selected slug must be passed here too.
  */
 export function buildReconnectRequest(options: {
   apiBaseUrl: string;
   chatId: string;
+  slug?: string;
 }): PreparedReconnectRequest {
-  const { apiBaseUrl, chatId } = options;
-  return { url: resumeStreamEndpoint(apiBaseUrl, chatId) };
+  const { apiBaseUrl } = options;
+  return { url: resumeStreamEndpoint(apiBaseUrl, options.chatId, options.slug) };
 }
 
 /**
@@ -205,14 +223,16 @@ export interface FetchLike {
 export async function fetchChatHydration(options: {
   apiBaseUrl: string;
   chatId: string;
+  /** Agent slug of the conversation (default `general`). */
+  slug?: string;
   fetchImpl?: FetchLike;
 }): Promise<HydrationResult> {
-  const { apiBaseUrl, chatId, fetchImpl = fetch } = options;
-  if (!isSafeChatId(chatId)) {
+  const { apiBaseUrl, slug, fetchImpl = fetch } = options;
+  if (!isSafeChatId(options.chatId)) {
     return { ok: false, error: HYDRATION_ERROR_INVALID };
   }
   try {
-    const response = await fetchImpl(hydrationEndpoint(apiBaseUrl, chatId), {
+    const response = await fetchImpl(hydrationEndpoint(apiBaseUrl, options.chatId, slug), {
       method: 'GET',
       cache: 'no-store',
       headers: { accept: 'application/json' },

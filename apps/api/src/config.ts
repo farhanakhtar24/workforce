@@ -36,6 +36,16 @@ export interface ApiConfig {
   readonly databaseUrl: string | null;
   /** Absolute repo-local directory for the local embedding model cache. */
   readonly embeddingCacheDir: string;
+  /** Phase 4: loopback base the tools/delegation runner call (default `http://127.0.0.1:<PORT>`). */
+  readonly internalApiBaseUrl: string;
+  /** Phase 4: HMAC secret for the internal delegation context; null → per-boot random. */
+  readonly delegationContextSecret: string | null;
+  /** Phase 4: bounded child-delegation timeout in ms (default 120000). */
+  readonly delegationTimeoutMs: number;
+  /** Phase 4: statement_timeout for `query_data` (default 2000). */
+  readonly queryStatementTimeoutMs: number;
+  /** Phase 4: row cap for `query_data`, enforced as LIMIT cap+1 (default 200). */
+  readonly queryRowCap: number;
 }
 
 /** Default model cache directory, resolved relative to the process cwd. */
@@ -86,6 +96,11 @@ const BLANK_AS_ABSENT_ENV_KEYS = [
   'WEB_ORIGIN',
   'DATABASE_URL',
   'EMBEDDING_CACHE_DIR',
+  'INTERNAL_API_BASE_URL',
+  'DELEGATION_CONTEXT_SECRET',
+  'DELEGATION_TIMEOUT_MS',
+  'QUERY_STATEMENT_TIMEOUT_MS',
+  'QUERY_ROW_CAP',
 ] as const;
 
 const envSchema = z.object({
@@ -127,6 +142,39 @@ const envSchema = z.object({
     .min(1, 'EMBEDDING_CACHE_DIR must not be empty')
     .default(DEFAULT_EMBEDDING_CACHE_DIR)
     .transform((value) => resolveEmbeddingCacheDir(value)),
+  // Phase 4: loopback base URL the capability tools/delegation runner call.
+  // Parsed only for shape; a per-request URL is composed from it. Never echoed.
+  INTERNAL_API_BASE_URL: z
+    .string({ message: 'INTERNAL_API_BASE_URL must be a string' })
+    .regex(/^https?:\/\/[a-zA-Z0-9._-]+(:\d+)?$/, 'INTERNAL_API_BASE_URL must be an http(s) origin without a path')
+    .optional()
+    .transform((value) => (value === undefined ? null : value.replace(/\/+$/, ''))),
+  // Phase 4: HMAC secret for the internal delegation context. Optional: when
+  // absent the server generates a throwaway randomBytes(32) secret per boot.
+  // Never logged; never echoed in errors.
+  DELEGATION_CONTEXT_SECRET: z
+    .string({ message: 'DELEGATION_CONTEXT_SECRET must be a string' })
+    .min(16, 'DELEGATION_CONTEXT_SECRET must be at least 16 characters')
+    .optional()
+    .transform((value) => (value === undefined ? null : value)),
+  DELEGATION_TIMEOUT_MS: z.coerce
+    .number({ message: 'DELEGATION_TIMEOUT_MS must be an integer between 1000 and 600000 (default: 120000)' })
+    .int('DELEGATION_TIMEOUT_MS must be an integer (default: 120000)')
+    .min(1000, 'DELEGATION_TIMEOUT_MS must be between 1000 and 600000 (default: 120000)')
+    .max(600_000, 'DELEGATION_TIMEOUT_MS must be between 1000 and 600000 (default: 120000)')
+    .default(120_000),
+  QUERY_STATEMENT_TIMEOUT_MS: z.coerce
+    .number({ message: 'QUERY_STATEMENT_TIMEOUT_MS must be an integer between 100 and 300000 (default: 2000)' })
+    .int('QUERY_STATEMENT_TIMEOUT_MS must be an integer (default: 2000)')
+    .min(100, 'QUERY_STATEMENT_TIMEOUT_MS must be between 100 and 300000 (default: 2000)')
+    .max(300_000, 'QUERY_STATEMENT_TIMEOUT_MS must be between 100 and 300000 (default: 2000)')
+    .default(2_000),
+  QUERY_ROW_CAP: z.coerce
+    .number({ message: 'QUERY_ROW_CAP must be an integer between 1 and 10000 (default: 200)' })
+    .int('QUERY_ROW_CAP must be an integer (default: 200)')
+    .min(1, 'QUERY_ROW_CAP must be between 1 and 10000 (default: 200)')
+    .max(10_000, 'QUERY_ROW_CAP must be between 1 and 10000 (default: 200)')
+    .default(200),
 });
 
 /**
@@ -157,5 +205,10 @@ export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     webOrigin: data.WEB_ORIGIN,
     databaseUrl: data.DATABASE_URL,
     embeddingCacheDir: data.EMBEDDING_CACHE_DIR,
+    internalApiBaseUrl: data.INTERNAL_API_BASE_URL ?? `http://127.0.0.1:${data.PORT}`,
+    delegationContextSecret: data.DELEGATION_CONTEXT_SECRET,
+    delegationTimeoutMs: data.DELEGATION_TIMEOUT_MS,
+    queryStatementTimeoutMs: data.QUERY_STATEMENT_TIMEOUT_MS,
+    queryRowCap: data.QUERY_ROW_CAP,
   });
 }

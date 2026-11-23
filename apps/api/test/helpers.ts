@@ -16,6 +16,17 @@ import { createInMemoryStreamContext, type InMemoryStreamContext, type InMemoryS
 import type { StreamContext } from '../src/stream-context/types.js';
 import type { ChatStore } from '../src/store/types.js';
 import type { MemoryRouteDeps } from '../src/memory/routes.js';
+import {
+  createDelegationContextSigner,
+  type DelegationContextSigner,
+} from '../src/agents/delegation-context.js';
+import type { HostCapabilityDeps, FetchLike } from '../src/agents/host-capabilities.js';
+import { WorkDocService } from '@workforce/core/work-docs';
+import { InMemoryWorkDocStore } from '@workforce/core/work-docs';
+import { InMemoryDelegationRepository, type DelegationRepository } from '@workforce/core/delegation';
+import type { DelegationJobQueue } from '../src/agents/delegation-queue.js';
+import type { DataQueryService } from '../src/agents/data-query.js';
+import { createDelegationRoutes } from '../src/agents/delegation-routes.js';
 
 export const TEST_ORIGINAL_ORIGIN = 'http://localhost:3000';
 
@@ -78,6 +89,28 @@ export function calculateStep(expression = '2+2'): LanguageModelV3StreamPart[] {
   ];
 }
 
+/** One tool-call response invoking an arbitrary tool with a JSON input. */
+export function toolCallStep(
+  toolName: 'ask_user' | 'delegate_task' | 'write_doc' | 'query_data' | 'search_memory' | 'calculate',
+  input: unknown,
+  toolCallId = 'c1',
+): LanguageModelV3StreamPart[] {
+  const encoded = JSON.stringify(input);
+  const finish: LanguageModelV3StreamPart = {
+    type: 'finish',
+    usage: mockUsage(),
+    finishReason: { unified: 'tool-calls', raw: undefined },
+  };
+  return [
+    { type: 'stream-start', warnings: [] },
+    { type: 'tool-input-start', id: toolCallId, toolName },
+    { type: 'tool-input-delta', id: toolCallId, delta: encoded },
+    { type: 'tool-input-end', id: toolCallId },
+    { type: 'tool-call', toolCallId, toolName, input: encoded },
+    finish,
+  ];
+}
+
 export interface MockModelSpec {
   /** Steps served one per doStream call. */
   steps: LanguageModelV3StreamPart[][];
@@ -118,9 +151,36 @@ export function userMessage(text: string, id = randomId()): UIMessage {
   return { id, role: 'user', parts: [{ type: 'text', text }] };
 }
 
+/**
+ * A stored assistant message holding ONE pending `ask_user` tool part
+ * (`input-available`) — the shape the stream machinery persists when the
+ * execute-less tool ends the turn.
+ */
+export function assistantMessageWithAskUser(options: {
+  id: string;
+  question: string;
+  toolCallId: string;
+}): UIMessage {
+  return {
+    id: options.id,
+    role: 'assistant',
+    parts: [
+      {
+        type: 'tool-ask_user',
+        toolCallId: options.toolCallId,
+        state: 'input-available',
+        input: { question: options.question },
+      } as unknown as UIMessage['parts'][number],
+    ],
+  };
+}
+
 export function randomId(): string {
   return `id-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+/** Fixed test secret for the internal delegation context (never a real one). */
+export const TEST_DELEGATION_SECRET = 'test-secret-for-signature-0123456789abcdef';
 
 /** Seeds chat history through the append-only contract, oldest first. */
 export async function seedMessages(
@@ -142,6 +202,20 @@ export interface TestAppOptions {
   onBackgroundError?: (error: unknown) => void;
   /** Phase 3 memory pipeline; when omitted the memory routes are absent. */
   memory?: MemoryRouteDeps;
+  /** Phase 4 agent runtime fixture (see {@link startAgentsTestApp}). */
+  agents?: AgentsFixtures;
+}
+
+export interface AgentsFixtures {
+  /** Loopback origin substituted for the placeholder at request time. */
+  delegationTimeoutMs?: number;
+  workDocService?: WorkDocService;
+  delegationRepo?: DelegationRepository;
+  delegationQueue?: DelegationJobQueue | null;
+  /** When false the whole agent runtime is omitted (legacy surface tests). */
+  wire?: boolean;
+  dataQueryService?: DataQueryService;
+  queryRowCap?: number;
 }
 
 export interface TestApp {
@@ -154,6 +228,16 @@ export interface TestApp {
   port: number;
   /** Phase 3 memory deps as injected (undefined when omitted). */
   memory?: MemoryRouteDeps;
+  /** Phase 4 runtime handles when the agent fixture is wired. */
+  agents?: {
+    hostDeps: HostCapabilityDeps;
+    signer: DelegationContextSigner;
+    /** Loopback origin the injected fetchFn rewrites to this port. */
+    internalOrigin: string;
+    workDocService: WorkDocService | undefined;
+    delegationRepo: DelegationRepository | undefined;
+    delegationQueue: DelegationJobQueue | null | undefined;
+  };
   /** Closes the HTTP server and drains tracked background tasks. */
   close(): Promise<void>;
 }
@@ -169,6 +253,35 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
     onError: options.onBackgroundError ?? (() => undefined),
   });
   const config = testConfig({ webOrigin: options.webOrigin ?? TEST_ORIGINAL_ORIGIN });
+
+  // Phase 4 fixtures: the tools/delegations call the SAME REST API through a
+  // rewriting fetch — the placeholder origin is substituted with the real
+  // ephemeral port once the server is listening, so every child chat, run,
+  // work-doc, memory, and query call flows through the one Express app.
+  const INTERNAL_ORIGIN = 'http://workforce-test-internal';
+  const agentsFixtures = options.agents;
+  let livePort = 0;
+  const agentFetchFn: FetchLike = (input, init) => {
+    const rewritten = typeof input === 'string' ? input.replace(INTERNAL_ORIGIN, `http://127.0.0.1:${livePort}`) : input;
+    return fetch(rewritten, init);
+  };
+  const signer = createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8'));
+  const delegationTimeoutMs = agentsFixtures?.delegationTimeoutMs ?? 120_000;
+  const hostDeps: HostCapabilityDeps = {
+    fetchFn: agentFetchFn,
+    baseUrl: INTERNAL_ORIGIN,
+    signer,
+    delegationTimeoutMs,
+  };
+  const workDocService =
+    agentsFixtures?.workDocService ??
+    (agentsFixtures === undefined ? undefined : new WorkDocService({ store: new InMemoryWorkDocStore() }));
+  const delegationRepo =
+    agentsFixtures?.delegationRepo ??
+    (agentsFixtures === undefined ? undefined : new InMemoryDelegationRepository());
+  const delegationQueue = agentsFixtures?.delegationQueue ?? null;
+  const dataQueryService = agentsFixtures?.dataQueryService;
+
   const app = buildApp({
     config,
     store,
@@ -176,6 +289,31 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
     model: options.model as LanguageModel,
     background,
     memory: options.memory,
+    agents:
+      agentsFixtures?.wire === false
+        ? undefined
+        : {
+            hostDeps,
+            signer,
+            workDocs: agentsFixtures === undefined ? undefined : { service: workDocService as WorkDocService },
+            delegations:
+              agentsFixtures === undefined
+                ? undefined
+                : createDelegationRoutes({
+                    repo: delegationRepo as DelegationRepository,
+                    queue: delegationQueue,
+                    chatStore: store,
+                    signer,
+                    fetchFn: agentFetchFn,
+                    baseUrl: INTERNAL_ORIGIN,
+                    delegationTimeoutMs,
+                    logger: { error: () => undefined, warn: () => undefined },
+                  }),
+            dataQuery:
+              dataQueryService === undefined || agentsFixtures === undefined
+                ? undefined
+                : { service: dataQueryService, rowCap: agentsFixtures?.queryRowCap ?? 200 },
+          },
   });
   const server = app.listen(0);
   await new Promise<void>((resolve, reject) => {
@@ -186,12 +324,24 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
   if (address === null || typeof address === 'string') {
     throw new Error('test server did not get an ephemeral port');
   }
+  livePort = address.port;
   return {
     config,
     store,
     streamContext,
     background,
     memory: options.memory,
+    agents:
+      agentsFixtures === undefined
+        ? undefined
+        : {
+            hostDeps,
+            signer,
+            internalOrigin: INTERNAL_ORIGIN,
+            workDocService,
+            delegationRepo,
+            delegationQueue,
+          },
     server,
     port: address.port,
     async close() {

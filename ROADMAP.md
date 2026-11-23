@@ -80,7 +80,7 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 ## Phase 3 — Memory, Embeddings, Hybrid Search (1-2 weeks)
 
-**Status (2026-11-19, last updated 2026-11-19)**: 🚧 **Active — implementation complete, automated + real-service validation green, live gate pending.** Phase 2 closed 2026-11-19 and Farhan said "next"; this phase started the same day. The design is fixed (not open for re-litigation) and recorded in [ADR-003](./docs/decisions/ADR-003-memory-tree.md) (memory tree + relations + compaction) and [ADR-007](./docs/decisions/ADR-007-pgvector.md) (pgvector + local MiniLM embeddings), both accepted 2026-11-19. Implementation is in place: the memory domain + Prisma/pgvector adapter + migrations in `packages/core`, the memory REST routes + local Transformers.js embeddings + Ollama compactor + BullMQ worker in `apps/api`, the `/memory` page in `apps/web`, and docker-compose Postgres/pgvector alongside Redis — **339 green offline tests** (core 131, CLI 30, API 133, web 45). Automated real-stack validation: real Postgres/pgvector+BullMQ integration **14/14 twice** (`npm run test:integration`), real local-MiniLM embedding smoke **5/5 twice** (`npm run test:embedding`; real model download cached project-locally), plus a real-service browser smoke with a **dummy** key (create pending→ready, semantic search cosine 0.557 / recency 1.0 / score 0.646, correction supersession + outgoing related display, desktop/mobile accessibility with zero missing names) and the `npm run demo:memory` seeder for the live walkthrough. **Not completed**: the real Ollama compaction call (dummy key could not exercise it) and Farhan's live-gate approval — the phase is incomplete until Farhan explicitly approves.
+**Status (started 2026-11-19, closed 2026-11-23)**: ✅ **Validated.** Phase 2 closed 2026-11-19 and Farhan said "next"; this phase started the same day. The design is fixed (not open for re-litigation) and recorded in [ADR-003](./docs/decisions/ADR-003-memory-tree.md) (memory tree + relations + compaction) and [ADR-007](./docs/decisions/ADR-007-pgvector.md) (pgvector + local MiniLM embeddings), both accepted 2026-11-19. Implementation is in place: the memory domain + Prisma/pgvector adapter + migrations in `packages/core`, the memory REST routes + local Transformers.js embeddings + Ollama compactor + BullMQ worker in `apps/api`, the `/memory` page in `apps/web`, and docker-compose Postgres/pgvector alongside Redis — **374 green offline tests** (core 137, CLI 30, API 162, web 45). Real-stack validation: real Postgres/pgvector+BullMQ integration **14/14**, real local-MiniLM embedding smoke **5/5** — and the closing live demo on **2026-11-23** with Farhan's REAL Ollama key: the `reasoningEffort: 'low'` compactor succeeded (one ready `learning` summary; the 30 observation sources retained and superseded) and the `/memory` page showed the READY summary plus the superseded observations. Farhan confirmed the live flow and approved progression ("yes, next phase") on **2026-11-23**. The topic self-assessment remained **waived** (never completed; not claimed by this phase). Details: [phase doc](./docs/phases/phase-3-memory.md).
 
 **Goal**: Memory that survives past 50 entries — hierarchical, vector-searchable, compactable.
 
@@ -101,9 +101,9 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 - BullMQ `workforce-memory` queue on the existing Redis (embedding + compaction jobs)
 - LLM compaction when active blocks at an exact path exceed 30 (sources retained, superseded)
 - Local infra: docker-compose Postgres/pgvector (`pgvector/pgvector:pg16`, host port `127.0.0.1:55432`) + `npm run dev:infra` / `npm run db:migrate`; `DATABASE_URL` defaults to the local dev stack (`postgresql://workforce:workforce@127.0.0.1:55432/workforce`) — Phase 6 deployment must set an explicit secret URL
-- REST routes in `apps/api` + the `/memory` page in `apps/web` (built — validation pending)
+- REST routes in `apps/api` + the `/memory` page in `apps/web` (built — validated 2026-11-23)
 
-**Validation**: I read you 20 test memories; you run queries against them — and explain *why* a specific result ranked higher (the 0.8/0.2 score + tie-breaks). Plus the live gate in the [phase doc](./docs/phases/phase-3-memory.md): write pending→ready, API restart survives, relevant semantic result, correction supersedes, relations explorable, >30 compaction produces a summary with sources retained, embedding/Postgres failures explicit. **Not complete until Farhan explicitly approves.**
+**Validation**: I read you 20 test memories; you run queries against them — and explain *why* a specific result ranked higher (the 0.8/0.2 score + tie-breaks). Plus the live gate in the [phase doc](./docs/phases/phase-3-memory.md): write pending→ready, API restart survives, relevant semantic result, correction supersedes, relations explorable, >30 compaction produces a summary with sources retained, embedding/Postgres failures explicit. ✅ Closed 2026-11-23 — real Ollama compaction verified live, browser evidence recorded, and Farhan explicitly approved.
 
 📄 Phase doc: [`docs/phases/phase-3-memory.md`](./docs/phases/phase-3-memory.md)
 
@@ -111,28 +111,29 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 ## Phase 4 — Multi-Agent Systems (1-2 weeks)
 
-**Status (2026-11-19)**: ⬜ **Not started.**
+**Status (since 2026-11-23)**: 🚧 **Active — implemented and integration-tested; live gate pending.** Phase 3 validated 2026-11-23 and Farhan said "yes, next phase". Design fixed in [ADR-001](./docs/decisions/ADR-001-composition-gating.md) (composition-time gating), [ADR-002](./docs/decisions/ADR-002-same-rest-api.md) (agents call own REST) and [ADR-004](./docs/decisions/ADR-004-delegation-depth.md) (depth cap 2 + same-REST child chats), all accepted 2026-11-23. Implementation is in place across core/API/web: **583 green offline tests** (core 203, CLI 30, API 256, web 94), root typecheck + production build pass, and the root `test:integration` suite runs **23 real-infrastructure tests — 11 memory + 3 Phase 2 Redis streaming + 9 Phase 4** — passed twice with exact cleanup (Prisma WorkDoc CAS/rollback/links, sync same-REST delegation, real BullMQ async with atomic single-claim, real Redis `ask_user` byte-CAS, read-only `query_data` guardrails; models mocked, no Ollama). **Not done yet**: the real Ollama/browser live gate and Farhan's explicit approval — the phase is **not validated**.
 
 **Goal**: Orchestrator that delegates safely — sync and async — without runaway recursion.
 
 **Topics**:
 - 4.1 What makes something an "agent" (loop + tools + memory + stop conditions)
-- 4.2 Capability adapter contract (readOnlyTools, approvalPolicy)
-- 4.3 Plan vs. Action mode (composition-time gating)
-- 4.4 Delegation patterns (sync, async via queue, orchestration DAG)
-- 4.5 Depth capping (why you cap at 2 or 3)
-- 4.6 Human-in-the-loop (HITL) as a loop-level stop
+- 4.2 Capability registry + composition-time tool selection (pure `composeAgentCapabilities`)
+- 4.3 Plan vs. Action mode (write/delegation tools omitted from the toolkit — not prompt-only)
+- 4.4 Delegation patterns (sync, async via the existing BullMQ/Redis — no DAG in this phase)
+- 4.5 Depth capping (why 2; enforced at composition; trusted depth server-side only)
+- 4.6 HITL (execute-less `ask_user` as a loop-level stop; resume on the next user message)
 - 4.7 Multi-agent anti-patterns (manager-does-everything, ping-pong, shared mutable memory)
 
-**Build artifact**: Three agents — Orchestrator, Analyst, Researcher — with:
-- Orchestrator *cannot* run SQL (capability gating)
-- Analyst *cannot* delegate (delegatableAgents = [])
-- Sync delegation for "do this now"
-- Async delegation via BullMQ + tracker artifact
-- Approval policy on write tools
-- Depth cap = 2
+**Build artifact** (implemented — validation pending): Four agents under `packages/core/agents/` — `general` unchanged (calculate only, fully backward compatible) plus **Orchestrator**, **Analyst**, **Researcher** — with:
+- Capability registry (Zod schemas, descriptions, readOnly/approval metadata) + pure `composeAgentCapabilities(agent, mode, depth, registry)` composed once per generation
+- Plan/Action mode on the orchestrator (plan omits `write_doc` and `delegate_task` entirely); workers are action-only with no write/delegate tools
+- Durable Work Docs (Postgres/Prisma): immutable versions, audit revisions, typed links, `expectedVersion` CAS updates and safe rollback over REST
+- Delegation to analyst/researcher: sync (same chat REST endpoint, consumed SSE) and async (existing BullMQ/Redis, deterministic IDs, tracked statuses); **depth cap 2**, server-signed depth context, no shadow child runner
+- Tools: `calculate` (unchanged), `write_doc`, `delegate_task`, `query_data` (read-only, capped SQL), `search_memory` (reuses the Phase 3 Memory API), `ask_user` (no execute — HITL)
+- Web: agent picker, `/chat/:chatId` URLs, Work Docs page with revisions/links/rollback, delegation list/detail, generic tool-part rendering — existing styles, no redesign
+- **No Postgres scheduling (Phase 5), no DAG requirement, no extra phases pulled forward**
 
-**Validation**: Whiteboard session. I describe a task, you sketch the delegation tree, marking sync vs. async edges, and justify depth-cap placement.
+**Validation**: Automated suites green (tool omission matrix, forbidden delegation, sync/async success/failure/timeout/idempotency, Work Doc CAS/rollback/versions/revisions/links over real Prisma, SQL guardrails over real Postgres, real Redis `ask_user` stop+resume, Phase 2 regression — see the [phase doc](./docs/phases/phase-4-multi-agent.md) for the recorded evidence and the review fixes). Remaining: the **live gate** in the [phase doc](./docs/phases/phase-4-multi-agent.md) — ready-to-paste prompts included — plus Farhan's explicit approval. **Phase 4 remains incomplete until Farhan explicitly approves the live gate.**
 
 📄 Phase doc: [`docs/phases/phase-4-multi-agent.md`](./docs/phases/phase-4-multi-agent.md)
 

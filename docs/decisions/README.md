@@ -21,10 +21,10 @@ See [`ADR-TEMPLATE.md`](./ADR-TEMPLATE.md).
 
 | # | Title | Phase | Status |
 |---|---|---|---|
-| 001 | Composition-time read/write gating | 4 | 🔴 Not written |
-| 002 | Agents call own REST API (no shadow API) | 4 | 🔴 Not written |
+| 001 | [Composition-time capability gating (not prompt-only)](./ADR-001-composition-gating.md) | 4 | 🟢 Accepted 2026-11-23 |
+| 002 | [Agents call own REST API (no shadow API)](./ADR-002-same-rest-api.md) | 4 | 🟢 Accepted 2026-11-23 |
 | 003 | [Memory tree + relations + compaction over flat memory / graph DB](./ADR-003-memory-tree.md) | 3 | 🟢 Accepted 2026-11-19 |
-| 004 | Depth cap at 2 (not 3) | 4 | 🔴 Not written |
+| 004 | [Depth cap at 2 (not 3) + same-REST child chats](./ADR-004-delegation-depth.md) | 4 | 🟢 Accepted 2026-11-23 |
 | 005 | [SSE + idempotency vs. WebSockets](./ADR-005-sse-idempotency.md) | 2 | 🟢 Accepted 2026-11-17 |
 | 006 | BullMQ over in-process cron | 5 | 🔴 Not written |
 | 007 | [pgvector + local MiniLM embeddings](./ADR-007-pgvector.md) | 3 | 🟢 Accepted 2026-11-19 |
@@ -34,8 +34,8 @@ See [`ADR-TEMPLATE.md`](./ADR-TEMPLATE.md).
 
 ## ADR file naming
 
-- `ADR-001-composition-time-gating.md`
-- `ADR-002-agents-call-own-api.md`
+- `ADR-001-composition-gating.md`
+- `ADR-002-same-rest-api.md`
 - …etc
 
 One file per ADR, in this folder.

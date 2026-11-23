@@ -588,12 +588,21 @@ test('schema + migrations: supersededById is non-unique with a plain index; boot
 
   // Exactly one forward fix-up migration: drops the constraint, adds the index.
   const migrationsDir = path.join(packageRoot, 'prisma/migrations');
-  const entries = readdirSync(migrationsDir).filter((entry) => entry !== 'migration_lock.toml');
-  assert.deepStrictEqual(entries, [
+  const entries = readdirSync(migrationsDir).filter((entry) => entry !== 'migration_lock.toml').sort();
+  // Applied memory migrations stay present, first, and never get renamed or
+  // removed; later forward-only migrations (e.g. the Phase 4 work-docs
+  // delegation schema) may sort strictly after them.
+  assert.deepStrictEqual(entries.slice(0, 3), [
     '20261119000000_memory_core',
     '20261120000000_memory_superseded_by_many_to_one',
     '20261120000100_memory_relation_tuple_unique',
   ]);
+  for (const later of entries.slice(3)) {
+    assert.ok(
+      later > '20261120000100_memory_relation_tuple_unique',
+      `forward-only migration ${later} must sort after the applied memory migrations`,
+    );
+  }
   const fixup = readFileSync(
     path.join(migrationsDir, '20261120000000_memory_superseded_by_many_to_one/migration.sql'),
     'utf8',
