@@ -19,6 +19,7 @@ MiniLM embeddings).
 |---|---|
 | Framework | Next.js 15 (App Router), React 19, TypeScript strict |
 | Chat state | `@ai-sdk/react` `useChat` (AI SDK v6), `DefaultChatTransport` from `ai` |
+| Markdown | `react-markdown` + `remark-gfm` (assistant text renders real Markdown; raw HTML is never enabled) |
 | UI framework | None — plain CSS (`app/globals.css`), no design system (Phase 2/3 non-goal) |
 | Tests | `node:test` via `tsx` on pure helpers — no browser, no live API |
 
@@ -76,6 +77,27 @@ Copy `.env.example` to `.env.local` for non-default values.
 - **No stop button.** Refresh/disconnect never aborts the provider generation
   (ADR-005); reconnecting resumes it. There is no abort call in this codebase.
 - **Throttle**: `experimental_throttle: 50` (≈50 ms) for streamed UI updates.
+- **Assistant message regions** (`src/lib/parts.ts` + Chat components): each assistant
+  turn renders exactly once per part, split into labeled regions so reasoning and tool
+  output never mix into the prose:
+  - `Response` — all text parts joined in original order with blank lines and rendered
+    as real Markdown (`react-markdown` + `remark-gfm`: headings, lists, bold/italic,
+    blockquotes, rules, code, GFM tables/strikethrough). Raw HTML is NOT enabled (no
+    `rehype-raw`, no `dangerouslySetInnerHTML`) and wide tables/fenced code scroll
+    sideways inside the column. Partial streamed Markdown renders as plain prose until
+    syntax closes — streaming never crashes.
+  - `Thinking` — all reasoning parts in a collapsed-by-default `<details>`.
+  - `Tool activity (N)` — every non-HITL tool part (all six cards below, plus unknown
+    `tool-*` fallback) in a separate collapsed-by-default `<details>` whose summary
+    lists deduplicated tool names, so giant always-open results (e.g. `search_memory`)
+    never dominate the thread.
+  - Pending HITL: an unanswered (`input-available`) `ask_user` stays top-level and
+    prominent while the answer gate is active (newest assistant message only — the
+    same gate as the composer); answered/older `ask_user` parts move into Tool
+    activity as readable cards. Never hidden, never duplicated.
+  - `user` messages keep the plain Phase 2 text rendering; `general`/`calculate`
+    behavior stays compatible (a simple calculate turn shows the answer text plus the
+    collapsed calculate card).
 - **Tool-part rendering** (`src/lib/tools.ts` + component views): human-labeled cards,
   all content bounded plain text (React escapes; no `dangerouslySetInnerHTML`):
   - `calculate` — unchanged Phase 2 rendering (dedicated tested helper).
@@ -122,6 +144,7 @@ src/components/Delegations.tsx        'use client': parent-chat delegation list 
 src/lib/api.ts                        chat request/response helpers (send/hydrate/resume, slug-aware; tested)
 src/lib/agents.ts                     agent/mode roster, URL builders, guidance (tested)
 src/lib/tools.ts                      tool-part formatting + pending-ask_user scan (tested)
+src/lib/parts.ts                      assistant-part partitioning into Response/Thinking/Activity regions (tested)
 src/lib/workdocs.ts                   Work-Docs request/body/mapping helpers (tested)
 src/lib/delegations.ts                delegation list mapping/query/poll helpers (tested)
 src/lib/memory.ts                     Phase 3 memory helpers (tested, unchanged)
@@ -132,12 +155,13 @@ src/lib/messages.ts                   UIMessage typing for the six Phase 4 tool 
 Design rules kept from Phase 2/3: stable ids in URLs, server as source of truth,
 `no-store` hydration, full-replay resume, no stop/abort, explicit accessible names on
 every control, `role="status"`/`role="alert"` live regions, visible focus outlines,
-single-column responsive layout, text-only rendering (React escapes everything), safe
-fixed error strings only.
+single-column responsive layout, safe text-only rendering (assistant Markdown renders
+through `react-markdown`'s React tree — raw HTML disabled, everything escaped, no
+`dangerouslySetInnerHTML`), safe fixed error strings only.
 
 ## Tests (offline, pure — node:test)
 
-`npm test` runs 94 tests across:
+`npm test` runs 100 tests across:
 
 - `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
   hydration mapping, safe errors) — unchanged and green.
@@ -149,6 +173,11 @@ fixed error strings only.
 - `test/tools.test.ts` — lifecycle labels, bounded text/JSON shaping, write_doc /
   delegate_task / query_data / search_memory / ask_user parsing, pending-ask_user
   scan, generic unknown-tool fallback.
+- `test/parts.test.ts` — assistant-part region partitioning: reasoning separation,
+  multiple text parts joined in original order with blank lines around tools, tool
+  grouping/count + summary label, pending ask_user exclusion/gating (and answered
+  or second ask_user never pending), streaming/junk/unknown parts dropped without
+  duplication.
 - `test/workdocs.test.ts` — exact endpoint URLs (?chatId everywhere it is required),
   list/PATCH/version/rollback/create body contracts (CAS `expectedVersion` +
   `toVersion`), response mappers (valid/malformed), 409 conflict text + hint,

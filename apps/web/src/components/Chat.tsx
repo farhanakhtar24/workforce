@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   buildReconnectRequest,
   buildSendRequest,
@@ -44,6 +46,12 @@ import {
   parseWriteDocOutput,
   toolStateLabel,
 } from '@/lib/tools';
+import {
+  activitySummaryLabel,
+  partitionMessageParts,
+  type ActivityItem,
+} from '@/lib/parts';
+import { createSubmissionGate } from '@/lib/submitgate';
 import type {
   AskUserToolPart,
   CalculateToolPart,
@@ -132,6 +140,19 @@ export function Chat({
   const [answerDraft, setAnswerDraft] = useState('');
   const [resumeNotice, setResumeNotice] = useState(hasActiveStream);
 
+  // Synchronous single-flight submission guard. One Enter keypress or Send
+  // double-click can invoke submit/submitAnswer twice in the same tick while
+  // the `status`/`canSend` closure is still stale (not yet rerendered busy):
+  // the guard is acquired BEFORE clearing input or calling sendMessage, so
+  // any second immediate invocation is rejected. Released whenever useChat
+  // is no longer submitted/streaming (ready/error) or the send promise
+  // rejects; a fresh gate is created on agent/mode remount, never a
+  // permanent lock. Shared by the normal and the HITL answer paths.
+  const submissionGate = useMemo(() => createSubmissionGate(), []);
+  useEffect(() => {
+    if (status !== 'submitted' && status !== 'streaming') submissionGate.release();
+  }, [status, submissionGate]);
+
   useEffect(() => {
     // The mount-time auto-resume either streams or finds nothing; either way
     // the one-line notice is only worth showing for the initial attempt.
@@ -150,17 +171,34 @@ export function Chat({
   const canAnswer = !busy && answerReady;
 
   const submit = (): void => {
-    if (!canSend) return;
+    if (!submissionGate.tryStart()) return;
+    if (!canSend) {
+      // Nothing actually goes out (empty input / answer gate active): don't
+      // hold the lock so a later valid submission can proceed.
+      submissionGate.release();
+      return;
+    }
     const text = input.trim();
     setInput('');
-    void sendMessage({ text });
+    void sendMessage({ text }).catch(() => {
+      // A failed send must not leave the gate locked.
+      submissionGate.release();
+    });
   };
 
   const submitAnswer = (): void => {
-    if (!canAnswer) return;
+    if (!submissionGate.tryStart()) return;
+    if (!canAnswer) {
+      // Nothing actually goes out: don't hold the lock.
+      submissionGate.release();
+      return;
+    }
     const text = answerDraft.trim();
     setAnswerDraft('');
-    void sendMessage({ text });
+    void sendMessage({ text }).catch(() => {
+      // A failed send must not leave the gate locked.
+      submissionGate.release();
+    });
   };
 
   const navigateTo = (next: AgentSelection): void => {
@@ -268,43 +306,30 @@ export function Chat({
 
       <section aria-label="Messages" aria-live="polite" className="chat-messages">
         <ol className="chat-thread">
-          {messages.map((message) => (
+          {messages.map((message, messageIndex) => (
             <li key={message.id} className={`chat-turn chat-turn-${message.role}`}>
               <span className="chat-role">{message.role === 'user' ? 'You' : 'Assistant'}</span>
               <div className="chat-parts">
-                {message.parts.map((part, index) => {
-                  if (part.type === 'text') {
+                {message.role === 'assistant' ? (
+                  // Assistant turns render as separated regions: Response
+                  // (markdown), the pending HITL question top-level, then
+                  // collapsed Thinking and Tool activity. No part renders
+                  // twice and reasoning/tool results never mix into the text.
+                  <AssistantPartsView
+                    parts={message.parts}
+                    holdsPendingAsk={pendingAsk !== null && messageIndex === messages.length - 1}
+                    chatId={chatId}
+                  />
+                ) : (
+                  message.parts.map((part, index) => {
+                    if (part.type !== 'text') return null;
                     return (
                       <p key={index} className="chat-text">
                         {part.text}
                       </p>
                     );
-                  }
-                  if (part.type === 'tool-calculate') {
-                    return <CalculatePartView key={index} part={part} />;
-                  }
-                  if (part.type === 'tool-write_doc') {
-                    return <WriteDocPartView key={index} part={part} chatId={chatId} />;
-                  }
-                  if (part.type === 'tool-delegate_task') {
-                    return <DelegatePartView key={index} part={part} />;
-                  }
-                  if (part.type === 'tool-query_data') {
-                    return <QueryDataPartView key={index} part={part} />;
-                  }
-                  if (part.type === 'tool-search_memory') {
-                    return <SearchMemoryPartView key={index} part={part} />;
-                  }
-                  if (part.type === 'tool-ask_user') {
-                    return <AskUserPartView key={index} part={part} />;
-                  }
-                  if (typeof part.type === 'string' && part.type.startsWith('tool-')) {
-                    return (
-                      <GenericToolPartView key={index} view={part as { type: string; state: string; input: unknown; output?: unknown; errorText?: string }} />
-                    );
-                  }
-                  return null;
-                })}
+                  })
+                )}
               </div>
             </li>
           ))}
@@ -417,6 +442,112 @@ export function Chat({
       </form>
     </main>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* Assistant message regions (Phase 4 formatting fix)                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Assistant markdown region: maintained `react-markdown` + `remark-gfm`.
+ * Raw HTML is deliberately NOT enabled — there is no rehype-raw and no
+ * `dangerouslySetInnerHTML`; the markdown AST renders through React, which
+ * escapes all text. Partial streamed markdown renders as plain prose until
+ * the syntax closes, so streaming never crashes.
+ */
+function MarkdownText({ text, className }: { text: string; className?: string }): React.ReactElement {
+  return (
+    <div className={className}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * One assistant turn as regions (from `partitionMessageParts`, pure + tested):
+ * every part renders exactly once — text parts joined in original order as
+ * the Response, reasoning in a collapsed-by-default Thinking block, tool
+ * parts in a collapsed-by-default Tool activity block with a concise
+ * summary, and the pending HITL question top-level (never inside collapsed
+ * activity, never duplicated).
+ */
+function AssistantPartsView({
+  parts,
+  holdsPendingAsk,
+  chatId,
+}: {
+  parts: WorkforceUIMessage['parts'];
+  holdsPendingAsk: boolean;
+  chatId: string;
+}): React.ReactElement {
+  const view = partitionMessageParts(parts, holdsPendingAsk);
+  const summary = activitySummaryLabel(view.activity);
+  return (
+    <>
+      {view.response !== null && <MarkdownText text={view.response} className="chat-md chat-md-response" />}
+      {view.pendingAsk !== null && view.pendingAsk.type === 'tool-ask_user' && (
+        <AskUserPartView part={view.pendingAsk} />
+      )}
+      {view.reasoning !== null && (
+        <details className="chat-region">
+          <summary>Thinking</summary>
+          <MarkdownText text={view.reasoning} className="chat-md chat-md-thinking" />
+        </details>
+      )}
+      {view.activity.length > 0 && (
+        <details className="chat-region">
+          <summary>
+            Tool activity ({view.activity.length})
+            {summary !== null && `: ${summary}`}
+          </summary>
+          <div className="chat-region-body">
+            {view.activity.map((item, index) => (
+              <ActivityItemView key={index} item={item} chatId={chatId} />
+            ))}
+          </div>
+        </details>
+      )}
+    </>
+  );
+}
+
+/**
+ * Renders one collapse-region tool part with the same per-tool cards as the
+ * pre-region renderer (identity preserved: the part object comes straight
+ * from the message).
+ */
+function ActivityItemView({
+  item,
+  chatId,
+}: {
+  item: ActivityItem<WorkforceUIMessage['parts'][number]>;
+  chatId: string;
+}): React.ReactElement | null {
+  const part = item.part;
+  if (part.type === 'tool-calculate') {
+    return <CalculatePartView part={part} />;
+  }
+  if (part.type === 'tool-write_doc') {
+    return <WriteDocPartView part={part} chatId={chatId} />;
+  }
+  if (part.type === 'tool-delegate_task') {
+    return <DelegatePartView part={part} />;
+  }
+  if (part.type === 'tool-query_data') {
+    return <QueryDataPartView part={part} />;
+  }
+  if (part.type === 'tool-search_memory') {
+    return <SearchMemoryPartView part={part} />;
+  }
+  if (part.type === 'tool-ask_user') {
+    return <AskUserPartView part={part} />;
+  }
+  if (typeof part.type === 'string' && part.type.startsWith('tool-')) {
+    return (
+      <GenericToolPartView view={part as { type: string; state: string; input: unknown; output?: unknown; errorText?: string }} />
+    );
+  }
+  return null;
 }
 
 /** Tool output is currently the JSON string `{"result":14}`. Rendered as text. */

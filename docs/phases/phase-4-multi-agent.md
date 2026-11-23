@@ -3,7 +3,7 @@
 **Duration**: 1-2 weeks
 **Goal**: A team of agents that delegate to each other safely — sync and async — without runaway recursion, with a real Work Doc artifact and human-in-the-loop (HITL) questions.
 
-> **Status: 🚧 Active — implemented and integration-tested; live gate pending (since 2026-11-23).** Phase 3 validated on 2026-11-23 and Farhan said "yes, next phase". The design below is fixed (not open for re-litigation) and recorded as decisions in [ADR-001](../decisions/ADR-001-composition-gating.md) (composition-time gating, not prompt-only), [ADR-002](../decisions/ADR-002-same-rest-api.md) (tools through the own REST API via injectable fetch) and [ADR-004](../decisions/ADR-004-delegation-depth.md) (depth cap 2 + same-REST child chats), all accepted 2026-11-23. Everything below is now **implemented** across `packages/core`, `apps/api` and `apps/web`: **583 green offline tests** (core 203, CLI 30, API 256, web 94), root typecheck + production build pass, and the real-infrastructure suite (`npm run test:integration`) covers **23 tests — 11 memory + 3 Phase 2 Redis streaming + 9 Phase 4** — passed twice with exact per-run cleanup. **Not done yet**: the real Ollama/browser live gate and Farhan's explicit approval — the phase is **not validated**, and reviews' fixes do not extend to any multi-process failover claim (recovery is per API process).
+> **Status: 🚧 Active — implemented and integration-tested; live browser gate passed by the orchestrator 2026-11-23 — awaiting Farhan's explicit approval.** Phase 3 validated on 2026-11-23 and Farhan said "yes, next phase". The design below is fixed (not open for re-litigation) and recorded as decisions in [ADR-001](../decisions/ADR-001-composition-gating.md) (composition-time gating, not prompt-only), [ADR-002](../decisions/ADR-002-same-rest-api.md) (tools through the own REST API via injectable fetch) and [ADR-004](../decisions/ADR-004-delegation-depth.md) (depth cap 2 + same-REST child chats), all accepted 2026-11-23. Everything below is **implemented** across `packages/core`, `apps/api` and `apps/web`: **593 green offline tests** (core 203, CLI 30, API 256, web 104), root typecheck + production-build checks pass (the consolidated root test run executes separately), and the real-infrastructure suite (`npm run test:integration`) covers **23 tests — 11 memory + 3 Phase 2 Redis streaming + 9 Phase 4** — passed twice with exact per-run cleanup. The **live browser gate ran on 2026-11-23** on Farhan's already-running real-provider servers via saved env (no key inspected or printed; real Ollama calls occurred through the browser) — see the validation record below. **Not done yet**: Farhan's explicit approval after this gate — the phase is **not validated**; recovery claims remain per API process (no multi-process failover claim).
 
 ---
 
@@ -188,7 +188,7 @@ Safe validation: self-target (orchestrator → orchestrator) → 400, invalid ta
 
 Current state (2026-11-23 — implemented & run):
 
-- **Offline: 583 green** (core 203, CLI 30, API 256, web 94); root `typecheck` and production `build` pass.
+- **Offline: 593 green** (core 203, CLI 30, API 256, web 104); root `typecheck` and production-build checks pass (the consolidated root test run executes separately).
 - The `composeAgentCapabilities` **tool omission matrix**: every agent × mode × depth yields the exact expected tool set (plan omits `write_doc`/`delegate_task` entirely; workers never compose write/delegate tools; `delegate_task` absent at `depth ≥ 2`; `general` always `calculate`-only).
 - **Forbidden delegation**: self-target/invalid-target rejections; a request implying depth ≥ 3 → 403 (no row, no child call); worker toolsets cannot delegate even on a hallucinated call.
 - **Sync delegation** (real Redis + real contract): same-REST child chat POST (verified `Idempotency-Key`), SSE consumed, result fed back, row `completed`; failure → `failed` (safe error); bounded timeout → `timeout`.
@@ -202,6 +202,28 @@ Current state (2026-11-23 — implemented & run):
 ### Review findings — found and fixed (integration-polished, not re-verified against multi-process failover)
 
 Review rounds caught and fixed: a transaction pool-poisoning path, the **sync delegation budget** (`DELEGATION_TIMEOUT_MS` + `TOOL_RUN_MARGIN_MS`, default 130 s — ordinary REST calls stay at the standard 30 s), a Redis `cjson` corruption risk in transcript CAS (replaced with raw-entry `LINDEX`/`LSET` byte matching), a **delegation double-run window** (now the `expectedFrom` atomic claim), a **stale `ask_user` wedge** (older pending questions resolve to `(no answer given)`), **stale `running` delegations** (budget-based recovery from the child transcript), an `addLink` aborted-transaction re-read, plus audit **source tagging and race polish**. Recovery is per API process — **no multi-process failover claim** is made.
+
+---
+
+## Validation record — live browser gate (2026-11-23, orchestrator run)
+
+**Setup honestly stated**: the gate ran against Farhan's **already-running real-provider servers** via saved env — **no key was inspected or printed** by the runner; the real Ollama calls occurred through the **browser** (server-side provider calls, as designed).
+
+- **Duplicate-submit bug found live and fixed**: the first Plan test produced **2 user IDs / 2 assistant rows** from one send. Fixed with a **synchronous `submissionGate` shared by the normal path and the HITL answer path**; browser regression then proved Enter ("OK") and the button ("DONE") each submit **exactly one message pair**.
+- **Plan mode (orchestrator chat `52790846-b7b8-4520-8def-23aacf5a96f8`)**: exactly **2 messages**; `search_memory` ran — **no `write_doc`, no `delegate_task`** (tools absent, per ADR-001).
+- **Action mode (same chat)**: `search_memory` → sync `delegate_task` — delegation `eb0be373-6ad2-438e-b014-95a445d1b385` **completed**, child chat `b71b4125-c0cb-4282-a909-6eba686f0418` — → `write_doc` created report **"SLM Comparison Brief"** (`86ee3a08-a8b1-471c-b6bc-d0b9e0782082`, v1). The model's **first `write_doc` attempt passed an unsupported argument (`summary`)** and got a contained output-error; the model corrected itself and succeeded. **Honest error-containment evidence**; 4 final messages before HITL.
+- **HITL (same chat)**: `ask_user` offered **Concise/Detailed**; the browser answer "Concise" produced **exactly one user answer**, stored output `{answer: 'Concise'}`, and the final response was concise — no duplicate.
+- **Analyst (chat `d2c66e6e-6641-4984-89b8-4f5df481836b`)**: `query_data` with `SELECT 1 AS ok` → columns `['ok']`, rows `[[1]]`, rowCount 1; no writes, no delegation.
+- **Researcher (chat `2919cbba-6416-45ba-b999-327498a65a48`)**: `search_memory` **three times**, summarized distinct quantization/latency conclusions; no writes, no delegation.
+- **Async delegation (same orchestrator)**: one async `delegate_task` — delegation `b91349db-dc07-4885-97c4-25e40d520795` `pending → completed` via **real BullMQ**; analyst child chat `210ef1d4-6e2a-4157-9fd6-11bcf7a54ea5` returned 42. The `/delegations` panel lists **both sync + async completed** and the child-chat links work.
+- **Work Docs UI**: the artifact shows content, **version history and the agent revision audit**. Earlier browser smoke already proved create, user `v2` edit and rollback to a **new v3**; **CAS conflicts are proven by the real integration suite** — no fresh real-provider conflict test is claimed here.
+- **Ops note (not an app failure)**: dev assets transiently 404'd once because the production build overwrote the running dev server's assets; only the dev server was restarted and they recovered (200).
+- **Artifact URLs for Farhan's approval walkthrough** (localhost:3000):
+  - `/agents/orchestrator/chat/52790846-b7b8-4520-8def-23aacf5a96f8`
+  - `/work/86ee3a08-a8b1-471c-b6bc-d0b9e0782082?chatId=52790846-b7b8-4520-8def-23aacf5a96f8`
+  - `/delegations?chatId=52790846-b7b8-4520-8def-23aacf5a96f8&agent=orchestrator`
+
+**Recorded 2026-11-23: live browser gate passed by the orchestrator — awaiting Farhan's explicit approval. Phase 4 is NOT validated.**
 
 ---
 
@@ -228,7 +250,7 @@ Gate criteria (unchanged):
 5. **Async delegation** status changes visible and linked to the child chat.
 6. **`ask_user`** pauses with a visible question; the next message resumes the same chat.
 
-**Honesty note**: the model is not guaranteed to always obey the intended tool order — if a turn picks a different (allowed) tool, or the exact failure appears, **record exactly what happened** (slug, mode, tool, response) and report it; that is a finding for the gate discussion, not a doc error to paper over.
+**Honesty note**: the model is not guaranteed to always obey the intended tool order — if a turn picks a different (allowed) tool, or the exact failure appears, **record exactly what happened** (slug, mode, tool, response) and report it; that is a finding for the gate discussion, not a doc error to paper over. *(The 2026-11-23 orchestrator run demonstrated exactly this: one contained `write_doc` argument error, self-corrected — see the validation record above.)*
 
 **Phase 4 is NOT complete until Farhan explicitly approves this live gate.**
 
