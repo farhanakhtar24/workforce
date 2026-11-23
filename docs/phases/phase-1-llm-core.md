@@ -1,91 +1,93 @@
 # Phase 1 — LLM Core
 
-**Duration**: 1-2 weeks (flexes based on self-assessment)
-**Goal**: You deeply understand how LLMs ingest prompts, decide to call tools, and iterate through loops. You can build an agent loop without copy-pasting.
+**Duration**: 1-2 weeks (actual: faster — build + validation closed 2026-11-17)
+**Goal**: Deeply understand how LLMs ingest prompts, decide to call tools, and iterate through loops — build an agent loop without copy-pasting.
+
+> **Status: ✅ Completed & validated — 2026-11-17.**
+> Validated by a live demo plus automated tests. Farhan explicitly approved progression with "Yes next phase" after the demo.
+> Honesty note: the self-assessment, targeted-learning, and whiteboard steps were **waived by Farhan**, not performed. This doc does not claim they happened.
 
 ---
 
-## What gets built in this phase
+## What got built
 
-**`apps/cli/`** — a terminal-based agent with **ONE tool** (your choice: `get_weather`, `calculate`, or `lookup_word`).
+**`apps/cli/`** — a terminal REPL agent with **one tool: `calculate`**.
 
-Requirements:
-- Maintains conversation history across turns
-- Tool result feeds back into the model before it continues
-- Stop condition: max 10 steps OR model emits no tool call
-- Logs each step: model input, model output, tool call, tool result
-- Runs **without** the Vercel AI SDK (raw HTTP to OpenAI/Anthropic) — you'll use the SDK in Phase 2, but you need to feel the wire first
-
----
-
-## Topics to self-assess
-
-Rate each 🟢 / 🟡 / 🔴 **before** starting. Don't move on until all are at least 🟡.
-
-| # | Topic | Your rating | Notes |
-|---|---|---|---|
-| 1.1 | Tokens, context window, temperature | _ | |
-| 1.2 | System / user / developer messages | _ | |
-| 1.3 | Tool calling / function calling (JSON schema contract) | _ | |
-| 1.4 | Structured output (forcing JSON, Zod validation) | _ | |
-| 1.5 | Token counting & cost (input vs. output pricing) | _ | |
-| 1.6 | The agent loop (Observe → Think → Act → Observe) | _ | |
-| 1.7 | Multi-turn state & summarization strategies | _ | |
-
----
-
-## Learning resources (per topic)
-
-> I'll fill these in with specific links once you tell me your ratings. The curriculum ([`docs/learning/CURRICULUM.md`](../learning/CURRICULUM.md)) has generic pointers; I'll tailor them based on your self-assessment.
-
----
-
-## Build artifact — detailed spec
+- Provider: **Ollama Cloud** (`glm-5.3-flash`) over raw OpenAI-compatible HTTP (`POST /chat/completions`) — no Vercel AI SDK, no provider SDK. Feeling the wire before the SDK was the point.
+- Config validation from env (`OLLAMA_API_KEY` required; base URL, model, timeout have defaults). Invalid config prints which variable failed — never its value.
+- One LLM transport with timeout and safe error messages (`src/llm.ts`).
+- One tool (`src/tools/calculate.ts`) registered in `src/tools/index.ts`.
+- One agent loop (`src/loop.ts`): model → tool calls → tool result messages → model, until the model answers with no tool call or the 10-step cap hits. Each step is logged (model output, tool call, tool result).
+- In-memory conversation history (`src/history.ts`): the full transcript is resent on every call.
+- Error containment: unknown tools, malformed argument JSON, and thrown tools all go back to the model as structured tool messages, so recovery is observable. Transport failures end the turn with an error; the REPL stays open.
+- No streaming, no UI beyond terminal prompts, no persistence — deliberately, so the loop stays the focus.
 
 ```
 apps/cli/
 ├── package.json
 ├── tsconfig.json
-├── src/
-│   ├── index.ts           # entry point, REPL loop
-│   ├── llm.ts             # low-level fetch to OpenAI/Anthropic
-│   ├── history.ts         # conversation state (in-memory for now)
-│   ├── tools/
-│   │   └── index.ts       # registry of ONE tool
-│   │   └── getWeather.ts  # or calculate / lookupWord
-│   └── loop.ts            # the Observe → Think → Act loop
-└── README.md              # how to run, what it does, what you learned
+├── README.md
+└── src/
+    ├── index.ts       # entry point, REPL loop
+    ├── config.ts      # env validation
+    ├── llm.ts         # raw fetch to Ollama Cloud (OpenAI-compatible)
+    ├── history.ts     # conversation state (in-memory)
+    ├── types.ts
+    ├── loop.ts        # model → tool calls → tool results → model
+    ├── llm.test.ts / loop.test.ts
+    └── tools/
+        ├── calculate.ts / calculate.test.ts
+        └── index.ts
 ```
 
-**Constraints**:
-- Only 1 tool (don't get ambitious)
-- No streaming yet (Phase 2)
-- No UI (terminal only)
-- No memory (Phase 3)
-- No multiple agents (Phase 4)
+---
 
-These constraints exist so you focus on **the loop** and nothing else.
+## Topics (originally for self-assessment)
+
+The rating table below was kept as originally planned but **never filled in**: Farhan waived self-assessment and targeted learning before the build.
+
+| # | Topic | Your rating | Notes |
+|---|---|---|---|
+| 1.1 | Tokens, context window, temperature | _(waived)_ | |
+| 1.2 | System / user / developer messages | _(waived)_ | |
+| 1.3 | Tool calling (JSON schema contract) | _(waived)_ | |
+| 1.4 | Structured output | _(waived)_ | Not used in Phase 1 |
+| 1.5 | Token counting & cost | _(waived)_ | |
+| 1.6 | The agent loop | _(waived)_ | |
+| 1.7 | Multi-turn state | _(waived)_ | Full-history resend, tested live |
+
+Learning resources: **skipped** (waived).
 
 ---
 
-## Validation gate for Phase 1
+## Validation result — 2026-11-17
 
-**Format**: Mixed (per your preference 1D).
+**Original gate**: live demo (3 prompts, one needing 2+ tool calls) + probe questions on error handling + whiteboard of the message array.
+**What actually happened**: live demo + automated tests. The probe/whiteboard parts were waived; error paths and multi-call behavior were covered by automated tests instead.
 
-1. **Demo** — you run the CLI live. I watch you send 3 prompts, at least one of which requires 2+ tool calls.
-2. **Probe** — I ask "what if the tool throws?" and "what if the model hallucinates a tool call that doesn't exist?" — you walk me through your error handling.
-3. **Whiteboard** — you sketch the message array after 3 turns, pointing out where the tool results sit.
+### Automated evidence (offline, no key needed)
 
-Pass = you can explain your own code without looking at it.
+- **56/56 tests pass** (`npm test`) — loops, tool registration, transport, tool errors, multi-call paths.
+- Root `typecheck` and CLI `build` pass.
+- Missing-key probe: exits nonzero, names the failing variable, never prints a value.
+- EOF probe: REPL exits cleanly on closed stdin.
 
----
+### Live transcript (real CLI session)
 
-## Notes
+| Prompt | Behavior |
+|---|---|
+| "Hello" | No tool call; direct text answer |
+| "(12+8)*3" | Loop invoked `calculate`; returned **60** |
+| "Add 7 to that result" | Full history resent in the request; model used the prior tool result; returned **67** |
 
-_(Fill this in as you go. What surprised you? What took longer than expected? What would you do differently?)_
+The third turn is the multi-turn proof: the tool result from turn 2 arrived back to the model as part of the resent history.
+
+### Decision to proceed
+
+After the live demo, Farhan said **"Yes next phase"** — explicit approval. Phase 1 closed, Phase 2 started the same day. Phase 2 validation has its own gate and is **not** complete yet.
 
 ---
 
 ## When done
 
-→ Start [Phase 2 — Streaming & Real-Time UX](./phase-2-streaming.md)
+→ Started [Phase 2 — Streaming & Real-Time UX](./phase-2-streaming.md) on 2026-11-17.

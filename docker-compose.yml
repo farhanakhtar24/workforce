@@ -1,0 +1,40 @@
+# Local infrastructure only: Phase 2 Redis (chat messages, idempotency keys,
+# active stream markers, resumable-stream relay, BullMQ memory queue) and
+# Phase 3 Postgres with pgvector (the memory store).
+# App containers (api/web images built and deployed) are still Phase 6 —
+# see ROADMAP.md.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: workforce
+      POSTGRES_PASSWORD: workforce
+      POSTGRES_DB: workforce
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workforce -d workforce"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:

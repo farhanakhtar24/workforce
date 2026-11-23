@@ -26,5 +26,5 @@
       "@workforce/queue/*": ["packages/queue/src/*"]
     }
   },
-  "exclude": ["node_modules", "dist", ".next", "build"]
+  "exclude": ["node_modules", "dist", ".next", "build", "apps/web"]
 }

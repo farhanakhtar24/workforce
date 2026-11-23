@@ -22,7 +22,7 @@ Errors are surfaced, not hidden: unknown tools, malformed argument JSON, thrown 
 
 ## Requirements
 
-- Node.js >= 20.
+- Node.js >= 24.
 - An Ollama Cloud API key with access to the `glm-5.3-flash` model.
 
 ## Setup
@@ -59,7 +59,8 @@ Put the key in your shell profile (e.g. `~/.zshrc`) or a directory you do not co
 ## Running
 
 ```sh
-# dev (tsx, no build step)
+# dev (tsx, no build step) — resolves @workforce/core from its dist/
+npm run build --workspace @workforce/core   # once from the repo root, if core is not built yet
 npm run dev --workspace @workforce/cli
 
 # build to dist/ and run the compiled JS
@@ -70,6 +71,8 @@ npm run start --workspace @workforce/cli
 npm test --workspace @workforce/cli
 npm run typecheck --workspace @workforce/cli
 ```
+
+The CLI imports `@workforce/core`, which resolves from its built `dist/` — the repo-root `npm run dev` / `test` / `build` targets build core automatically, but running the CLI directly (including its tests, which run in `src/` via tsx) needs core built first.
 
 At startup the CLI prints its model and tool, then prompts (`You> `). Type `exit` or `quit` (case-insensitive), or press Ctrl+C / Ctrl+D, to leave. Diagnostics (per-step logs, errors, stop notices) go to stderr; the final assistant text goes to stdout — so `npm run dev ... 2>/dev/null` shows only the answers.
 

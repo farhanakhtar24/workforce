@@ -23,12 +23,12 @@ See [`ADR-TEMPLATE.md`](./ADR-TEMPLATE.md).
 |---|---|---|---|
 | 001 | Composition-time read/write gating | 4 | 🔴 Not written |
 | 002 | Agents call own REST API (no shadow API) | 4 | 🔴 Not written |
-| 003 | Memory tree over flat memory | 3 | 🔴 Not written |
+| 003 | [Memory tree + relations + compaction over flat memory / graph DB](./ADR-003-memory-tree.md) | 3 | 🟢 Accepted 2026-11-19 |
 | 004 | Depth cap at 2 (not 3) | 4 | 🔴 Not written |
-| 005 | SSE + idempotency vs. WebSockets | 2 | 🔴 Not written |
+| 005 | [SSE + idempotency vs. WebSockets](./ADR-005-sse-idempotency.md) | 2 | 🟢 Accepted 2026-11-17 |
 | 006 | BullMQ over in-process cron | 5 | 🔴 Not written |
-| 007 | pgvector over Pinecone | 3 | 🔴 Not written |
-| 008 | AI SDK UI message streams vs. custom protocol | 2 | 🔴 Not written |
+| 007 | [pgvector + local MiniLM embeddings](./ADR-007-pgvector.md) | 3 | 🟢 Accepted 2026-11-19 |
+| 008 | [AI SDK UI message streams vs. custom protocol](./ADR-008-ai-sdk-ui-streams.md) | 2 | 🟢 Accepted 2026-11-17 |
 
 ---
 

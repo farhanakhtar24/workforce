@@ -43,6 +43,9 @@ coverage/
 .nyc_output/
 
 # Cache
+# .cache/ also covers the local embedding model cache (EMBEDDING_CACHE_DIR,
+# default .cache/workforce-models — first local MiniLM use downloads the model
+# here). Code, migrations, and .generated/ are NOT ignored by this.
 .cache/
 .eslintcache
 .turbo/

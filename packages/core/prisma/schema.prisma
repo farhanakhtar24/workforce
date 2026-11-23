@@ -1,0 +1,93 @@
+// Prisma schema for the Workforce Phase 3 memory domain.
+//
+// The generated client is emitted to `packages/core/generated/prisma`
+// (gitignored; reproducible via `prisma generate`). Only the Postgres memory
+// adapter under `@workforce/core/memory/postgres` is allowed to import the
+// generated client, so the CLI and the pure domain module never load Prisma.
+//
+// Identifiers use Prisma defaults (quoted PascalCase tables, camelCase
+// columns) so this handwritten SQL and any future `prisma migrate diff`
+// output stay in sync — no @map renames are used on purpose.
+//
+// `embedding` uses the pgvector `vector(384)` type via `Unsupported`. It is
+// read and written exclusively through raw SQL in the Postgres adapter and is
+// never returned to callers (embedding values never leave the store).
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MemoryKind {
+  learning
+  correction
+  changelog
+  observation
+  decision
+  preference
+}
+
+enum EmbeddingStatus {
+  pending
+  ready
+  failed
+}
+
+enum MemoryRelationType {
+  supports
+  supersedes
+  contradicts
+}
+
+model MemoryBlock {
+  id              String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scope           String
+  path            String
+  kind            MemoryKind
+  content         String
+  confidence      Float                @db.DoublePrecision
+  embeddingStatus EmbeddingStatus      @default(pending)
+  embedding       Unsupported("vector(384)")?
+  embeddingModel  String?
+  accessCount     Int                  @default(0)
+  // Intentionally NOT @unique: ONE summary/correction block supersedes many
+  // sources, so several rows share the same supersededById value. One-successor
+  // integrity per source row is enforced by the adapter's guarded UPDATE
+  // (see packages/core/src/memory/postgres), not by a DB constraint.
+  supersededById  String?              @db.Uuid
+  metadata        Json                 @default("{}")
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @default(now())
+  embeddedAt      DateTime?
+  lastAccessedAt  DateTime?
+
+  supersededBy MemoryBlock?   @relation("MemoryBlockSupersededBy", fields: [supersededById], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  supersedes   MemoryBlock[]  @relation("MemoryBlockSupersededBy")
+
+  sourceRelations MemoryRelation[] @relation("MemoryRelationSource")
+  targetRelations MemoryRelation[] @relation("MemoryRelationTarget")
+
+  @@index([scope, path, createdAt(sort: Desc)])
+  @@index([embeddingStatus])
+  @@index([supersededById])
+}
+
+model MemoryRelation {
+  id        String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceId  String             @db.Uuid
+  targetId  String             @db.Uuid
+  type      MemoryRelationType
+  createdAt DateTime           @default(now())
+
+  source MemoryBlock @relation("MemoryRelationSource", fields: [sourceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  target MemoryBlock @relation("MemoryRelationTarget", fields: [targetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([sourceId, targetId, type])
+  @@index([sourceId])
+  @@index([targetId])
+}

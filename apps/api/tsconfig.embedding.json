@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "@workforce/core": ["../../node_modules/@workforce/core/dist/index.d.ts"],
+      "@workforce/core/memory": ["../../node_modules/@workforce/core/dist/memory/index.d.ts"],
+      "@workforce/core/memory/postgres": ["../../node_modules/@workforce/core/dist/memory/postgres/index.d.ts"],
+      "@workforce/core/generated/prisma": ["../../node_modules/@workforce/core/generated/prisma/index.d.ts"]
+    }
+  },
+  "include": ["src", "test-embedding"]
+}

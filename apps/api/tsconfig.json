@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "paths": {
+      "@workforce/core": ["../../node_modules/@workforce/core/dist/index.d.ts"],
+      "@workforce/core/memory": ["../../node_modules/@workforce/core/dist/memory/index.d.ts"],
+      "@workforce/core/memory/postgres": ["../../node_modules/@workforce/core/dist/memory/postgres/index.d.ts"],
+      "@workforce/core/generated/prisma": ["../../node_modules/@workforce/core/generated/prisma/index.d.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

@@ -1,0 +1,3 @@
+# Prisma generated client (reproducible via `npm run build` / `prisma generate`).
+generated/
+prisma/migrations/dev/

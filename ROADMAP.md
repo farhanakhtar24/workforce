@@ -35,6 +35,8 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 ## Phase 1 — LLM Core (1-2 weeks)
 
+**Status (2026-11-17)**: ✅ **Validated.** Live demo passed ("Hello" → no tool; `(12+8)*3` → `calculate` → 60; "Add 7 to that result" → history resent → 67), 56/56 offline tests, root typecheck, CLI build, missing-key and EOF probes. Farhan waived self-assessment/whiteboard and explicitly approved progression ("Yes next phase"). Details: [phase doc](./docs/phases/phase-1-llm-core.md).
+
 **Goal**: Understand the agent loop deeply enough to explain it to a stranger, and implement it.
 
 **Topics**:
@@ -56,13 +58,15 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 ## Phase 2 — Streaming & Real-Time UX (1 week)
 
+**Status (2026-11-19)**: ✅ **Validated.** Started 2026-11-17. 156/156 offline tests (core 31, CLI 30, API 74, web 21), 3/3 real Redis integration tests, root typecheck, full build, desktop/mobile accessibility smoke; Farhan confirmed the live Phase 2 web flow is working on 2026-11-19. Design: [phase doc](./docs/phases/phase-2-streaming.md), [ADR-005](./docs/decisions/ADR-005-sse-idempotency.md), [ADR-008](./docs/decisions/ADR-008-ai-sdk-ui-streams.md). Details: [phase doc](./docs/phases/phase-2-streaming.md).
+
 **Goal**: Production-grade streaming with resumability + idempotency.
 
 **Topics**:
 - 2.1 Server-Sent Events (SSE) — when, how, wire format
 - 2.2 Streaming LLM responses (chunks, deltas)
-- 2.3 Vercel AI SDK basics (`useChat`, `streamText`, Data Stream Protocol)
-- 2.4 Resumable streams (Redis checkpoints, why streams break)
+- 2.3 Vercel AI SDK basics (`useChat`, `streamText`, UI message streams)
+- 2.4 Resumable streams (resumable-stream's Redis relay, process-local replay buffers, why streams break)
 - 2.5 Idempotency-Key header pattern
 - 2.6 Error handling mid-stream (abort signals, partial saves)
 
@@ -76,31 +80,38 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 ## Phase 3 — Memory, Embeddings, Hybrid Search (1-2 weeks)
 
+**Status (2026-11-19, last updated 2026-11-19)**: 🚧 **Active — implementation complete, automated + real-service validation green, live gate pending.** Phase 2 closed 2026-11-19 and Farhan said "next"; this phase started the same day. The design is fixed (not open for re-litigation) and recorded in [ADR-003](./docs/decisions/ADR-003-memory-tree.md) (memory tree + relations + compaction) and [ADR-007](./docs/decisions/ADR-007-pgvector.md) (pgvector + local MiniLM embeddings), both accepted 2026-11-19. Implementation is in place: the memory domain + Prisma/pgvector adapter + migrations in `packages/core`, the memory REST routes + local Transformers.js embeddings + Ollama compactor + BullMQ worker in `apps/api`, the `/memory` page in `apps/web`, and docker-compose Postgres/pgvector alongside Redis — **339 green offline tests** (core 131, CLI 30, API 133, web 45). Automated real-stack validation: real Postgres/pgvector+BullMQ integration **14/14 twice** (`npm run test:integration`), real local-MiniLM embedding smoke **5/5 twice** (`npm run test:embedding`; real model download cached project-locally), plus a real-service browser smoke with a **dummy** key (create pending→ready, semantic search cosine 0.557 / recency 1.0 / score 0.646, correction supersession + outgoing related display, desktop/mobile accessibility with zero missing names) and the `npm run demo:memory` seeder for the live walkthrough. **Not completed**: the real Ollama compaction call (dummy key could not exercise it) and Farhan's live-gate approval — the phase is incomplete until Farhan explicitly approves.
+
 **Goal**: Memory that survives past 50 entries — hierarchical, vector-searchable, compactable.
 
 **Topics**:
 - 3.1 What embeddings actually are (vectors, cosine similarity)
-- 3.2 Embedding models & providers (OpenAI / Gemini / Cohere; dimensionalities)
-- 3.3 Vector databases (pgvector vs. Pinecone vs. Milvus — and why pgvector here)
+- 3.2 Embedding models & providers (local Transformers.js/MiniLM vs hosted; dimensionality tradeoff)
+- 3.3 Vector databases (pgvector vs. Pinecone vs. Milvus — pgvector chosen, ADR-007)
 - 3.4 Hybrid search (semantic + keyword + recency fusion)
 - 3.5 RAG pattern (chunking, retrieval, prompt augmentation)
 - 3.6 Memory architectures (flat vs. tree vs. graph — collapse of flat at scale)
 - 3.7 Pruning & compaction (LLM-driven summarization, half-lives)
 
 **Build artifact**: Memory system in `packages/core/memory/` with:
-- Path-addressed blocks (`brands/...`, `global/...`)
-- pgvector hybrid search (cosine × 0.8 + recency × 0.2)
-- `writeBlock`, `queryBlocks`, `semanticSearch`, `exploreRelated`
-- BullMQ-backed async embedding
-- LLM compaction trigger (>30 blocks per path)
+- Domain-neutral path-addressed blocks (`research/small-language-models`, …), single-tenant `scope = default`
+- Postgres + Prisma 6.19.3 + pgvector, `vector(384)`, HNSW cosine candidate index
+- Hybrid retrieval: `0.8 × cosine + 0.2 × recency decay` with per-kind half-lives
+- `writeBlock`, `queryBlocks` (path/kind/keyword), `semanticSearch`, `exploreRelated`
+- BullMQ `workforce-memory` queue on the existing Redis (embedding + compaction jobs)
+- LLM compaction when active blocks at an exact path exceed 30 (sources retained, superseded)
+- Local infra: docker-compose Postgres/pgvector (`pgvector/pgvector:pg16`, host port `127.0.0.1:55432`) + `npm run dev:infra` / `npm run db:migrate`; `DATABASE_URL` defaults to the local dev stack (`postgresql://workforce:workforce@127.0.0.1:55432/workforce`) — Phase 6 deployment must set an explicit secret URL
+- REST routes in `apps/api` + the `/memory` page in `apps/web` (built — validation pending)
 
-**Validation**: I read you 20 test memories; you run queries against them. You have to explain *why* a specific result ranked higher than another.
+**Validation**: I read you 20 test memories; you run queries against them — and explain *why* a specific result ranked higher (the 0.8/0.2 score + tie-breaks). Plus the live gate in the [phase doc](./docs/phases/phase-3-memory.md): write pending→ready, API restart survives, relevant semantic result, correction supersedes, relations explorable, >30 compaction produces a summary with sources retained, embedding/Postgres failures explicit. **Not complete until Farhan explicitly approves.**
 
 📄 Phase doc: [`docs/phases/phase-3-memory.md`](./docs/phases/phase-3-memory.md)
 
 ---
 
 ## Phase 4 — Multi-Agent Systems (1-2 weeks)
+
+**Status (2026-11-19)**: ⬜ **Not started.**
 
 **Goal**: Orchestrator that delegates safely — sync and async — without runaway recursion.
 

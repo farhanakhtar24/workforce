@@ -58,7 +58,7 @@ Rate yourself **🟢 / 🟡 / 🔴** next to each. This phase is mostly review �
 - [x] Root `package.json` (workspaces: `apps/*`, `packages/*`)
 - [x] Root `tsconfig.json` with `strict: true`
 - [x] `.gitignore` (node_modules, .env, dist, .next)
-- [x] `.nvmrc` → `20`
+- [x] `.nvmrc` → `24` (migrated from `20` on 2026-11-21, Node 24)
 - [x] `.editorconfig`
 - [x] `docs/` skeleton complete
 - [x] Git init + first commit

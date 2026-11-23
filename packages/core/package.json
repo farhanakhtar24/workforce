@@ -1,0 +1,48 @@
+{
+  "name": "@workforce/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./memory": {
+      "types": "./dist/memory/index.d.ts",
+      "import": "./dist/memory/index.js"
+    },
+    "./memory/postgres": {
+      "types": "./dist/memory/postgres/index.d.ts",
+      "import": "./dist/memory/postgres/index.js"
+    },
+    "./generated/prisma": {
+      "types": "./generated/prisma/index.d.ts",
+      "import": "./generated/prisma/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "generated"
+  ],
+  "scripts": {
+    "build": "node scripts/prisma-generate.mjs && tsc -p tsconfig.json",
+    "test": "tsx --test src/capabilities/calculate/*.test.ts src/memory/paths-schemas.test.ts src/memory/recency-ranking.test.ts src/memory/service-write-query.test.ts src/memory/service-semantic.test.ts src/memory/service-jobs.test.ts src/memory/postgres/sql-utils.test.ts src/memory/postgres/postgres-store.test.ts",
+    "typecheck": "node scripts/prisma-generate.mjs && tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "pg": "8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "prisma": "6.19.3",
+    "tsx": "^4.23.15"
+  }
+}

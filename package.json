@@ -5,19 +5,34 @@
   "description": "An AI workforce platform: agents that remember, schedule, and delegate.",
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   },
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "build:core": "npm run build --workspace @workforce/core",
+    "predev": "npm run build:core && npm run db:migrate",
+    "dev": "concurrently -n api,web -c blue,green --kill-others \"npm run dev --workspace @workforce/api\" \"npm run dev --workspace @workforce/web\"",
+    "dev:api": "npm run build:core && npm run dev --workspace @workforce/api",
+    "dev:web": "npm run dev --workspace @workforce/web",
+    "dev:infra": "docker compose up -d redis postgres",
+    "dev:redis": "docker compose up -d redis",
+    "dev:postgres": "docker compose up -d postgres",
+    "db:migrate": "node packages/core/scripts/prisma-migrate.mjs",
+    "pretest:integration": "npm run build:core && npm run db:migrate",
+    "test:integration": "npm run test:integration --workspace @workforce/api",
+    "test:embedding": "npm run test:embedding --workspace @workforce/api",
+    "demo:memory": "npm run demo:memory --workspace @workforce/api",
+    "build": "npm run build --workspace @workforce/core && npm run build --workspace @workforce/cli && npm run build --workspace @workforce/api && npm run build --workspace @workforce/web",
+    "typecheck": "npm run build:core && tsc --noEmit && npm run typecheck --workspace @workforce/core && npm run typecheck:tests --workspace @workforce/api && npm run typecheck --workspace @workforce/web",
     "lint": "echo \"lint not configured yet\" && exit 0",
-    "test": "npm test --workspace @workforce/cli"
+    "test": "npm run build:core && npm test --workspace @workforce/core && npm test --workspace @workforce/cli --workspace @workforce/api --workspace @workforce/web"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^24.19.2",
+    "concurrently": "^10.0.7",
     "typescript": "^5.5.0"
   }
 }
