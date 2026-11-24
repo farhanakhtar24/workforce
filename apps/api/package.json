@@ -8,8 +8,10 @@
   },
   "scripts": {
     "dev": "tsx --watch src/server.ts",
+    "dev:scheduler": "tsx --watch src/scheduler-worker.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
+    "start:scheduler": "node dist/scheduler-worker.js",
     "test": "tsx --test test/*.test.ts",
     "test:integration": "tsx --test test-live/*.test.ts",
     "test:embedding": "tsx --test test-embedding/local-embedding.test.ts",
@@ -23,6 +25,7 @@
     "@ai-sdk/openai-compatible": "^2.0.94",
     "@huggingface/transformers": "^4.3.2",
     "@workforce/core": "0.1.0",
+    "@workforce/queue": "0.1.0",
     "ai": "^6.0.333",
     "bullmq": "^6.7.8",
     "express": "^4.22.3",

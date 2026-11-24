@@ -1,0 +1,176 @@
+/**
+ * Public API of the Phase 5 scheduler domain: `@workforce/core/scheduler`.
+ *
+ * Pure domain only (zod + croner): no HTTP, no BullMQ, no Prisma side
+ * effects — the API agent owns transports and queue sync. The Prisma adapter
+ * is exported ONLY from `@workforce/core/scheduler/postgres` so importing
+ * this barrel never loads Prisma.
+ */
+
+export {
+  recurrenceTypes,
+  agentTaskTriggers,
+  agentTaskExecutionStatuses,
+  agentTaskExecutionTerminalStatuses,
+  agentTaskExecutionTransitions,
+  isRecurrenceType,
+  isAgentTaskTrigger,
+  isAgentTaskExecutionStatus,
+  AGENT_TASK_MAX_NAME_LENGTH,
+  AGENT_TASK_MAX_PROMPT_LENGTH,
+  MAX_TASK_ATTEMPTS,
+  MAX_SKIP_DATES,
+  MAX_RECURRENCE_ITERATIONS,
+  MAX_CRON_EXPRESSION_LENGTH,
+  CRON_FIELD_COUNT,
+  AGENT_TASK_EXECUTION_MAX_ERROR_LENGTH,
+  MAX_DURATION_MS,
+  MAX_TOKEN_COUNT,
+  AGENT_TASK_MAX_QUEUE_ID_LENGTH,
+  SCHEDULER_LIST_LIMIT_MAX,
+  SCHEDULER_LIST_LIMIT_DEFAULT,
+  AGENT_TASK_TIMEZONE,
+  type RecurrenceType,
+  type AgentTaskTrigger,
+  type AgentTaskExecutionStatus,
+} from './kinds.js';
+
+export {
+  SchedulerError,
+  SchedulerValidationError,
+  SchedulerNotFoundError,
+  SchedulerConflictError,
+  type SchedulerErrorCode,
+} from './errors.js';
+
+export type {
+  AgentTask,
+  AgentTaskExecution,
+  AgentTaskExecutionTokenUsage,
+  AgentTaskRecurrenceConfig,
+} from './types.js';
+
+export {
+  isRealUtcCalendarDate,
+  utcDateKey,
+  endOfUtcDay,
+  recurrenceConfigMatchesType,
+  cronExpressionForRecurrence,
+  validateCronExpression,
+  computeNextRunAt,
+} from './recurrence.js';
+
+export {
+  agentTaskNameSchema,
+  agentTaskPromptSchema,
+  agentSlugSchema,
+  agentModeSchema,
+  recurrenceTypeSchema,
+  agentTaskTriggerSchema,
+  agentTaskExecutionStatusSchema,
+  agentTaskTimezoneSchema,
+  skipDateSchema,
+  skipDatesSchema,
+  onceRecurrenceConfigSchema,
+  dailyRecurrenceConfigSchema,
+  weeklyRecurrenceConfigSchema,
+  monthlyRecurrenceConfigSchema,
+  customCronRecurrenceConfigSchema,
+  recurrenceConfigSchema,
+  assertRecurrencePair,
+  recurrencePairMessage,
+  createTaskInputSchema,
+  updateTaskInputSchema,
+  setTaskActiveInputSchema,
+  listTasksInputSchema,
+  createExecutionInputSchema,
+  claimExecutionInputSchema,
+  agentTaskExecutionTokenUsageSchema,
+  markExecutionRetryingInputSchema,
+  markExecutionCompletedInputSchema,
+  markExecutionFailedInputSchema,
+  markExecutionDeadLetterInputSchema,
+  markExecutionSkippedInputSchema,
+  listExecutionsInputSchema,
+  parseSchedulerInput,
+  schedulerIdSchema,
+  schedulerExternalIdSchema,
+  type CreateTaskInput,
+  type UpdateTaskInput,
+  type SetTaskActiveInput,
+  type ListTasksInput,
+  type CreateExecutionInput,
+  type ClaimExecutionInput,
+  type MarkExecutionRetryingInput,
+  type MarkExecutionCompletedInput,
+  type MarkExecutionFailedInput,
+  type MarkExecutionDeadLetterInput,
+  type MarkExecutionSkippedInput,
+  type ListExecutionsInput,
+  type ParsedRecurrenceType,
+  type ParsedAgentTaskTrigger,
+  type ParsedAgentTaskExecutionStatus,
+  type ParsedRecurrenceConfig,
+  type ParsedSkipDates,
+  type ParsedCreateTaskInput,
+  type ParsedUpdateTaskInput,
+  type ParsedSetTaskActiveInput,
+  type ParsedListTasksInput,
+  type ParsedCreateExecutionInput,
+  type ParsedClaimExecutionInput,
+  type ParsedMarkExecutionRetryingInput,
+  type ParsedMarkExecutionCompletedInput,
+  type ParsedMarkExecutionFailedInput,
+  type ParsedMarkExecutionDeadLetterInput,
+  type ParsedMarkExecutionSkippedInput,
+  type ParsedListExecutionsInput,
+} from './schemas.js';
+
+export type {
+  SchedulerStore,
+  SchedulerStoreTaskCreate,
+  SchedulerStoreTaskUpdate,
+  SchedulerStoreTaskListParams,
+  SchedulerStoreExecutionCreate,
+  SchedulerStoreExecutionCreateResult,
+  SchedulerStoreExecutionListParams,
+  SchedulerStoreExecutionClaim,
+  SchedulerStoreExecutionMark,
+  SchedulerMarkTarget,
+} from './store.js';
+export { schedulerMarkTargets } from './store.js';
+
+export {
+  toInstant,
+  toOptionalInstant,
+  compareByCreatedAtThenId,
+  validateListParams,
+  validateStoreTaskCreate,
+  validateStoreTaskUpdate,
+  validateRecurrenceConfig,
+  resolveNextRunAtForUpdate,
+  validateStoreExecutionCreate,
+  validateStoreClaim,
+  expectedFromForMark,
+  canMarkExecution,
+  validateStoreExecutionMark,
+  sameMarkPayload,
+  sameTokenUsage,
+  validateSkipDatesRow,
+  assertExecutionRowShape,
+  notFound,
+  assertCondition,
+  type ValidatedTaskCreate,
+  type ValidatedTaskUpdate,
+  type ValidatedExecutionCreate,
+  type ValidatedClaim,
+  type ValidatedMark,
+} from './validate.js';
+
+export {
+  SchedulerService,
+  createSchedulerService,
+  type SchedulerServiceOptions,
+} from './service.js';
+
+export { InMemorySchedulerStore } from './stores/in-memory-scheduler-store.js';

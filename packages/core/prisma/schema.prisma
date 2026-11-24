@@ -241,3 +241,115 @@ model Delegation {
   @@index([parentChatId, createdAt(sort: Desc)])
   @@index([status])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: agent task scheduler (scheduled agent tasks + executions)
+// ---------------------------------------------------------------------------
+// Documented choices:
+// - Everything is UTC: `timezone` is fixed to the literal "UTC" (SQL CHECK),
+//   and next-run computation happens in UTC in the domain (croner with
+//   timezone UTC). Recurrence is DST-free by construction.
+// - `recurrenceConfig`/`skipDates`/`tokenUsage` are JSONB. The domain schema
+//   (packages/core/src/scheduler/schemas.ts) pins the exact per-recurrence
+//   shapes; the DB only checks the container (object/array) — SQL-only checks
+//   in the migration.
+// - A (taskId, scheduledFor) tuple holds at most ONE SCHEDULED execution:
+//   enforced ONLY in SQL (partial unique index WHERE trigger='scheduled') so
+//   MANUAL and RETRY rows keep unlimited rows per instant. Prisma cannot
+//   express partial indexes.
+// - `chatId` is globally unique and equals the execution id: one execution ->
+//   one isolated chat.
+// - `queueJobId`/`repeatJobKey` are nullable UNIQUE (BullMQ identities).
+// - Status transitions (the RUNNING->RETRYING/... CAS chain and terminal
+//   immutability) are enforced in the domain layer; `attempt` (bounded by
+//   `maxAttempts`) and `maxAttempts` (fixed 3) are checked in SQL.
+// - `retryOfExecutionId` self-FK ON DELETE SET NULL: deleting a source
+//   execution never cascades into retry chains.
+
+enum AgentTaskRecurrenceType {
+  once
+  daily
+  weekly
+  monthly
+  custom_cron
+}
+
+enum AgentTaskAgentSlug {
+  general
+  orchestrator
+  analyst
+  researcher
+}
+
+enum AgentTaskMode {
+  plan
+  action
+}
+
+enum AgentTaskTrigger {
+  scheduled
+  manual
+  retry
+}
+
+enum AgentTaskExecutionStatus {
+  pending
+  running
+  retrying
+  completed
+  failed
+  dead_letter
+  skipped
+}
+
+model AgentTask {
+  id               String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name             String
+  agentSlug        AgentTaskAgentSlug
+  mode             AgentTaskMode
+  prompt           String
+  scope            String                  @default("default")
+  recurrenceType   AgentTaskRecurrenceType
+  recurrenceConfig Json                    @default("{}")
+  skipDates        Json                    @default("[]")
+  isActive         Boolean                 @default(true)
+  timezone         String                  @default("UTC")
+  nextRunAt        DateTime?
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @default(now())
+
+  executions AgentTaskExecution[]
+
+  @@index([isActive, nextRunAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@index([agentSlug])
+}
+
+model AgentTaskExecution {
+  id                 String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  taskId             String                   @db.Uuid
+  retryOfExecutionId String?                  @db.Uuid
+  scheduledFor       DateTime
+  trigger            AgentTaskTrigger
+  status             AgentTaskExecutionStatus @default(pending)
+  attempt            Int                      @default(0)
+  maxAttempts        Int                      @default(3)
+  durationMs         Int?
+  tokenUsage         Json?
+  error              String?
+  chatId             String                   @unique
+  queueJobId         String?                  @unique
+  repeatJobKey       String?                  @unique
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @default(now())
+  finishedAt         DateTime?
+
+  task    AgentTask            @relation(fields: [taskId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  // Self-FK: a RETRY execution points at the DEAD_LETTER execution it retries.
+  retryOf AgentTaskExecution?  @relation("AgentTaskExecutionRetryOf", fields: [retryOfExecutionId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  retries AgentTaskExecution[] @relation("AgentTaskExecutionRetryOf")
+
+  @@index([taskId, scheduledFor])
+  @@index([status])
+  @@index([scheduledFor])
+}

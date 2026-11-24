@@ -41,6 +41,14 @@
       "types": "./dist/delegation/postgres/index.d.ts",
       "import": "./dist/delegation/postgres/index.js"
     },
+    "./scheduler": {
+      "types": "./dist/scheduler/index.d.ts",
+      "import": "./dist/scheduler/index.js"
+    },
+    "./scheduler/postgres": {
+      "types": "./dist/scheduler/postgres/index.d.ts",
+      "import": "./dist/scheduler/postgres/index.js"
+    },
     "./generated/prisma": {
       "types": "./generated/prisma/index.d.ts",
       "import": "./generated/prisma/index.js"
@@ -52,11 +60,12 @@
   ],
   "scripts": {
     "build": "node scripts/prisma-generate.mjs && tsc -p tsconfig.json",
-    "test": "tsx --test src/agents/*.test.ts src/capabilities/calculate/*.test.ts src/memory/paths-schemas.test.ts src/memory/recency-ranking.test.ts src/memory/service-write-query.test.ts src/memory/service-semantic.test.ts src/memory/service-jobs.test.ts src/work-docs/*.test.ts src/work-docs/postgres/*.test.ts src/delegation/*.test.ts src/delegation/postgres/*.test.ts src/memory/postgres/sql-utils.test.ts src/memory/postgres/postgres-store.test.ts",
+    "test": "tsx --test src/agents/*.test.ts src/capabilities/calculate/*.test.ts src/memory/paths-schemas.test.ts src/memory/recency-ranking.test.ts src/memory/service-write-query.test.ts src/memory/service-semantic.test.ts src/memory/service-jobs.test.ts src/work-docs/*.test.ts src/work-docs/postgres/*.test.ts src/delegation/*.test.ts src/delegation/postgres/*.test.ts src/memory/postgres/sql-utils.test.ts src/memory/postgres/postgres-store.test.ts src/scheduler/*.test.ts src/scheduler/postgres/*.test.ts",
     "typecheck": "node scripts/prisma-generate.mjs && tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@prisma/client": "6.19.3",
+    "croner": "^11.0.1",
     "pg": "8.23.1",
     "zod": "^4.6.7"
   },

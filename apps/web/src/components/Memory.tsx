@@ -58,9 +58,14 @@ export function Memory(): React.ReactElement {
     <main className="chat-layout">
       <header className="chat-header">
         <h1>Memory</h1>
-        <a className="chat-new" href="/">
-          Back to chat
-        </a>
+        <nav className="chat-nav" aria-label="Workforce pages">
+          <a className="chat-new" href="/">
+            Back to chat
+          </a>
+          <a className="chat-new" href="/schedules">
+            Schedules
+          </a>
+        </nav>
       </header>
 
       <CreatePanel

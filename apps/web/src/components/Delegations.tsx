@@ -51,6 +51,9 @@ export function DelegationsView({ apiBaseUrl, chatId, agent }: DelegationsProps)
             <a className="chat-new" href="/memory">
               Memory
             </a>
+            <a className="chat-new" href="/schedules">
+              Schedules
+            </a>
             <a className="chat-new" href="/work">
               Work
             </a>
@@ -141,6 +144,9 @@ function DelegationsLoaded({
           </a>
           <a className="chat-new" href="/memory">
             Memory
+          </a>
+          <a className="chat-new" href="/schedules">
+            Schedules
           </a>
           <a className="chat-new" href="/work">
             Work

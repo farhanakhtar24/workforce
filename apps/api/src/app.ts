@@ -20,6 +20,8 @@ import type { DelegationRouteHandlers } from './agents/delegation-routes.js';
 import { dataQueryRouteHandler, type DataQueryRouteDeps } from './agents/data-query-routes.js';
 import type { DelegationContextSigner } from './agents/delegation-context.js';
 import type { HostCapabilityDeps } from './agents/host-capabilities.js';
+import type { SchedulerRouteDeps } from './scheduler/routes.js';
+import { createSchedulerRoutes } from './scheduler/routes.js';
 
 export interface AppDependencies {
   config: ApiConfig;
@@ -40,6 +42,12 @@ export interface AppDependencies {
    * surface remains byte-compatible.
    */
   agents?: AgentRuntimeDeps;
+  /**
+   * Phase 5 scheduler composition (`/api/scheduler`). When omitted, the
+   * scheduler routes are absent (404). The API produces/syncs schedules only
+   * — the scheduler BullMQ Worker lives in `src/scheduler-worker.ts`.
+   */
+  scheduler?: SchedulerRouteDeps;
 }
 
 export interface AgentRuntimeDeps {
@@ -171,6 +179,23 @@ export function buildApp(dependencies: AppDependencies): Express {
     if (agents.dataQuery !== undefined) {
       app.post('/api/agents/:slug/data/query', dataQueryRouteHandler(agents.dataQuery));
     }
+  }
+
+  // Phase 5 scheduler routes — only when the scheduler composition is wired.
+  if (dependencies.scheduler !== undefined) {
+    const scheduler = createSchedulerRoutes(dependencies.scheduler);
+    app.post('/api/scheduler/tasks', scheduler.createTask);
+    app.get('/api/scheduler/tasks', scheduler.listTasks);
+    app.get('/api/scheduler/tasks/:id', scheduler.getTask);
+    app.patch('/api/scheduler/tasks/:id', scheduler.patchTask);
+    app.post('/api/scheduler/tasks/:id/activate', scheduler.activateTask);
+    app.post('/api/scheduler/tasks/:id/pause', scheduler.pauseTask);
+    app.post('/api/scheduler/tasks/:id/run', scheduler.runTask);
+    app.post('/api/scheduler/tasks/:id/run-scheduled', scheduler.runScheduledOccurrence);
+    app.get('/api/scheduler/executions', scheduler.listExecutions);
+    app.get('/api/scheduler/executions/:id', scheduler.getExecution);
+    app.post('/api/scheduler/executions/:id/retry', scheduler.retryExecution);
+    app.post('/api/scheduler/executions/:id/run', scheduler.runExecution);
   }
 
   app.use((req: Request, res: Response) => {

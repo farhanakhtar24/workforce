@@ -7,6 +7,10 @@
       "@workforce/core": ["../../node_modules/@workforce/core/dist/index.d.ts"],
       "@workforce/core/memory": ["../../node_modules/@workforce/core/dist/memory/index.d.ts"],
       "@workforce/core/memory/postgres": ["../../node_modules/@workforce/core/dist/memory/postgres/index.d.ts"],
+      "@workforce/core/scheduler": ["../../node_modules/@workforce/core/dist/scheduler/index.d.ts"],
+      "@workforce/core/scheduler/postgres": ["../../node_modules/@workforce/core/dist/scheduler/postgres/index.d.ts"],
+      "@workforce/queue": ["../../node_modules/@workforce/queue/dist/index.d.ts"],
+      "@workforce/queue/scheduler": ["../../node_modules/@workforce/queue/dist/scheduler/index.d.ts"],
       "@workforce/core/generated/prisma": ["../../node_modules/@workforce/core/generated/prisma/index.d.ts"]
     }
   },

@@ -144,6 +144,9 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
           <a className="chat-new" href="/memory">
             Memory
           </a>
+          <a className="chat-new" href="/schedules">
+            Schedules
+          </a>
           <a className="chat-new" href="/">
             New chat
           </a>

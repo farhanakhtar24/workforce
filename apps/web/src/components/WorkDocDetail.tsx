@@ -60,6 +60,9 @@ export function WorkDocDetailView({ apiBaseUrl, workDocId, chatId }: WorkDocDeta
             <a className="chat-new" href={workListPagePath()}>
               All documents
             </a>
+            <a className="chat-new" href="/schedules">
+              Schedules
+            </a>
           </nav>
         </header>
         <div role="alert" className="chat-banner chat-banner-warning">
@@ -278,6 +281,9 @@ function WorkDocDetailLoaded({
           )}
           <a className="chat-new" href={workListPagePath(chatId)}>
             Documents
+          </a>
+          <a className="chat-new" href="/schedules">
+            Schedules
           </a>
         </nav>
       </header>

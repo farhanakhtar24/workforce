@@ -29,6 +29,9 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { createClient } from 'redis';
 import type { RedisClientType } from 'redis';
 import { PrismaClient } from '@workforce/core/generated/prisma';
+import { SchedulerService, SCHEDULER_LIST_LIMIT_MAX } from '@workforce/core/scheduler';
+import { createPrismaSchedulerStore } from '@workforce/core/scheduler/postgres';
+import { BullMQSchedulerQueue } from '@workforce/queue/scheduler';
 import { MemoryService, type MemoryLogger } from '@workforce/core/memory';
 import { createPostgresMemoryStore } from '@workforce/core/memory/postgres';
 import { WorkDocService } from '@workforce/core/work-docs';
@@ -60,6 +63,11 @@ import { createDelegationRunJobClient } from './agents/delegation-run-client.js'
 import { createDelegationRoutes } from './agents/delegation-routes.js';
 import { createWorkDocRoutes } from './agents/work-doc-routes.js';
 import type { FetchLike } from './agents/host-capabilities.js';
+import {
+  SCHEDULER_METADATA_TIMEOUT_MS,
+  SCHEDULER_RUNNING_STALE_MS,
+  type SchedulerQueuePort,
+} from './scheduler/types.js';
 
 /**
  * Maps a startup failure to a SAFE, human-readable reason for logs — the only
@@ -105,6 +113,10 @@ export function startupFailureReason(error: unknown): string {
     }
     if (message === 'Redis connect timeout' || (message.startsWith('Redis ') && message.endsWith('connect timeout'))) {
       return 'Redis connection timed out';
+    }
+    // BullMQ queue PING failures (memory/delegation/scheduler startup pings).
+    if (message === 'Redis queue PING failed' || message.startsWith('Redis queue PING timeout')) {
+      return 'Redis queue unavailable';
     }
     if (message === 'Postgres connect timeout') {
       return 'Postgres connection timed out';
@@ -169,6 +181,8 @@ export interface ApiServerHandle {
     delegations: { repo: ReturnType<typeof createPrismaDelegationRepository>; queue: DelegationJobQueue | null };
     dataQuery: DataQueryService | null;
   };
+  /** Phase 5 scheduler handles (service + BullMQ queue; no worker here). */
+  scheduler: { service: SchedulerService; queue: SchedulerQueuePort | null };
   server: Server;
   /** Closes everything; idempotent. */
   close(): Promise<void>;
@@ -253,6 +267,7 @@ export async function startServer(): Promise<ApiServerHandle> {
   let worker: MemoryWorkerHandle | null = null;
   let delegationQueue: BullMQDelegationJobQueue | null = null;
   let delegationWorker: DelegationWorkerHandle | null = null;
+  let schedulerQueue: BullMQSchedulerQueue | null = null;
   let queryPool: Pool | null = null;
   let dataQueryService: DataQueryService | null = null;
   try {
@@ -335,6 +350,29 @@ export async function startServer(): Promise<ApiServerHandle> {
       rowCap: config.queryRowCap,
     });
 
+    // -- Phase 5 scheduler wiring --------------------------------------------
+    // The API produces/syncs schedules ONLY: Prisma store + service + the
+    // BullMQSchedulerQueue for Redis job state. The scheduler WORKER is a
+    // separate process (src/scheduler-worker.ts) that calls own REST — it is
+    // never created here.
+    const schedulerStore = createPrismaSchedulerStore(prisma);
+    const schedulerService = new SchedulerService({ store: schedulerStore });
+    schedulerQueue = new BullMQSchedulerQueue({ redisUrl: config.redisUrl });
+    // Startup honesty: PING the scheduler queue (bounded) and reconcile every
+    // task BEFORE listen — a down Redis must fail startup instead of serving
+    // scheduler writes that all 503. Every create/update/activate/pause sync
+    // is eventually re-derived here (queue state is a cache of the rows).
+    await schedulerQueue.ping(REDIS_CONNECT_TIMEOUT_MS);
+    try {
+      const tasks = await schedulerService.listTasks({ limit: SCHEDULER_LIST_LIMIT_MAX });
+      if (tasks.length > 0) {
+        await schedulerQueue.reconcile(tasks);
+      }
+    } catch (error) {
+      logger.error('scheduler-startup-reconcile-failed', error);
+      throw error instanceof Error ? error : new Error('Scheduler startup reconciliation failed');
+    }
+
     const app = buildApp({
       config,
       store,
@@ -358,6 +396,20 @@ export async function startServer(): Promise<ApiServerHandle> {
           logger,
         }),
         dataQuery: { service: dataQueryService, rowCap: config.queryRowCap },
+      },
+      scheduler: {
+        service: schedulerService,
+        queue: schedulerQueue as unknown as SchedulerQueuePort,
+        run: {
+          fetchFn,
+          baseUrl: config.internalApiBaseUrl,
+          executionTimeoutMs: config.schedulerExecutionTimeoutMs,
+          // Bounded budgets for hydration/resume recovery reads.
+          metadataTimeoutMs: SCHEDULER_METADATA_TIMEOUT_MS,
+          staleRunningMs: SCHEDULER_RUNNING_STALE_MS,
+          logger,
+        },
+        logger,
       },
     });
 
@@ -424,6 +476,13 @@ export async function startServer(): Promise<ApiServerHandle> {
           logger.error('delegation-queue-close-failed', error);
         }
       }
+      if (schedulerQueue !== null) {
+        try {
+          await schedulerQueue.close();
+        } catch (error) {
+          logger.error('scheduler-queue-close-failed', error);
+        }
+      }
       if (queryPool !== null) {
         try {
           await queryPool.end();
@@ -454,6 +513,7 @@ export async function startServer(): Promise<ApiServerHandle> {
         delegations: { repo: delegationRepo, queue: delegationQueue },
         dataQuery: dataQueryService,
       },
+      scheduler: { service: schedulerService, queue: schedulerQueue as unknown as SchedulerQueuePort },
       close,
     };
   } catch (error) {
@@ -475,6 +535,11 @@ export async function startServer(): Promise<ApiServerHandle> {
     }
     try {
       await delegationQueue?.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      await schedulerQueue?.close();
     } catch {
       /* best effort */
     }

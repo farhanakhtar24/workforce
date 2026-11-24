@@ -26,6 +26,14 @@ import { InMemoryWorkDocStore } from '@workforce/core/work-docs';
 import { InMemoryDelegationRepository, type DelegationRepository } from '@workforce/core/delegation';
 import type { DelegationJobQueue } from '../src/agents/delegation-queue.js';
 import type { DataQueryService } from '../src/agents/data-query.js';
+import {
+  InMemorySchedulerStore,
+  SchedulerService,
+  type AgentTask,
+  type AgentTaskExecution,
+  type SchedulerStore,
+} from '@workforce/core/scheduler';
+import type { SchedulerQueuePort, SchedulerRunBudgets } from '../src/scheduler/types.js';
 import { createDelegationRoutes } from '../src/agents/delegation-routes.js';
 
 export const TEST_ORIGINAL_ORIGIN = 'http://localhost:3000';
@@ -204,6 +212,8 @@ export interface TestAppOptions {
   memory?: MemoryRouteDeps;
   /** Phase 4 agent runtime fixture (see {@link startAgentsTestApp}). */
   agents?: AgentsFixtures;
+  /** Phase 5 scheduler fixture; when present the /api/scheduler routes mount. */
+  scheduler?: SchedulerFixtures;
 }
 
 export interface AgentsFixtures {
@@ -217,6 +227,64 @@ export interface AgentsFixtures {
   dataQueryService?: DataQueryService;
   queryRowCap?: number;
 }
+
+export interface SchedulerFixtures {
+  /** In-memory store for the service; tests seed/assert on it directly. */
+  store?: SchedulerStore;
+  /** Queue fake override; default records every call and never fails. */
+  queue?: SchedulerQueuePort;
+  /** Run-budget overrides (shortened in tests; see SchedulerRunBudgets). */
+  executionTimeoutMs?: number;
+  metadataTimeoutMs?: number;
+  staleRunningMs?: number;
+}
+
+/**
+ * Records every scheduler queue interaction; per-test failure injection via
+ * {@link failSync} / {@link failEnqueue}.
+ */
+export class FakeSchedulerQueue implements SchedulerQueuePort {
+  readonly syncCalls: Array<{ taskId: string; isActive: boolean }> = [];
+  readonly enqueueCalls: string[] = [];
+  private syncFailure: Error | null = null;
+  private enqueueFailure: Error | null = null;
+
+  /** Fails the next syncTask calls (null restores healthy behavior). */
+  failSync(error: Error | null): void {
+    this.syncFailure = error;
+  }
+
+  /** Fails the next enqueueExecution calls (null restores healthy behavior). */
+  failEnqueue(error: Error | null): void {
+    this.enqueueFailure = error;
+  }
+
+  async syncTask(task: AgentTask): Promise<{ recurringScheduler: 'none'; onceJob: 'none' }> {
+    this.syncCalls.push({ taskId: task.id, isActive: task.isActive });
+    if (this.syncFailure !== null) {
+      throw this.syncFailure;
+    }
+    return { recurringScheduler: 'none', onceJob: 'none' };
+  }
+
+  async enqueueExecution(execution: Pick<AgentTaskExecution, 'id'>): Promise<boolean> {
+    this.enqueueCalls.push(execution.id);
+    if (this.enqueueFailure !== null) {
+      throw this.enqueueFailure;
+    }
+    return true;
+  }
+
+  async ping(): Promise<void> {
+    return;
+  }
+
+  async close(): Promise<void> {
+    return;
+  }
+}
+
+export const silentLogger = { error: (): void => undefined, warn: (): void => undefined };
 
 export interface TestApp {
   config: ApiConfig;
@@ -237,6 +305,12 @@ export interface TestApp {
     workDocService: WorkDocService | undefined;
     delegationRepo: DelegationRepository | undefined;
     delegationQueue: DelegationJobQueue | null | undefined;
+  };
+  /** Phase 5 scheduler handles when the scheduler fixture is wired. */
+  scheduler?: {
+    service: SchedulerService;
+    store: SchedulerStore;
+    queue: SchedulerQueuePort;
   };
   /** Closes the HTTP server and drains tracked background tasks. */
   close(): Promise<void>;
@@ -282,6 +356,13 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
   const delegationQueue = agentsFixtures?.delegationQueue ?? null;
   const dataQueryService = agentsFixtures?.dataQueryService;
 
+  // Phase 5 scheduler fixture: the runner posts the isolated chat through the
+  // SAME rewriting loopback fetch (one app, one port), the queue is a fake.
+  const schedulerFixtures = options.scheduler;
+  const schedulerStore = schedulerFixtures?.store ?? new InMemorySchedulerStore();
+  const schedulerService = new SchedulerService({ store: schedulerStore });
+  const schedulerQueue = schedulerFixtures?.queue ?? new FakeSchedulerQueue();
+
   const app = buildApp({
     config,
     store,
@@ -314,6 +395,22 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
                 ? undefined
                 : { service: dataQueryService, rowCap: agentsFixtures?.queryRowCap ?? 200 },
           },
+    scheduler:
+      schedulerFixtures === undefined
+        ? undefined
+        : {
+            service: schedulerService,
+            queue: schedulerQueue,
+            run: {
+              fetchFn: agentFetchFn,
+              baseUrl: INTERNAL_ORIGIN,
+              executionTimeoutMs: schedulerFixtures.executionTimeoutMs ?? 180_000,
+              metadataTimeoutMs: schedulerFixtures.metadataTimeoutMs ?? 10_000,
+              staleRunningMs: schedulerFixtures.staleRunningMs ?? 30_000,
+              logger: silentLogger,
+            },
+            logger: silentLogger,
+          },
   });
   const server = app.listen(0);
   await new Promise<void>((resolve, reject) => {
@@ -342,6 +439,10 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
             delegationRepo,
             delegationQueue,
           },
+    scheduler:
+      schedulerFixtures === undefined
+        ? undefined
+        : { service: schedulerService, store: schedulerStore, queue: schedulerQueue },
     server,
     port: address.port,
     async close() {

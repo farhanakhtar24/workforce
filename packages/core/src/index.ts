@@ -1,12 +1,13 @@
 /**
  * Public API of @workforce/core: capabilities shared by every Workforce app.
  *
- * `export *` from the memory, agent-composition, work-doc, and delegation
- * barrels is safe here: all four barrels are pure (zod only) and carry no
- * Prisma side effects, so CLI consumers of `@workforce/core` never load the
- * generated client. The Prisma/pgvector/Postgres adapters live only under the
- * dedicated subpaths (`@workforce/core/memory/postgres`,
- * `@workforce/core/work-docs/postgres`, `@workforce/core/delegation/postgres`).
+ * `export *` from the memory, agent-composition, work-doc, delegation, and
+ * scheduler barrels is safe here: all five barrels are pure (zod + croner
+ * only) and carry no Prisma side effects, so CLI consumers of
+ * `@workforce/core` never load the generated client. The Prisma/pgvector/
+ * Postgres adapters live only under the dedicated subpaths
+ * (`@workforce/core/memory/postgres`, `@workforce/core/work-docs/postgres`,
+ * `@workforce/core/delegation/postgres`, `@workforce/core/scheduler/postgres`).
  */
 
 export {
@@ -22,3 +23,4 @@ export * from './memory/index.js';
 export * from './agents/index.js';
 export * from './work-docs/index.js';
 export * from './delegation/index.js';
+export * from './scheduler/index.js';

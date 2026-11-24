@@ -2,7 +2,7 @@
 
 Written during Phase 0 scaffold; extended as we build. This is the **single source of truth** for the system's shape — if code and this doc disagree, the doc wins until we update it.
 
-> Current state (2026-11-23): Phase 1 (CLI agent) **validated 2026-11-17**; Phase 2 (streaming, SSE, idempotency) **validated 2026-11-19** — see [`docs/phases/phase-2-streaming.md`](./phases/phase-2-streaming.md). Phase 3 (Memory) **validated 2026-11-23** — design fixed in [ADR-003](./decisions/ADR-003-memory-tree.md) and [ADR-007](./decisions/ADR-007-pgvector.md); evidence: **374 green offline tests** (core 137, CLI 30, API 162, web 45), real Postgres/pgvector+BullMQ integration **14/14**, real local-MiniLM embedding smoke **5/5**, and a live demo with Farhan's real Ollama key (compaction succeeded: one ready summary over 30 superseded sources; browser showed the READY summary and superseded observations); Farhan approved the phase on 2026-11-23 (topic self-assessment remained waived — not claimed). Phase 4 (Multi-Agent) is **implemented and integration-tested — validation pending** ([ADR-001](./decisions/ADR-001-composition-gating.md), [ADR-002](./decisions/ADR-002-same-rest-api.md), [ADR-004](./decisions/ADR-004-delegation-depth.md) accepted 2026-11-23): **583 green offline tests** (core 203, CLI 30, API 256, web 94), root typecheck + production build pass, real-infrastructure suite **23 tests green twice with cleanup** (11 memory + 3 Phase 2 Redis streaming + 9 Phase 4: Prisma WorkDoc CAS/rollback/links, sync same-REST delegation, real BullMQ async with atomic single-claim, real Redis `ask_user` byte-CAS, read-only `query_data` guardrails) — models mocked, so **the real Ollama/browser live gate and Farhan's explicit approval remain: the phase is not validated**. Recovery claims are per API process (no multi-process failover). Phase 5+ not started.
+> Current state (2026-11-23): Phase 1 (CLI agent) **validated 2026-11-17**; Phase 2 (streaming, SSE, idempotency) **validated 2026-11-19** — see [`docs/phases/phase-2-streaming.md`](./phases/phase-2-streaming.md). Phase 3 (Memory) **validated 2026-11-23** — design fixed in [ADR-003](./decisions/ADR-003-memory-tree.md) and [ADR-007](./decisions/ADR-007-pgvector.md); evidence: **374 green offline tests** (core 137, CLI 30, API 162, web 45), real Postgres/pgvector+BullMQ integration **14/14**, real local-MiniLM embedding smoke **5/5**, and a live demo with Farhan's real Ollama key (compaction succeeded: one ready summary over 30 superseded sources; browser showed the READY summary and superseded observations); Farhan approved the phase on 2026-11-23 (topic self-assessment remained waived — not claimed). Phase 4 (Multi-Agent) **validated 2026-11-23** ([ADR-001](./decisions/ADR-001-composition-gating.md), [ADR-002](./decisions/ADR-002-same-rest-api.md), [ADR-004](./decisions/ADR-004-delegation-depth.md) accepted 2026-11-23): **593 green offline tests** (core 203, CLI 30, API 256, web 104), root typecheck + production build pass, real-infrastructure suite **23 tests green twice with cleanup** (11 memory + 3 Phase 2 Redis streaming + 9 Phase 4: Prisma WorkDoc CAS/rollback/links, sync same-REST delegation, real BullMQ async with atomic single-claim, real Redis `ask_user` byte-CAS, read-only `query_data` guardrails; models mocked), and the **live browser gate passed by the orchestrator** the same day on Farhan's already-running real-provider servers (saved env; no key inspected or printed) — **Farhan's explicit approval ("yes next phase pls") followed on 2026-11-23**. Recovery claims remain per API process (no multi-process failover). Phase 5 (Queues & Schedulers) is **implemented and integration-tested — live real-provider browser gate PASSED 2026-11-24, awaiting Farhan's explicit approval — not validated** (design fixed in [ADR-006](./decisions/ADR-006-bullmq-scheduler.md), BullMQ Job Schedulers): **757 green offline tests** (core 243, `@workforce/queue` 47, CLI 30, API 299, web 138), root typecheck passes, real-infrastructure suite **34/34 with 0 skips** (23 previous + 11 scheduler) — green five consecutive runs after the initial fixes and twice more after the `nextRunAt` fix. The browser gate (API + web + standalone scheduler worker, saved env; no key inspected or printed) PASSED: manual Run-now **MANUAL COMPLETED attempt 1**; the automatic **`ONCE`** task fired without human input (**SCHEDULED COMPLETED attempt 1**, `queueJobId once-2ddc…`, dashboard Next run `— (none pending)` — `nextRunAt` cleared); the automatic **`CUSTOM_CRON`** `* * * * *` task fired through real BullMQ (**SCHEDULED COMPLETED attempt 1**, library repeat id/`repeatJobKey` persisted, `nextRunAt` advanced to 00:04 UTC, paused before a second run); tasks left PAUSED after success. **Farhan's explicit approval still required.** Startup reconcile covers the first 100 active tasks (documented bound). Phase 6 not started.
 
 ---
 
@@ -44,8 +44,10 @@ Written during Phase 0 scaffold; extended as we build. This is the **single sour
                                   │
                                   ▼
                           ┌──────────────┐
-                          │  Cron Worker │
-                          │  (separate)  │
+                          │  Scheduler   │
+                          │ Worker       │
+                          │ (separate    │
+                          │  process, 5) │
                           └──────────────┘
 ```
 
@@ -56,18 +58,19 @@ Written during Phase 0 scaffold; extended as we build. This is the **single sour
 | Module | Where | Status | Responsibility |
 |---|---|---|---|
 | **Shared calculator tool** | `packages/core/capabilities/` (`@workforce/core`) | **Phase 2 (validated)** | The one shared tool (`calculate`) used by CLI (Phase 1) and API (Phase 2) — stays the single shared local primitive in Phase 4 |
-| **API routes** | `apps/api/routes/` | **Phase 2 (validated)**; Phase 4 **implemented** (validation pending) | Chat POST, resume GET, hydration GET; Phase 4: chat dispatch by slug + mode + server-resolved depth, Work Docs / Delegations / `query_data` routes (`general`-only 404 fallback when agent deps are absent) |
+| **API routes** | `apps/api/routes/` | **Phase 2 (validated)**; Phase 4 **validated 2026-11-23**; Phase 5 scheduler routes **implemented** (`apps/api/src/scheduler`) | Chat POST, resume GET, hydration GET; Phase 4: chat dispatch by slug + mode + server-resolved depth, Work Docs / Delegations / `query_data` routes (`general`-only 404 fallback when agent deps are absent); Phase 5: `/api/scheduler` task CRUD, `tasks/:id/run`, executions list/detail, internal idempotent `executions/:id/run`, `executions/:id/retry` |
 | **Streaming** | `apps/api/streams/` | **Phase 2 (validated)** | SSE via AI SDK UI message streams, resumable streams, idempotency — unchanged by Phase 4 (child chats reuse it) |
-| **Web UI** | `apps/web/` | **Phase 2 (validated)**; `/memory` **Phase 3 (validated)**; Phase 4 **implemented** (validation pending) | Minimal accessible chat page (`useChat`, resume, hydration). Phase 4: agent picker, agent-scoped chat URLs, `/work` + `/work/[id]` Work Docs, `/delegations` panel (8 routes total) |
+| **Web UI** | `apps/web/` | **Phase 2 (validated)**; `/memory` **Phase 3 (validated)**; Phase 4 **validated 2026-11-23**; `/schedules` **Phase 5 implemented** (browser gate passed 2026-11-24, approval pending) | Minimal accessible chat page (`useChat`, resume, hydration). Phase 4: agent picker, agent-scoped chat URLs, `/work` + `/work/[id]` Work Docs, `/delegations` panel. Phase 5: `/schedules` task list/create/edit, activate/pause, run now, execution status/duration/attempt/token-usage/error/chat links, dead-letter retry |
 | **Memory** | `packages/core/memory/` | **Phase 3 (validated 2026-11-23)** | Domain contracts + `MemoryService` (`writeBlock/queryBlocks/semanticSearch/exploreRelated`), embedding/compaction processing methods, in-memory unit store; Prisma Postgres/pgvector adapter (`vector(384)`) + migration |
 | **Memory REST routes** | `apps/api/src/memory/` (routes) | **Phase 3 (validated 2026-11-23)** | Blocks browse/search/related/retry/compact endpoints (registered only when memory deps are injected) — built on top of `@workforce/core`; reused by the Phase 4 `search_memory` tool |
 | **Memory web page** | `apps/web/` (`/memory`) | **Phase 3 (validated 2026-11-23)** | Accessible page: create, path/keyword browse, semantic search, related/superseded, retry, compact |
 | **Memory queue + worker** | `apps/api/src/memory/` (BullMQ `workforce-memory` queue) | **Phase 3 (validated 2026-11-23)** | Embedding + compaction jobs on the existing Redis: deterministic job IDs, bounded retries w/ backoff, idempotent workers, failed status visible; local Transformers.js embeddings + Ollama compactor |
-| **Agents & capability registry** | `packages/core/agents/` | **Phase 4 — implemented (validation pending)** | Agent definitions (`orchestrator`, `analyst`, `researcher`; `general` unchanged), tool registry with Zod schemas + `readOnly`/approval metadata, pure `composeAgentCapabilities(agent, mode, depth, registry)` (ADR-001) |
-| **Work Docs** | `packages/core` + `apps/api` (Prisma) + `apps/api/routes` | **Phase 4 — implemented (validation pending)** | Durable versioned documents (`WorkDoc`/`WorkDocVersion`/`WorkDocRevision`/`WorkDocLink`), `expectedVersion` CAS updates, rollback → NEW version, audit source tagging, REST routes (ADR-002) |
-| **Delegation** | `apps/api` (routes + BullMQ `workforce-delegation` worker) | **Phase 4 — implemented (validation pending)** | Sync + async delegation over the same REST chat endpoint; `Delegation` tracker rows with atomic `expectedFrom` single-claim + stale `running` recovery; server-signed depth context; depth cap 2 (ADR-004) |
-| **Agent runtime** | `packages/core/runtime/` + agent composition | **Phase 4 — implemented (validation pending)** | Tools composed once per generation from the registry; transcript validation against the full action-set so plan/action switching stays valid; child chats route through the chat endpoint |
-| **Scheduler** | `packages/queue/scheduler/` | planned (Phase 5) | BullMQ repeatable jobs, recurrence, execution records |
+| **Agents & capability registry** | `packages/core/agents/` | **Phase 4 (validated 2026-11-23)** | Agent definitions (`orchestrator`, `analyst`, `researcher`; `general` unchanged), tool registry with Zod schemas + `readOnly`/approval metadata, pure `composeAgentCapabilities(agent, mode, depth, registry)` (ADR-001) |
+| **Work Docs** | `packages/core` + `apps/api` (Prisma) + `apps/api/routes` | **Phase 4 (validated 2026-11-23)** | Durable versioned documents (`WorkDoc`/`WorkDocVersion`/`WorkDocRevision`/`WorkDocLink`), `expectedVersion` CAS updates, rollback → NEW version, audit source tagging, REST routes (ADR-002) |
+| **Delegation** | `apps/api` (routes + BullMQ `workforce-delegation` worker) | **Phase 4 (validated 2026-11-23)** | Sync + async delegation over the same REST chat endpoint; `Delegation` tracker rows with atomic `expectedFrom` single-claim + stale `running` recovery; server-signed depth context; depth cap 2 (ADR-004) |
+| **Agent runtime** | `packages/core/runtime/` + agent composition | **Phase 4 (validated 2026-11-23)** | Tools composed once per generation from the registry; transcript validation against the full action-set so plan/action switching stays valid; child chats route through the chat endpoint |
+| **Scheduler domain** | `packages/core/scheduler` | **Phase 5 — implemented (integration-tested; browser gate passed 2026-11-24, approval pending)** | `AgentTask`/`AgentTaskExecution` domain + Prisma adapter; recurrence validation, next-run computation and skip-date iteration via croner (no hand-written cron parsing) |
+| **Scheduler queue, worker & routes** | `packages/queue/scheduler` (`@workforce/queue`) + `apps/api/src/scheduler` routes + `apps/api/src/scheduler-worker.ts` | **Phase 5 — implemented (integration-tested; browser gate passed 2026-11-24, approval pending)** | BullMQ Job Schedulers (`upsertJobScheduler`, `tz: 'UTC'`, template carries `taskId`) on the `workforce-scheduler` queue; separate scheduler-only worker process invoking the API's own REST; execution-table idempotency (unique scheduled execution per task+scheduledFor; atomic `PENDING/RETRYING → RUNNING` claim); DLQ = `DEAD_LETTER` rows + retained failed jobs; startup reconcile of the first 100 active tasks |
 
 ---
 
@@ -154,21 +157,34 @@ MemoryBlock
   ├── relations[]             (supersedes / supports / contradicts)
   └── compactedFromIds[]      (compaction provenance; sources retained, superseded)
 
-AgentTask (scheduler)
-  ├── agentSlug
-  ├── userPrompt
-  ├── recurrenceType          (ONCE / DAILY / WEEKLY / MONTHLY / CRON)
-  ├── recurrenceConfig        (JSON)
-  ├── skipDates[]             (dates to skip)
-  └── isActive
+AgentTask (scheduler — Phase 5 design, ADR-006; UTC only, no seconds)
+  ├── id / name
+  ├── agentSlug              (general | orchestrator | analyst | researcher)
+  ├── mode                   (plan | action)
+  ├── prompt
+  ├── scope                  (single-tenant: "default")
+  ├── recurrenceType         (ONCE / DAILY / WEEKLY / MONTHLY / CUSTOM_CRON)
+  ├── recurrenceConfig       (JSON — ONCE: runAt; DAILY: hour/minute; WEEKLY: hour/minute/weekdays;
+  │                           MONTHLY: hour/minute/daysOfMonth; CUSTOM_CRON: exactly five fields)
+  ├── skipDates[]            (YYYY-MM-DD — occurrences recorded SKIPPED)
+  ├── isActive               (deactivate removes the scheduler; already-produced occurrence → SKIPPED)
+  ├── timezone               (UTC only in Phase 5)
+  ├── nextRunAt?             (computed)
+  └── createdAt / updatedAt
 
-AgentTaskExecution
+AgentTaskExecution (scheduler — Phase 5 design, ADR-006; one isolated chat per execution)
   ├── taskId
   ├── scheduledFor
-  ├── startedAt / completedAt
-  ├── status                  (RUNNING / SUCCESS / FAILED / SKIPPED)
-  ├── tokenUsage
-  └── durationMs
+  ├── trigger                (SCHEDULED / MANUAL / RETRY)
+  ├── status                 (PENDING / RUNNING / RETRYING / COMPLETED / FAILED / DEAD_LETTER / SKIPPED)
+  ├── attempt / maxAttempts  (3; exponential backoff base 1000 ms)
+  ├── durationMs
+  ├── tokenUsage?            (nullable JSON — captured when provider/UI metadata allows; never fabricated)
+  ├── error                  (safe, bounded)
+  ├── chatId                 (unique = execution id — isolated chat prevents unbounded recurring context)
+  ├── queueJobId? / repeatJobKey?  (nullable, unique — BullMQ linkage)
+  ├── retryOfExecutionId?    (RETRY execution → its DEAD_LETTER predecessor; terminal rows immutable)
+  └── createdAt / updatedAt
 
 WorkDoc                      (Phase 4 — built; see phase-4 doc)
   ├── scope                  (single-tenant: "default")
@@ -234,6 +250,8 @@ Phase 2 specifics (see [ADR-005](./decisions/ADR-005-sse-idempotency.md), [ADR-0
 | `query_data` write/multi-statement attempt | Read-only transaction (DB-level), single SELECT/WITH screening, statement timeout, row cap (integrated; demonstration, not a firewall) |
 | Async delegation run twice (concurrent runners, worker retries) | Atomic `expectedFrom: 'pending'` single-claim → exactly one execution; stale `running` rows recover from the child transcript (per-process, no multi-process failover claim) |
 | BullMQ worker crash mid-job | Job idempotency via deterministic ids + retry with backoff (memory queue; Phase 4 delegation uses the `expectedFrom` claim + stale-`running` recovery — per-process) |
+| Same scheduler occurrence fired twice / concurrent delivery | Unique scheduled execution per `task + scheduledFor` (trigger `SCHEDULED`) + atomic `PENDING/RETRYING → RUNNING` claim — one row, one runner (integration-proven over real BullMQ/Postgres; ADR-006) |
+| Scheduler worker killed mid-run | Runs go through the own REST chat with the `Idempotency-Key`-ed isolated chat; BullMQ retry/backoff + stale-`running` recovery from the durable transcript — proven by a real SIGKILL of the scheduler worker: stall → restart → resume, COMPLETED attempt 1, exactly one model generation (no multi-process failover claim beyond this recovery) |
 | Redis unavailable | Chat/resume return an explicit 503 — no silent drop of exactly-once or resume guarantees (ADR-005) |
 
 ---
@@ -259,7 +277,7 @@ Phase 2 specifics (see [ADR-005](./decisions/ADR-005-sse-idempotency.md), [ADR-0
 - ADR-003: [Memory tree + relations + compaction over flat memory / graph DB](./decisions/ADR-003-memory-tree.md) — **Accepted 2026-11-19**
 - ADR-004: [Depth cap at 2 (not 3) + same-REST child chats](./decisions/ADR-004-delegation-depth.md) — **Accepted 2026-11-23**
 - ADR-005: [SSE + idempotency vs. WebSockets](./decisions/ADR-005-sse-idempotency.md) — **Accepted 2026-11-17**
-- ADR-006: BullMQ over in-process cron — Phase 5, not written
+- ADR-006: [BullMQ Job Schedulers over in-process cron (separate worker; execution-table idempotency)](./decisions/ADR-006-bullmq-scheduler.md) — **Accepted 2026-11-23**
 - ADR-007: [pgvector + local MiniLM embeddings (dimension tradeoff, local cache/privacy/cost)](./decisions/ADR-007-pgvector.md) — **Accepted 2026-11-19**
 - ADR-008: [AI SDK UI message streams vs. custom protocol](./decisions/ADR-008-ai-sdk-ui-streams.md) — **Accepted 2026-11-17**
 

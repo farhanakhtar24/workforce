@@ -22,6 +22,18 @@ See `docs/phases/phase-2-streaming.md`, `docs/phases/phase-3-memory.md`,
 ADR-002 (tools call the own REST API), and ADR-004 (depth cap 2) for the
 fixed designs.
 
+Phase 5 adds the scheduler (ADR-006, `docs/phases/phase-5-queues.md`): the
+`/api/scheduler` REST surface over the Prisma scheduler store/service, the
+real BullMQ scheduler queue (`@workforce/queue`), and the two run routes the
+standalone `src/scheduler-worker.ts` process calls (`X-Workforce-Scheduler-Worker: 1`
+convention). Every run goes through the SAME chat endpoint; each execution is
+an isolated chat (`chatId = execution.id`). After an occurrence is materialized
+(or deduped) the API advances `task.nextRunAt` under an exact-instant guard —
+`null` for `ONCE` (startup reconcile never re-adds a consumed once job),
+`computeNextRunAt(..., { after: occurrence, skipDates })` for recurring — as
+UI/reconcile metadata only: the run path never calls `queue.syncTask`, and
+there is no catch-up/backfill.
+
 ## Stack
 
 | Concern | Choice |

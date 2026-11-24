@@ -46,6 +46,11 @@ export interface ApiConfig {
   readonly queryStatementTimeoutMs: number;
   /** Phase 4: row cap for `query_data`, enforced as LIMIT cap+1 (default 200). */
   readonly queryRowCap: number;
+  /**
+   * Phase 5: scheduler execution budget (ms) for one internal chat POST
+   * (default 180000); the runner adds a bounded margin on top for streaming.
+   */
+  readonly schedulerExecutionTimeoutMs: number;
 }
 
 /** Default model cache directory, resolved relative to the process cwd. */
@@ -101,6 +106,7 @@ const BLANK_AS_ABSENT_ENV_KEYS = [
   'DELEGATION_TIMEOUT_MS',
   'QUERY_STATEMENT_TIMEOUT_MS',
   'QUERY_ROW_CAP',
+  'SCHEDULER_EXECUTION_TIMEOUT_MS',
 ] as const;
 
 const envSchema = z.object({
@@ -175,6 +181,17 @@ const envSchema = z.object({
     .min(1, 'QUERY_ROW_CAP must be between 1 and 10000 (default: 200)')
     .max(10_000, 'QUERY_ROW_CAP must be between 1 and 10000 (default: 200)')
     .default(200),
+  // Phase 5: budget (ms) for one scheduler-run internal chat POST. Shared by
+  // the API runner (adds a bounded stream margin) and the scheduler worker
+  // (its fetch budget for the same call).
+  SCHEDULER_EXECUTION_TIMEOUT_MS: z.coerce
+    .number({
+      message: 'SCHEDULER_EXECUTION_TIMEOUT_MS must be an integer between 1000 and 600000 (default: 180000)',
+    })
+    .int('SCHEDULER_EXECUTION_TIMEOUT_MS must be an integer (default: 180000)')
+    .min(1000, 'SCHEDULER_EXECUTION_TIMEOUT_MS must be between 1000 and 600000 (default: 180000)')
+    .max(600_000, 'SCHEDULER_EXECUTION_TIMEOUT_MS must be between 1000 and 600000 (default: 180000)')
+    .default(180_000),
 });
 
 /**
@@ -210,5 +227,6 @@ export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     delegationTimeoutMs: data.DELEGATION_TIMEOUT_MS,
     queryStatementTimeoutMs: data.QUERY_STATEMENT_TIMEOUT_MS,
     queryRowCap: data.QUERY_ROW_CAP,
+    schedulerExecutionTimeoutMs: data.SCHEDULER_EXECUTION_TIMEOUT_MS,
   });
 }

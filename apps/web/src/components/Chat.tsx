@@ -222,6 +222,9 @@ export function Chat({
           <a className="chat-new" href="/memory">
             Memory
           </a>
+          <a className="chat-new" href="/schedules">
+            Schedules
+          </a>
           <a className="chat-new" href={`/work?chatId=${encodeURIComponent(chatId)}&agent=${agent}`}>
             Work
           </a>

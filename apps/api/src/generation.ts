@@ -21,6 +21,7 @@ import {
   stepCountIs,
   type LanguageModel,
   type ToolSet,
+  type TextStreamPart,
   type UIMessage,
 } from 'ai';
 import type { ChatStore, ChatRef } from './store/types.js';
@@ -32,6 +33,61 @@ import { createMessageId, createStreamId } from './ids.js';
 
 /** Fixed safe text used whenever generation fails — nothing else ships. */
 export const STREAM_ERROR_TEXT = 'An error occurred while generating the response. Please try again.';
+
+/** Upper bound for a single usage counter (matches the scheduler domain bound). */
+export const MAX_USAGE_TOKEN_COUNT = 2_147_483_647 as const;
+
+/**
+ * Bounded, scheduler-shape token usage from the normalized AI SDK usage: only
+ * finite nonnegative integers survive; the object is omitted entirely when no
+ * field is valid (usage is never fabricated). `metadata.usage` rides along on
+ * the assistant message for every consumer (scheduler executions read it;
+ * other chats may simply ignore it).
+ */
+export function usageMetadata(usage: LanguageModelUsageLike): {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+} | null {
+  const bounded = (value: unknown): number | undefined => {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > MAX_USAGE_TOKEN_COUNT) {
+      return undefined;
+    }
+    return value;
+  };
+  const inputTokens = bounded(usage.inputTokens);
+  const outputTokens = bounded(usage.outputTokens);
+  const totalTokens = bounded(usage.totalTokens);
+  if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) {
+    return null;
+  }
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+  };
+}
+
+/** Structural surface of the normalized AI SDK usage object (v6). */
+interface LanguageModelUsageLike {
+  readonly inputTokens?: unknown;
+  readonly outputTokens?: unknown;
+  readonly totalTokens?: unknown;
+}
+
+/**
+ * `messageMetadata` for `toUIMessageStream`: emits `metadata.usage` on finish
+ * when the provider reported a parseable usage (Phase 5). Old Phase 2/4
+ * streams without usage metadata are unchanged (the chunks simply carry no
+ * `messageMetadata`).
+ */
+function chatTurnMessageMetadata({ part }: { part: TextStreamPart<ToolSet> }): { usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } } | undefined {
+  if (part.type !== 'finish') {
+    return undefined;
+  }
+  const usage = usageMetadata(part.totalUsage);
+  return usage === null ? undefined : { usage };
+}
 
 export interface CreateChatTurnStreamOptions {
   chat: ChatRef;
@@ -123,6 +179,8 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
           originalMessages: messages,
           // Provider/stream failures must never ship provider output.
           onError: () => STREAM_ERROR_TEXT,
+          // Phase 5: bounded `metadata.usage` on finish (never fabricated).
+          messageMetadata: chatTurnMessageMetadata,
         }),
       );
     },

@@ -26,7 +26,7 @@ See [`ADR-TEMPLATE.md`](./ADR-TEMPLATE.md).
 | 003 | [Memory tree + relations + compaction over flat memory / graph DB](./ADR-003-memory-tree.md) | 3 | 🟢 Accepted 2026-11-19 |
 | 004 | [Depth cap at 2 (not 3) + same-REST child chats](./ADR-004-delegation-depth.md) | 4 | 🟢 Accepted 2026-11-23 |
 | 005 | [SSE + idempotency vs. WebSockets](./ADR-005-sse-idempotency.md) | 2 | 🟢 Accepted 2026-11-17 |
-| 006 | BullMQ over in-process cron | 5 | 🔴 Not written |
+| 006 | [BullMQ Job Schedulers over in-process cron](./ADR-006-bullmq-scheduler.md) | 5 | 🟢 Accepted 2026-11-23 (design fixed; Phase 5 not built yet) |
 | 007 | [pgvector + local MiniLM embeddings](./ADR-007-pgvector.md) | 3 | 🟢 Accepted 2026-11-19 |
 | 008 | [AI SDK UI message streams vs. custom protocol](./ADR-008-ai-sdk-ui-streams.md) | 2 | 🟢 Accepted 2026-11-17 |
 

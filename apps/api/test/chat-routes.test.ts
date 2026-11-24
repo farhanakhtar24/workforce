@@ -1022,3 +1022,35 @@ test('resume with a generic failure: safe 503 and the marker is untouched', asyn
     await app.close();
   }
 });
+
+test('stream finish carries optional usage metadata; Phase 2 shape preserved', async () => {
+  const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
+  try {
+    const response = await postChat({ port: app.port, body: chatBody({ id: 'u-meta', text: 'hello' }) });
+    assert.equal(response.status, 200);
+    const raw = await response.text();
+    const chunks = raw
+      .split('\n\n')
+      .filter((line) => line.startsWith('data: ') && !line.includes('[DONE]'))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+    // The finish chunk carries `messageMetadata.usage` when the provider
+    // reported usage; every other chunk keeps its Phase 2 shape.
+    const finish = chunks.find((chunk) => chunk.type === 'finish') as Record<string, unknown> | undefined;
+    assert.notEqual(finish, undefined);
+    assert.deepEqual(
+      ((finish?.messageMetadata as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined),
+      { inputTokens: 12, outputTokens: 7, totalTokens: 19 },
+    );
+    // The persisted assistant message carries the same metadata; old
+    // consumers that ignore `metadata` are unaffected.
+    const stored = (await app.store.loadMessages({ slug: 'general', chatId: CHAT })) as UIMessage[];
+    const assistant = stored[stored.length - 1] as UIMessage;
+    assert.equal(assistant.role, 'assistant');
+    assert.deepEqual(
+      (assistant.metadata as Record<string, unknown> | undefined)?.usage,
+      { inputTokens: 12, outputTokens: 7, totalTokens: 19 },
+    );
+  } finally {
+    await app.close();
+  }
+});

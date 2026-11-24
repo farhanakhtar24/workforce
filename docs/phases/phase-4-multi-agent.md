@@ -3,13 +3,13 @@
 **Duration**: 1-2 weeks
 **Goal**: A team of agents that delegate to each other safely — sync and async — without runaway recursion, with a real Work Doc artifact and human-in-the-loop (HITL) questions.
 
-> **Status: 🚧 Active — implemented and integration-tested; live browser gate passed by the orchestrator 2026-11-23 — awaiting Farhan's explicit approval.** Phase 3 validated on 2026-11-23 and Farhan said "yes, next phase". The design below is fixed (not open for re-litigation) and recorded as decisions in [ADR-001](../decisions/ADR-001-composition-gating.md) (composition-time gating, not prompt-only), [ADR-002](../decisions/ADR-002-same-rest-api.md) (tools through the own REST API via injectable fetch) and [ADR-004](../decisions/ADR-004-delegation-depth.md) (depth cap 2 + same-REST child chats), all accepted 2026-11-23. Everything below is **implemented** across `packages/core`, `apps/api` and `apps/web`: **593 green offline tests** (core 203, CLI 30, API 256, web 104), root typecheck + production-build checks pass (the consolidated root test run executes separately), and the real-infrastructure suite (`npm run test:integration`) covers **23 tests — 11 memory + 3 Phase 2 Redis streaming + 9 Phase 4** — passed twice with exact per-run cleanup. The **live browser gate ran on 2026-11-23** on Farhan's already-running real-provider servers via saved env (no key inspected or printed; real Ollama calls occurred through the browser) — see the validation record below. **Not done yet**: Farhan's explicit approval after this gate — the phase is **not validated**; recovery claims remain per API process (no multi-process failover claim).
+> **Status: ✅ Validated 2026-11-23.** Phase 3 validated on 2026-11-23 and Farhan said "yes, next phase". The design below is fixed (not open for re-litigation) and recorded as decisions in [ADR-001](../decisions/ADR-001-composition-gating.md) (composition-time gating, not prompt-only), [ADR-002](../decisions/ADR-002-same-rest-api.md) (tools through the own REST API via injectable fetch) and [ADR-004](../decisions/ADR-004-delegation-depth.md) (depth cap 2 + same-REST child chats), all accepted 2026-11-23. Everything below is **implemented** across `packages/core`, `apps/api` and `apps/web`: **593 green offline tests** (core 203, CLI 30, API 256, web 104), root typecheck + production-build checks pass (the consolidated root test run executes separately), and the real-infrastructure suite (`npm run test:integration`) covers **23 tests — 11 memory + 3 Phase 2 Redis streaming + 9 Phase 4** — passed twice with exact per-run cleanup. The **live browser gate ran on 2026-11-23** on Farhan's already-running real-provider servers via saved env (no key inspected or printed; real Ollama calls occurred through the browser) — see the validation record below. **Farhan explicitly approved the live gate on 2026-11-23 ("yes next phase pls") — the phase is validated**; recovery claims remain per API process (no multi-process failover claim).
 
 ---
 
 ## What gets built in this phase
 
-All built — implemented and integration-tested; the live gate below is still open. Four agent slugs under `packages/core/agents/`. The existing slug `general` stays exactly as it is (full backward compatibility):
+All built — implemented, integration-tested, and **validated (2026-11-23)**. Four agent slugs under `packages/core/agents/`. The existing slug `general` stays exactly as it is (full backward compatibility):
 
 | Slug | Role | Can query data? | Can search memory? | Can write Work Docs? | Can delegate? | Tools |
 |---|---|---|---|---|---|---|
@@ -223,7 +223,7 @@ Review rounds caught and fixed: a transaction pool-poisoning path, the **sync de
   - `/work/86ee3a08-a8b1-471c-b6bc-d0b9e0782082?chatId=52790846-b7b8-4520-8def-23aacf5a96f8`
   - `/delegations?chatId=52790846-b7b8-4520-8def-23aacf5a96f8&agent=orchestrator`
 
-**Recorded 2026-11-23: live browser gate passed by the orchestrator — awaiting Farhan's explicit approval. Phase 4 is NOT validated.**
+**Recorded 2026-11-23: live browser gate passed by the orchestrator; Farhan explicitly approved the same day ("yes next phase pls") — Phase 4 VALIDATED 2026-11-23.**
 
 ---
 
@@ -252,10 +252,10 @@ Gate criteria (unchanged):
 
 **Honesty note**: the model is not guaranteed to always obey the intended tool order — if a turn picks a different (allowed) tool, or the exact failure appears, **record exactly what happened** (slug, mode, tool, response) and report it; that is a finding for the gate discussion, not a doc error to paper over. *(The 2026-11-23 orchestrator run demonstrated exactly this: one contained `write_doc` argument error, self-corrected — see the validation record above.)*
 
-**Phase 4 is NOT complete until Farhan explicitly approves this live gate.**
+**Phase 4 was closed on 2026-11-23: Farhan explicitly approved this live gate ("yes next phase pls"). It is validated.**
 
 ---
 
 ## When done
 
-→ Start [Phase 5 — Queues & Schedulers](./phase-5-queues.md)
+✅ Done 2026-11-23. → [Phase 5 — Queues & Schedulers](./phase-5-queues.md) opened the same day — design fixed in [ADR-006](../decisions/ADR-006-bullmq-scheduler.md) (BullMQ Job Schedulers); implementation not started.

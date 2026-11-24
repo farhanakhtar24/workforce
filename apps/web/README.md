@@ -1,11 +1,12 @@
 # @workforce/web
 
-Phase 2/3/4 minimal Next.js + React client for the Workforce API (`@workforce/api`).
+Phase 2/3/4/5 minimal Next.js + React client for the Workforce API (`@workforce/api`).
 Chat: four agents (`general` / `orchestrator` / `analyst` / `researcher`) with
 plan/action modes over the same streaming, idempotent, resumable chat core —
 rendered part by part. Memory: `/memory` create/browse/search/related/retry/compact
 workspace for the Phase 3 memory routes. Work Docs and Delegations are the Phase 4
-additions.
+additions, `/schedules` (agent task dashboard over the real `/api/scheduler` REST
+routes) is the Phase 5 addition.
 
 See `docs/phases/phase-2-streaming.md`, `docs/phases/phase-3-memory.md`,
 `docs/phases/phase-4-multi-agent.md`, ADR-005 (SSE + idempotency), ADR-008 (UI
@@ -57,6 +58,37 @@ Copy `.env.example` to `.env.local` for non-default values.
 | `/work` | Work Docs library: filter by scope/chat id/type/status, list, create (real orchestrator POST route, draft v1, requires a chat context). |
 | `/work/[workDocId]?chatId=…` | Work Doc detail: content, metadata edit via PATCH (CAS `expectedVersion`), versioned content edit via the REAL agent versions route (CAS `expectedVersion`, new immutable version), revisions, versions, typed links, rollback (`expectedVersion` + `toVersion` + confirm). The owning `chatId` is required by every doc-scoped API call — cross-chat access is a fixed 404, and the UI never links a detail view without it. |
 | `/delegations?chatId=…` | One parent chat's delegations through the real `GET /api/agents/orchestrator/delegations?parentChatId=…` route: target, mode, depth, status, task, result/error, timestamps, child-chat link. Polls only while a row is pending/running (tab visible, no overlapping requests, stops on error). No manual run/retry: `/run` is an internal signed route the browser never calls. |
+| `/schedules` | Phase 5 schedule dashboard over the real `/api/scheduler` routes (below). Tasks table/cards (agent/mode/recurrence summary/Active-Paused/next run) with Edit, Activate/Pause and Run now; execution-history table/cards with task + status filters, status badges, `scheduledFor` (UTC), `attempt/maxAttempts`, `durationMs`, input/output/total tokens (em dash when absent), bounded safe error, `retryOfExecutionId` link, and an `Open isolated chat` link to `/agents/<owning agent slug>/chat/<execution.chatId>?mode=<owning mode>`. DEAD_LETTER rows carry the only Retry action (details explain it creates a NEW linked execution in a NEW isolated chat; the old row stays immutable). Polls at most every 2 s, only while visible executions are PENDING/RUNNING/RETRYING (or a just-submitted run is settling), tab-gated, non-overlapping, sequence-guarded, stops on error behind a manual Refresh. All schedule input/times are UTC: minute precision, no seconds, no other timezone. The WORKER-ONLY routes (`tasks/:id/run-scheduled`, `executions/:id/run`) are never called and have no client builder. |
+
+## `/api/scheduler` contract (Phase 5)
+
+Contract source of truth: `apps/api/src/app.ts` mounting + `apps/api/src/scheduler/routes.ts`
+and `packages/core/src/scheduler` (kinds/schemas/types). The browser may call
+exactly these (helpers in `src/lib/scheduler.ts`, all tested):
+
+| Call | Route | Notes |
+|---|---|---|
+| Create | `POST /api/scheduler/tasks` | body = `{ name, agentSlug, mode, prompt, scope, recurrenceType, recurrenceConfig, skipDates, timezone: 'UTC' }` — 201 `{ task }`; a 503 means the DB row stands and only the BullMQ sync failed (`Scheduler queue is temporarily unavailable.` shown verbatim + saved-row hint; the UI refreshes task state). |
+| List | `GET /api/scheduler/tasks?isActive=&limit=` | `{ tasks } ≤ 100`; `isActive` only `true`/`false`. |
+| Detail | `GET /api/scheduler/tasks/:id` | `{ task, executions ≤ 10 }`. |
+| Update | `PATCH /api/scheduler/tasks/:id` | full editable field set; `recurrenceType`+`recurrenceConfig` always together; `nextRunAt` is recomputed server-side; same honest 503 semantics. |
+| Activate/Pause | `POST /api/scheduler/tasks/:id/activate` / `/pause` | the ONLY way `isActive` changes; `{ task }`; honest 503 as above. |
+| Run now | `POST /api/scheduler/tasks/:id/run` | MANUAL trigger → NEW execution + enqueue; 202 `{ execution }` (starts PENDING and settles in the history). |
+| History | `GET /api/scheduler/executions?taskId=&status=&limit=` | task (UUID) / status (the 7 statuses) filters; invalid values are omitted client-side. |
+| One row | `GET /api/scheduler/executions/:id` | `{ execution }`. |
+| Retry | `POST /api/scheduler/executions/:id/retry` | DEAD_LETTER-only (409 otherwise): NEW linked execution + NEW isolated chat; 202 `{ execution, retryOfExecutionId }`. |
+| NEVER | `POST /api/scheduler/tasks/:id/run-scheduled`, `POST /api/scheduler/executions/:id/run` | WORKER-ONLY (they carry BullMQ occurrence metadata the browser never mints); no builder exists in the client. |
+
+Recurrence shapes (strict pair rule, from `packages/core/src/scheduler`):
+`ONCE { runAt: UTC Z ISO }` (a `datetime-local` value converted by the client —
+seconds never stored), `DAILY { hour, minute }`, `WEEKLY { hour, minute,
+weekdays 0..6 unique }` (0=Sunday), `MONTHLY { hour, minute, daysOfMonth 1..31
+unique }`, `CUSTOM_CRON { expression: exactly 5 whitespace-separated fields, ≤200 chars }`.
+`skipDates`: comma/newline textarea → unique real `YYYY-MM-DD` UTC dates (≤366),
+deduped/validated client-side (all-or-nothing). Strict mappers reject malformed
+rows (wrong enum/value/shape, config/type mismatch, non-UTC instants, unsafe
+chat ids, non-UUID ids, malformed `tokenUsage`) into one safe fixed refresh
+error — no raw payload ever reaches the DOM.
 
 ## Chat (Phase 2 core, Phase 4 surface)
 
@@ -136,11 +168,14 @@ app/memory/page.tsx                   /memory shell → <Memory>
 app/work/page.tsx                     /work shell → <WorkDocsList> (chatId/scope/agent params validated)
 app/work/[workDocId]/page.tsx         detail shell → <WorkDocDetailView> (chatId required)
 app/delegations/page.tsx              delegation panel shell → <DelegationsView>
+app/schedules/page.tsx                /schedules shell → <Schedules> (fully dynamic)
 src/components/Chat.tsx               'use client': agent/mode controls, useChat + transport, tool-part and HITL rendering
 src/components/Memory.tsx             'use client': Phase 3 workspace (unchanged)
 src/components/WorkDocs.tsx           'use client': library list + create (real routes)
 src/components/WorkDocDetail.tsx      'use client': metadata PATCH, versioned content edit, versions/revisions/links, rollback
 src/components/Delegations.tsx        'use client': parent-chat delegation list + polling
+src/components/Schedules.tsx          'use client': Phase 5 schedule dashboard (create/edit form, task table/cards, execution history + polling)
+src/lib/scheduler.ts                  Phase 5 scheduler request/body/mapping/poll/link helpers (tested)
 src/lib/api.ts                        chat request/response helpers (send/hydrate/resume, slug-aware; tested)
 src/lib/agents.ts                     agent/mode roster, URL builders, guidance (tested)
 src/lib/tools.ts                      tool-part formatting + pending-ask_user scan (tested)
@@ -161,7 +196,7 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 
 ## Tests (offline, pure — node:test)
 
-`npm test` runs 100 tests across:
+`npm test` runs 138 tests across:
 
 - `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
   hydration mapping, safe errors) — unchanged and green.
@@ -185,11 +220,33 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 - `test/delegations.test.ts` — required `parentChatId` query, row validation against
   the status machine, poll predicate (pending/running only), child-chat URL gating,
   safe error collapse, no-retry stance (the guarded `/run` route is never surfaced).
+- `test/scheduler.test.ts` — exact `/api/scheduler` endpoint URLs (tasks, activate/
+  pause/run, executions, retry), task + execution query builders (invalid enum/UUID
+  values dropped), every recurrence type valid + invalid with ONCE `datetime-local`
+  → UTC `Z` conversion (seconds stripped, offsets/non-real dates rejected), skip-dates
+  editor (comma/newline, dedupe, real dates, 366 cap), create/update bodies (UTC
+  timezone, scope normalization, NO `isActive` on create/update), strict task/execution
+  mappers (malformed rows, config/type mismatch, token usage, non-UTC instants,
+  unsafe chat ids rejected), response mappers (list/detail/mutation/run 202/retry
+  202), formatters (recurrence summary per type, `attempt/maxAttempts`, `durationMs`,
+  token em dashes, bounded error, badge data-status), chat/retry links keyed to the
+  OWNING task's agent+mode, DEAD_LETTER-only retry gate, poll predicate
+  (PENDING/RUNNING/RETRYING + settle window, never terminal-only), and stub-fetch
+  orchestration for the real routes (API error text verbatim, honest 503 status).
 
 ## Validation limitations (honest — the phase gate is Farhan's live run)
 
 - Tests cover only the **pure helpers**. No React/browser tests were added
   (by design, no extra stack).
+- Phase 5 (`/schedules`) is NOT live-validated yet. Not yet run against the live
+  stack: creating every recurrence type end-to-end, the honest 503 queue-sync flow
+  (row stands, UI keeps the task after refresh), MANUAL run 202 → PENDING →
+  RUNNING → terminal settling through the 2 s poll, DEAD_LETTER retry creating a
+  NEW linked execution + NEW isolated chat, filter-driven history refresh,
+  execution chat links landing in the right agent transcript, and the scheduler
+  worker actually picking the synced BullMQ jobs. Run the API (`npm run dev` with
+  Redis + Postgres + the scheduler worker) and `npm run dev` here, then walk the
+  phase-5 validation gate.
 - Not yet run against the live Phase 4 stack: agent/mode switch navigation +
   per-slug hydration, plan-mode generations actually WITHOUT write/delegation tools,
   `write_doc` → Work Doc page round-trip, CAS conflict (409) behavior in the PATCH /
