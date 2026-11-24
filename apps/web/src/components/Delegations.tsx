@@ -54,7 +54,7 @@ export function DelegationsView({ apiBaseUrl, chatId, agent }: DelegationsProps)
         title="Delegations"
         description="Runs this chat delegated to worker agents, with their child chats."
       >
-        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900">
+        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
           <p className="m-0">
             Delegations are listed per chat — open this page from a chat's <code>Delegations</code>{' '}
             link (<code>/delegations?chatId=…</code>).
@@ -147,10 +147,10 @@ function DelegationsLoaded({
       {error !== null && (
         <div
           role="alert"
-          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200"
         >
           <p className="m-0">{error}</p>
-          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => void refresh()}>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 dark:hover:bg-red-950/60 dark:hover:text-red-200" onClick={() => void refresh()}>
             Refresh
           </Button>
         </div>
@@ -186,9 +186,9 @@ function DelegationCard({ row }: { row: Delegation }): React.ReactElement {
     <Card
       className={cn(
         'gap-2.5 px-3.5 py-3',
-        row.status === 'pending' && 'border-amber-300',
+        row.status === 'pending' && 'border-amber-300 dark:border-amber-800',
         row.status === 'running' && 'border-primary',
-        (row.status === 'failed' || row.status === 'timeout') && 'border-red-300',
+        (row.status === 'failed' || row.status === 'timeout') && 'border-red-300 dark:border-red-800',
       )}
       data-status={row.status}
     >
@@ -216,7 +216,7 @@ function DelegationCard({ row }: { row: Delegation }): React.ReactElement {
         </>
       )}
       {row.error !== null && (
-        <p className="m-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-sm break-words whitespace-pre-wrap text-red-800">
+        <p className="m-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-sm break-words whitespace-pre-wrap text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
           {truncateDelegationText(row.error, DELEGATION_TEXT_LIMIT)}
         </p>
       )}

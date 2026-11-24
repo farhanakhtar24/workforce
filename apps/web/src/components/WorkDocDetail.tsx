@@ -70,7 +70,7 @@ export function WorkDocDetailView({ apiBaseUrl, workDocId, chatId }: WorkDocDeta
         title="Work document"
         description="One document with its content, versions, revisions and links."
       >
-        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900">
+        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
           <p className="m-0">
             This page needs its owning chat as <code>?chatId=…</code> — open the document from a
             chat's Work link or a list entry on <code>/work</code>.
@@ -302,10 +302,10 @@ function WorkDocDetailLoaded({
       {loadError !== null && loadedOnce && (
         <div
           role="alert"
-          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200"
         >
           <p className="m-0">{loadError}</p>
-          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => void loadAll()}>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 dark:hover:bg-red-950/60 dark:hover:text-red-200" onClick={() => void loadAll()}>
             Refresh
           </Button>
         </div>
@@ -563,8 +563,8 @@ function NoticeTextLive({ kind, text }: { kind: 'ok' | 'error'; text: string }):
       aria-live="polite"
       className={
         kind === 'ok'
-          ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900'
-          : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800'
+          ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200'
+          : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200'
       }
     >
       {text}

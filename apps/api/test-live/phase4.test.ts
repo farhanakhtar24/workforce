@@ -366,6 +366,8 @@ async function createPhase4Stack(options: Phase4StackOptions): Promise<Phase4Sta
       for (const { slug, chatId } of trackedChats) {
         await base.del(`${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:messages`);
         await base.del(`${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:active-stream`);
+        // The activity-index member this run's appends created.
+        await base.zRem(`${REDIS_KEY_PREFIX}:chat-index`, `${slug}:${chatId}`);
       }
       for (const key of trackedIdempotencyKeys) {
         await base.del(key);

@@ -98,3 +98,59 @@ Browser fixes found during the orchestrator's real audits (each fixed narrowly):
 6. **Mobile active nav clipped** — after the horizontal top-bar scroll, the right-most active item could render off-view. Fix: refs + a mobile-guarded (`max-width: 767px`) effect that centers the active item by assigning the nav list's `scrollLeft` directly — no `scrollIntoView`, no document scroll.
 
 Validation as recorded: root `npm test` total is now **767 green offline tests** (core 243, `@workforce/queue` 47, CLI 30, API 299, web 148 — web grew by the 10 `test/workspace.test.ts` cases) and root typecheck + root tests pass after the final source changes. Orchestrator browser evidence: desktop/mobile long chat `maxScrollY 0`; fresh suggestions fill the composer only; one real `general` Enter submission produced exactly one user+assistant turn (`UI OK`); Memory, Work list/detail, Delegations with real results, and Schedules (desktop/mobile) verified. **No Next production build was run** — the real `next dev` server stayed active for Farhan at all times (a production build against the same `.next` would corrupt dev assets), so the plan's build-after-stopping-dev-server step remains for a coordinated window.
+
+## Follow-up implementation record (2026-11-24 — real chat history + live progress/offline; review fixes; all phase validation/approval statuses unchanged)
+
+After the shell work shipped, two Farhan UX requests landed and the browser review fixes followed (scope: `apps/web` + the API's own `GET /api/chats` route, owned by the API workspace):
+
+- **Real recent chats**: the sidebar gained a history region fed exclusively by the real `GET /api/chats` (default 20 / max 50 / `no-store`; bounded server-side title/preview plain text; indexed last-activity timestamps with honest `null` for legacy rows; fixed 400/503 mapping client-side; atomic `RPUSH`+`ZADD` persistence with a bounded legacy `SCAN` backfill — API-owned, real-tested). Desktop renders an independently scrollable region below the primary nav; mobile a collapsed disclosure in the top bar. Refresh on route change (hard) and once per settled generation via the `workforce:chats-changed` window event (soft: prior rows never flash to skeleton; soft failures keep the last good list). Current `(agent, chatId)` row highlighted (`aria-current`), links to canonical chat URLs; accessible copy states that "New chat" never deletes history. No localStorage anywhere.
+- **Real loading progress + live thinking + offline**: the dead space under a busy assistant turn is replaced by a stage indicator derived purely from `useChat` status + the CURRENT generation's raw parts (Sending your message → Waiting for the model → Thinking only for live reasoning → Using <tool> only while that tool awaits → Writing response), with spinner + aria-hidden elapsed seconds and the honest >12 s "Taking longer than usual…" note — no fake progress, no stop button. Streamed reasoning renders in a visibly live Thinking panel only for the current assistant turn (a fresh submit can no longer reopen previous turns' reasoning) and collapses back on completion without duplication. `navigator.onLine` + online/offline events drive an honest amber warning (draft/history remain; the request can fail; nothing resumes automatically; busy-offline adds "no confirmed progress"), and errors present as "Response failed" with fixed text + connection guidance.
+
+Final review fixes: live-thinking gating to the newest assistant message, elapsed span marked `aria-hidden` (no per-second re-announcement; stage changes still announce), skeleton-free soft history refresh, and surrogate-pair-safe title/preview truncation with an astral boundary test.
+
+Validation: production build passed before the final review-only fixes; the dev server is active now (no further build — orchestrator-owned). Current root offline total **810 green tests** (core 243, `@workforce/queue` 47, CLI 30, API 318, web 172; web grew by the `recent-chats` and `chat-progress` suites) with root typecheck and root tests passing. Real integration: full suite previously **37/37**; after the `zScore` edge fix the targeted real chat-history suite passed **4/4** (one new test; no full rerun claimed). Browser evidence: real sending progress settling into a completed compute response; a new chat indexed first with a real timestamp; an old-chat click restoring the transcript with `UI OK`; mobile disclosure verified. No offline-browser simulation is claimed: the offline event/copy helpers are unit-tested — the real browser did not toggle the machine's network.
+
+## Follow-up implementation record (2026-11-24 — Farhan's ChatGPT-style light/dark request; all phase validation/approval statuses unchanged)
+
+Farhan supplied a ChatGPT dark screenshot: "make the UI this kind, give light dark modes, also don't make it too dark." Implemented on `apps/web` only:
+
+- **Working Light + Dark mode** via standard `next-themes` (class attribute,
+  `defaultTheme="system"`, localStorage persistence, injected pre-paint script
+  + `suppressHydrationWarning` — no flash, no hydration mismatch). `ThemeToggle`
+  shows the action (Moon/"Dark theme" in light; Sun/"Light theme" in dark) with
+  CSS-class-driven markup (hydration-safe, no mounted gate), compact icon-only
+  on mobile. **Explicit `.dark` token set** (also refined the light one): main
+  soft graphite `oklch(0.28 0.007 255)` and sidebar `oklch(0.245)` — visibly
+  lighter than the screenshot's pure black and NOT dark-green; the sidebar rail
+  is a subtle neutral gray in both themes (`oklch(0.968)` light) and deep green
+  survives only as a small brand mark/accent (`--primary`, ring, avatar).
+  Every status color (amber/red/emerald banners, notices, status/delegation
+  badges, avatar tints) gained matching `dark:` variants; the custom legacy CSS
+  is token-based and audited for dark compatibility.
+- **ChatGPT-calm shell geometry**: slim `md:w-[260px]` neutral rail — brand
+  mark row, prominent New chat row, compact icon nav, the real single-line
+  Recent chats (avatar chip + truncated title + real message count; full
+  honest metadata kept accessible via per-row `aria-label`/`title`), and a
+  bottom utility area (theme toggle + "Local workspace"). Quieter page
+  headers; mobile keeps nav scroll-centering + the collapsed history
+  disclosure + icon theme toggle.
+- **Empty chat rebuild**: greeting "What should we accomplish?" + the ONE
+  composer instance centered under it + a few rounded suggestion chips below
+  (the single form is repositioned per state — centered when empty, pinned
+  dock once populated; ids/aria/handlers unchanged, never two forms).
+  Suggestion chips remain fill-only.
+
+Preservation (all verified by diff + tests): transport/idempotency/resume,
+submissionGate, Enter/Shift+Enter, fixed h-dvh frame with transcript-only
+scrolling and pinned dock, initial-latest scroll, real RecentChats data/
+events/loading/error/empty/soft-refresh/active/mobile disclosure, progress
+stages + aria-hidden elapsed + long-wait note, current-turn-only live
+Thinking, HITL dock, tool cards, safe Markdown, WorkDoc CAS/rollback,
+delegations/scheduler polling. New dependency: `next-themes@0.4.6` (allowed:
+the documented standard for class-based themes). Checks: web typecheck pass,
+web tests 172/172, root typecheck exit 0, root tests exit 0 (810 offline =
+core 243 + queue 47 + CLI 30 + API 318 + web 172; one API-owned memory-route
+test flaked once and passed in isolation plus the full rerun). Orchestrator
+browser verification still open for both themes × desktop/mobile ×
+empty/populated chat, including dark-contrast eyeballing of the graphite
+surfaces.

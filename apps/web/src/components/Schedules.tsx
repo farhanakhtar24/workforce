@@ -319,10 +319,10 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
     notice === null
       ? ''
       : notice.kind === 'ok'
-        ? 'border border-emerald-200 bg-emerald-50 text-emerald-900'
+        ? 'border border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200'
         : notice.kind === 'warn'
-          ? 'border border-amber-200 bg-amber-50 text-amber-900'
-          : 'border border-red-200 bg-red-50 text-red-800';
+          ? 'border border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200'
+          : 'border border-red-200 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200';
 
   return (
     <WorkspaceShell
@@ -355,10 +355,10 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
       {error !== null && (
         <div
           role="alert"
-          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200"
         >
           <p className="m-0">{error}</p>
-          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => void refresh()}>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 dark:hover:bg-red-950/60 dark:hover:text-red-200" onClick={() => void refresh()}>
             Refresh
           </Button>
         </div>
@@ -411,7 +411,7 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
                         )}
                       </td>
                       <td>
-                        <Badge variant="outline" data-active={task.isActive ? 'true' : 'false'} className={task.isActive ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : ''}>
+                        <Badge variant="outline" data-active={task.isActive ? 'true' : 'false'} className={task.isActive ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200' : ''}>
                           {task.isActive ? 'Active' : 'Paused'}
                         </Badge>
                       </td>
@@ -443,7 +443,7 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
                     <div className="flex flex-wrap items-baseline gap-2">
                       <Badge variant="secondary" data-kind={task.agentSlug}>{task.agentSlug}</Badge>
                       <Badge variant="outline">{task.mode}</Badge>
-                      <Badge variant="outline" data-active={task.isActive ? 'true' : 'false'} className={task.isActive ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : ''}>
+                      <Badge variant="outline" data-active={task.isActive ? 'true' : 'false'} className={task.isActive ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200' : ''}>
                         {task.isActive ? 'Active' : 'Paused'}
                       </Badge>
                     </div>
@@ -920,8 +920,8 @@ function ScheduleFormSection({
             role={formNotice.kind === 'ok' ? 'status' : 'alert'}
             className={
               formNotice.kind === 'ok'
-                ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900'
-                : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800'
+                ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200'
+                : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200'
             }
           >
             <p className="m-0">{formNotice.text}</p>

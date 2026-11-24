@@ -12,9 +12,11 @@ import {
   FileText,
   MessageSquare,
   Network,
-  SquarePen,
+  Plus,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { RecentChats } from '@/components/RecentChats';
+import { ThemeToggle } from '@/components/ThemeToggle';
 import { cn } from '@/lib/utils';
 import {
   WORKSPACE_NAV,
@@ -24,21 +26,21 @@ import {
 } from '@/lib/workspace';
 
 /**
- * Shared app shell for every routed Workforce surface (Tailwind + shadcn).
+ * Shared app shell for every routed Workforce surface (Tailwind + shadcn,
+ * light/dark via the shared token set).
  *
- * One sidebar serves both breakpoints: a slim dark-ink column on desktop and
- * a compact horizontal bar on mobile (all routes stay reachable — nothing is
- * hidden into a dropdown). It owns the brand mark, the "New chat" shadcn
- * Button, the single primary navigation with current-page indication
- * (`aria-current` + section highlight), and the honest "Local workspace"
- * label — no fake history, usage metrics or provider status.
+ * ChatGPT-calm geometry, not a branded dashboard: a slim (~260px) NEUTRAL
+ * sidebar rail (subtle gray in light, soft graphite in dark) with the simple
+ * brand mark, a prominent New chat row, compact icon nav, the real
+ * `RecentChats` region (API data), and a bottom utility area (theme toggle +
+ * "Local workspace"). One sidebar serves both breakpoints: desktop column,
+ * compact mobile top bar with a collapsed history disclosure. One primary
+ * navigation landmark with `aria-current`, single nav never duplicated.
  *
- * Surfaces render their own content inside; page surfaces get an eyebrow /
- * title / description header, while the chat uses the full-height "chat"
- * variant whose sticky composer dock relies on `mt-auto` here. Navigation
- * into Work/Delegations can carry the caller's context query (chat id +
- * agent) via `contextQuery` so scoped deep-linking keeps working exactly
- * like the old per-page headers.
+ * Chat uses the full-height "chat" variant (viewport frame, transcript-only
+ * scroll, pinned composer dock); page surfaces keep the document scroll.
+ * `contextQuery` keeps Work/Delegations deep-link filtering when coming from
+ * a chat, exactly like the old per-page headers did.
  */
 
 const NAV_ICONS: Readonly<Record<WorkspaceNavId, LucideIcon>> = {
@@ -124,27 +126,30 @@ export function WorkspaceShell({
       <a className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:border focus:bg-card focus:px-3 focus:py-2 focus:text-sm" href="#ws-content">
         Skip to content
       </a>
-      <aside className="sticky top-0 z-30 flex shrink-0 flex-col gap-2 border-b bg-sidebar px-3 py-2 text-sidebar-foreground md:h-dvh md:w-60 md:gap-4 md:border-r md:border-b-0 md:py-4 md:pr-4">
-        <div className="flex items-center justify-between gap-2 md:flex-col md:items-stretch md:gap-3 md:border-b md:border-sidebar-border md:pb-4">
+      <aside className="sticky top-0 z-30 flex shrink-0 flex-col gap-2 border-b bg-sidebar px-3 py-2 text-sidebar-foreground md:h-dvh md:w-[260px] md:gap-3 md:border-r md:border-b-0 md:py-3 md:pr-3">
+        <div className="flex items-center justify-between gap-2 md:flex-col md:items-stretch md:gap-3 md:border-b md:border-sidebar-border md:pb-3">
           <div className="flex min-w-0 items-center gap-2">
             <span className="inline-flex size-6 items-center justify-center rounded-md bg-primary text-primary-foreground" aria-hidden="true">
               <Bot size={15} strokeWidth={2.2} />
             </span>
-            <span className="text-[0.95rem] font-semibold tracking-tight whitespace-nowrap">
+            <span className="text-[0.95rem] font-medium tracking-tight whitespace-nowrap">
               Workforce
             </span>
           </div>
-          <Button
-            asChild
-            variant="outline"
-            size="sm"
-            className="justify-center border-sidebar-border bg-transparent text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground md:w-full"
-          >
-            <a href={newChatHref}>
-              <SquarePen aria-hidden="true" />
-              New chat
-            </a>
-          </Button>
+          <div className="flex items-center gap-1.5 md:w-full md:flex-col">
+            <ThemeToggle compact className="md:hidden" />
+            <Button
+              asChild
+              variant="outline"
+              size="sm"
+              className="justify-start gap-2 border-sidebar-border bg-transparent font-medium text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground md:h-9 md:w-full md:justify-center md:px-3 md:text-[0.875rem]"
+            >
+              <a href={newChatHref}>
+                <Plus aria-hidden="true" />
+                New chat
+              </a>
+            </Button>
+          </div>
         </div>
         <nav aria-label="Workforce pages" className="min-w-0">
           <ul ref={navListRef} className="flex gap-0.5 overflow-x-auto md:flex-col md:overflow-visible">
@@ -152,19 +157,19 @@ export function WorkspaceShell({
               const Icon = NAV_ICONS[item.id];
               const isActive = item.id === activeId;
               return (
-                <li key={item.id}>
+                <li key={item.id} className="shrink-0 md:shrink">
                   <a
                     ref={isActive ? activeLinkRef : undefined}
                     className={cn(
-                      'flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[0.85rem] whitespace-nowrap transition-colors',
-                      'text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground',
+                      'flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[0.84rem] whitespace-nowrap transition-colors',
+                      'text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground',
                       isActive &&
-                        'bg-sidebar-accent font-semibold text-sidebar-foreground shadow-[inset_2px_0_0_var(--sidebar-primary)]',
+                        'bg-sidebar-accent font-medium text-sidebar-foreground',
                     )}
                     href={navHref(item)}
                     aria-current={isActive ? 'page' : undefined}
                   >
-                    <Icon size={16} aria-hidden="true" />
+                    <Icon size={15} aria-hidden="true" />
                     <span>{item.label}</span>
                   </a>
                 </li>
@@ -172,8 +177,14 @@ export function WorkspaceShell({
             })}
           </ul>
         </nav>
-        <div className="mt-auto hidden border-t border-sidebar-border pt-2 text-[0.72rem] text-sidebar-foreground/55 md:block">
-          Local workspace
+        <RecentChats />
+        {/* Desktop bottom utility area: theme control + honest label. Mobile
+            keeps a compact theme toggle next to New chat, saving bar rows. */}
+        <div className="mt-auto flex flex-col gap-2 border-t border-sidebar-border pt-2 max-md:hidden">
+          <ThemeToggle className="w-full justify-center" />
+          <div className="text-center text-[0.7rem] text-sidebar-foreground/55">
+            Local workspace
+          </div>
         </div>
       </aside>
       <main
@@ -185,21 +196,21 @@ export function WorkspaceShell({
         {hasHeader && (
           <header
             className={cn(
-              'mx-auto w-full max-w-[70rem] pt-6 md:px-7 md:pt-8',
+              'mx-auto w-full max-w-[70rem] px-4 pt-5 md:px-7 md:pt-6',
               variant === 'chat' && 'shrink-0',
             )}
           >
             <div className={cn(variant === 'chat' && 'mx-auto max-w-[44rem]')}>
               {eyebrow !== undefined && (
-                <p className="mb-0.5 text-[0.7rem] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
+                <p className="mb-0.5 text-[0.68rem] font-medium tracking-[0.07em] text-muted-foreground uppercase">
                   {eyebrow}
                 </p>
               )}
               {title !== undefined && (
-                <h1 className="m-0 text-2xl leading-tight font-semibold tracking-tight">{title}</h1>
+                <h1 className="m-0 text-xl leading-tight font-medium tracking-tight">{title}</h1>
               )}
               {description !== undefined && (
-                <p className="mt-1 max-w-[70ch] text-[0.92rem] text-muted-foreground">{description}</p>
+                <p className="mt-1 max-w-[70ch] text-[0.88rem] text-muted-foreground">{description}</p>
               )}
               {context !== undefined && (
                 <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">{context}</div>

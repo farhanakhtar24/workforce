@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { Loader2, Send } from 'lucide-react';
+import { Loader2, Send, Sparkles, WifiOff } from 'lucide-react';
 import {
   buildReconnectRequest,
   buildSendRequest,
@@ -55,6 +55,17 @@ import { AgentAvatar } from '@/components/AgentAvatar';
 import { WorkspaceShell } from '@/components/WorkspaceShell';
 import { MarkdownText } from '@/components/MarkdownText';
 import { agentLabel, chatSuggestions } from '@/lib/workspace';
+import {
+  LONG_WAIT_TEXT,
+  OFFLINE_BODY,
+  OFFLINE_BUSY_BODY,
+  OFFLINE_TITLE,
+  deriveProgressStage,
+  formatElapsed,
+  isLongWait,
+  progressLabel,
+} from '@/lib/chat-progress';
+import { CHATS_CHANGED_EVENT } from '@/lib/recent-chats';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { NativeSelect } from '@/components/ui/native-select';
@@ -263,6 +274,136 @@ export function Chat({
           ? 'Something interrupted this response. You can send a new message.'
           : 'Ready';
 
+  // Online/offline awareness: immediate honest warnings, no auto-resume claim.
+  const [online, setOnline] = useState(true);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setOnline(window.navigator.onLine);
+    const goOnline = (): void => setOnline(true);
+    const goOffline = (): void => setOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []);
+
+  // Busy elapsed clock: starts at the first busy render, resets on settle.
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const busyStartRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (busy) {
+      if (busyStartRef.current === null) busyStartRef.current = Date.now();
+      const start = busyStartRef.current;
+      const tick = (): void =>
+        setElapsedSeconds(Math.max(0, Math.floor((Date.now() - start) / 1000)));
+      tick();
+      const timer = window.setInterval(tick, 1000);
+      return () => {
+        window.clearInterval(timer);
+      };
+    }
+    if (busyStartRef.current !== null) {
+      busyStartRef.current = null;
+      setElapsedSeconds(0);
+    }
+  }, [busy]);
+
+  // The current streaming generation's assistant turn (if any): drives the
+  // live stage and the live Thinking panel without touching the reader.
+  // Stage parts come from the CURRENT turn only: while the newest message is
+  // still the user's fresh submission, no assistant parts apply (pure
+  // "Sending/Waiting" copy), so previous turns never fake activity.
+  const latestIndex = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === 'assistant') return index;
+    }
+    return -1;
+  }, [messages]);
+  const progress = useMemo(() => {
+    if (!busy) return null;
+    const latest = messages.length > 0 ? messages[messages.length - 1] : null;
+    return deriveProgressStage({
+      status: status === 'streaming' ? 'streaming' : 'submitted',
+      parts: latest?.role === 'assistant' ? latest.parts : [],
+    });
+  }, [busy, status, messages]);
+  const stageLine =
+    busy && progress !== null ? progressLabel(progress) : statusText;
+
+  // One real-data refresh per settled generation: the history region
+  // (RecentChats) listens for this event. Fired once for ready/error settles
+  // that left messages — never per token, never on a quiet mount.
+  const hadBusyRef = useRef(false);
+  useEffect(() => {
+    if (busy) {
+      hadBusyRef.current = true;
+      return;
+    }
+    if (!hadBusyRef.current) return;
+    hadBusyRef.current = false;
+    if (messages.length > 0) {
+      window.dispatchEvent(new CustomEvent(CHATS_CHANGED_EVENT));
+    }
+  }, [busy, messages]);
+
+  // THE single composer instance (ids/aria/handlers unchanged): rendered
+  // centered inside the greeting block on an empty transcript, and pinned in
+  // the bottom dock once the chat is populated. Exactly one of the two is
+  // mounted at any time — never two forms.
+  const composerForm = (
+    <form
+      className="flex flex-col gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <Label htmlFor="chat-input" className="sr-only">
+        Message
+      </Label>
+      <Textarea
+        id="chat-input"
+        name="chat-input"
+        aria-label="Message"
+        ref={inputRef}
+        value={input}
+        onChange={(event) => setInput(event.target.value)}
+        onKeyDown={(event) => {
+          // Enter submits; Shift+Enter keeps the textarea newline behavior.
+          if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+        rows={3}
+        className="min-h-20 rounded-xl md:min-h-24"
+        placeholder={
+          pendingAsk !== null
+            ? "Answer the agent's question in the form above."
+            : 'Ask anything, e.g. What is 21+21?'
+        }
+        disabled={busy || pendingAsk !== null}
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="m-0 text-[0.75rem] text-muted-foreground">
+          Enter to send · Shift+Enter for a new line
+        </p>
+        <Button type="submit" size="sm" disabled={!canSend}>
+          {busy ? <Loader2 className="animate-spin" aria-hidden="true" /> : <Send aria-hidden="true" />}
+          {busy ? 'Working…' : 'Send'}
+        </Button>
+      </div>
+      {pendingAsk !== null && (
+        <p className="m-0 text-xs text-muted-foreground">
+          Send is paused because the agent asked you a question above — answer it there.
+          The normal message channel resumes as soon as the question is answered.
+        </p>
+      )}
+    </form>
+  );
+
   return (
     <WorkspaceShell
       variant="chat"
@@ -277,10 +418,10 @@ export function Chat({
       {hydrationError !== undefined && (
         <div
           role="status"
-          className="shrink-0 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900"
+          className="shrink-0 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-950 dark:bg-amber-950/40 dark:text-amber-200"
         >
           <p className="m-0">{hydrationError}</p>
-          <p className="m-0 mt-1 text-[0.85rem] text-amber-800">
+          <p className="m-0 mt-1 text-[0.85rem] text-amber-800 dark:text-amber-200/80">
             You can still send a message; earlier history reappears once the service is reachable and you refresh.
           </p>
         </div>
@@ -362,14 +503,53 @@ export function Chat({
         </p>
       )}
 
+      {!online && (
+        <div
+          role="status"
+          className="shrink-0 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+        >
+          <p className="m-0 flex items-center gap-1.5 font-semibold">
+            <WifiOff className="size-4" aria-hidden="true" />
+            {OFFLINE_TITLE}
+          </p>
+          <p className="m-0 mt-1 text-[0.82rem] leading-snug">{OFFLINE_BODY}</p>
+          {busy && <p className="m-0 mt-1 text-[0.82rem] leading-snug">{OFFLINE_BUSY_BODY}</p>}
+        </div>
+      )}
+
       <section
         aria-label="Messages"
         aria-live="polite"
         ref={transcriptRef}
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-4"
+        className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain py-4"
       >
         {messages.length === 0 ? (
-          <ChatEmptyState agent={agent} onSuggestion={fillInput} />
+          // ChatGPT-calm empty state: centered greeting, THE composer right
+          // under it, suggestion chips below. One form instance only.
+          <div className="my-auto flex flex-col items-center gap-4 py-8 text-center">
+            <h2 className="m-0 text-[1.7rem] leading-tight font-normal tracking-tight">
+              What should we accomplish?
+            </h2>
+            <p className="sr-only">{AGENT_GUIDANCE[agent]}</p>
+            <div className="w-full max-w-[40rem]">{composerForm}</div>
+            <ul className="m-0 mt-1 flex w-full max-w-[36rem] list-none flex-col items-center gap-2 p-0 sm:flex-row sm:flex-wrap sm:justify-center">
+              {chatSuggestions(agent).map((suggestion) => (
+                <li key={suggestion} className="sm:max-w-[21rem]">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-auto justify-start rounded-xl py-2 text-left font-normal text-[0.85rem] hover:border-ring/50 hover:bg-accent"
+                    onClick={() => fillInput(suggestion)}
+                  >
+                    {suggestion}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+            <p className="m-0 text-[0.72rem] text-muted-foreground">
+              A suggestion fills the composer — review it, edit, then send when ready.
+            </p>
+          </div>
         ) : (
           <ol className="m-0 flex list-none flex-col gap-5 p-0">
             {messages.map((message, messageIndex) => (
@@ -401,6 +581,9 @@ export function Chat({
                     <AssistantPartsView
                       parts={message.parts}
                       holdsPendingAsk={pendingAsk !== null && messageIndex === messages.length - 1}
+                      holdsLiveThinking={
+                        busy && messageIndex === latestIndex && messageIndex === messages.length - 1
+                      }
                       chatId={chatId}
                     />
                   ) : (
@@ -420,25 +603,63 @@ export function Chat({
             ))}
           </ol>
         )}
+        {busy && progress !== null && (
+          <div
+            aria-hidden="true"
+            className="mt-3 flex items-center gap-2 text-[0.85rem] text-muted-foreground"
+          >
+            <Loader2 className="size-4 animate-spin" />
+            <span>{progressLabel(progress)}</span>
+            <span className="tabular-nums">{formatElapsed(elapsedSeconds)}</span>
+            <span className="ml-0.5 flex items-center gap-0.5">
+              <span className="size-1 animate-pulse rounded-full bg-muted-foreground" />
+              <span className="size-1 animate-pulse rounded-full bg-muted-foreground" style={{ animationDelay: '200ms' }} />
+              <span className="size-1 animate-pulse rounded-full bg-muted-foreground" style={{ animationDelay: '400ms' }} />
+            </span>
+          </div>
+        )}
       </section>
 
       <p
         aria-live="polite"
         className={cn(
-          'm-0 min-h-5 shrink-0 text-xs text-muted-foreground',
+          'm-0 flex min-h-5 shrink-0 items-center gap-2 text-xs text-muted-foreground',
           `chat-status-${status}`,
         )}
       >
-        {statusText}
+        {busy && <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />}
+        <span>{stageLine}</span>
+        {/* Elapsed ticks every second: hidden from assistive tech so the
+            polite status region does not re-announce the whole line. Stage
+            changes still announce as they arrive. */}
+        {busy && (
+          <span aria-hidden="true" className="shrink-0 tabular-nums">
+            {formatElapsed(elapsedSeconds)}
+          </span>
+        )}
       </p>
+
+      {busy && isLongWait(elapsedSeconds) && (
+        <p role="status" className="m-0 shrink-0 text-xs text-amber-800 dark:text-amber-200">
+          {LONG_WAIT_TEXT}
+        </p>
+      )}
 
       {error !== undefined && (
         <div
           role="alert"
-          className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+          className="flex shrink-0 items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200"
         >
-          <p className="m-0">{describeChatError(error)}</p>
-          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => clearError()}>
+          <div className="min-w-0">
+            <p className="m-0 font-semibold">Response failed</p>
+            <p className="m-0 mt-0.5">{describeChatError(error)}</p>
+            <p className="m-0 mt-0.5 text-[0.8rem] text-red-800 dark:text-red-200">
+              {online
+                ? 'Guidance: check your internet connection, then send a new message.'
+                : 'You are offline — reconnect, then send a new message.'}
+            </p>
+          </div>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 dark:hover:bg-red-950/60 dark:hover:text-red-200" onClick={() => clearError()}>
             Dismiss
           </Button>
         </div>
@@ -498,102 +719,9 @@ export function Chat({
           </form>
         )}
 
-        <form
-          className="flex flex-col gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            submit();
-          }}
-        >
-          <Label htmlFor="chat-input" className="sr-only">
-            Message
-          </Label>
-          <Textarea
-            id="chat-input"
-            name="chat-input"
-            aria-label="Message"
-            ref={inputRef}
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              // Enter submits; Shift+Enter keeps the textarea newline behavior.
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                submit();
-              }
-            }}
-            rows={3}
-            placeholder={
-              pendingAsk !== null
-                ? "Answer the agent's question in the form above."
-                : 'Ask anything, e.g. What is 21+21?'
-            }
-            disabled={busy || pendingAsk !== null}
-          />
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="m-0 text-[0.75rem] text-muted-foreground">
-              Enter to send · Shift+Enter for a new line
-            </p>
-            <Button type="submit" size="sm" disabled={!canSend}>
-              {busy ? <Loader2 className="animate-spin" aria-hidden="true" /> : <Send aria-hidden="true" />}
-              {busy ? 'Working…' : 'Send'}
-            </Button>
-          </div>
-          {pendingAsk !== null && (
-            <p className="m-0 text-xs text-muted-foreground">
-              Send is paused because the agent asked you a question above — answer it there.
-              The normal message channel resumes as soon as the question is answered.
-            </p>
-          )}
-        </form>
+        {messages.length > 0 && composerForm}
       </div>
     </WorkspaceShell>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Empty state: agent-aware welcome + composer-filling suggestions      */
-/* ------------------------------------------------------------------ */
-
-/**
- * Shown only while the transcript is empty. Suggestions are honest per-agent
- * prompts (see `chatSuggestions`) that FILL the composer — they never send:
- * creating exactly one turn stays an explicit user action through the submit
- * gate.
- */
-function ChatEmptyState({
-  agent,
-  onSuggestion,
-}: {
-  agent: WebAgentSlug;
-  onSuggestion: (text: string) => void;
-}): React.ReactElement {
-  const suggestions = chatSuggestions(agent);
-  return (
-    <div className="my-auto flex flex-col items-center gap-3 px-2 pt-10 pb-6 text-center">
-      <div className="inline-flex rounded-full border bg-card p-1.5 shadow-sm">
-        <AgentAvatar agent={agent} size={38} />
-      </div>
-      <h2 className="m-0 text-[1.4rem] font-semibold tracking-tight">What should we accomplish?</h2>
-      <p className="m-0 max-w-[44ch] text-[0.92rem] text-muted-foreground">{AGENT_GUIDANCE[agent]}</p>
-      <ul className="m-0 mt-2 flex w-full max-w-[26rem] list-none flex-col gap-2 p-0">
-        {suggestions.map((suggestion) => (
-          <li key={suggestion}>
-            <Button
-              type="button"
-              variant="outline"
-              className="h-auto w-full justify-start py-2.5 text-left font-normal text-[0.88rem] hover:border-ring/60 hover:bg-accent"
-              onClick={() => onSuggestion(suggestion)}
-            >
-              {suggestion}
-            </Button>
-          </li>
-        ))}
-      </ul>
-      <p className="m-0 mt-1 text-[0.78rem] text-muted-foreground">
-        A suggestion fills the composer — review it, edit, then send when ready.
-      </p>
-    </div>
   );
 }
 
@@ -613,10 +741,19 @@ function AssistantPartsView({
   parts,
   holdsPendingAsk,
   chatId,
+  holdsLiveThinking = false,
 }: {
   parts: WorkforceUIMessage['parts'];
   holdsPendingAsk: boolean;
   chatId: string;
+  /**
+   * True only for the CURRENT generation's latest assistant turn while the
+   * UI is busy: opens a visible live Thinking panel instead of the collapsed
+   * details. The same reasoning text renders exactly once — never duplicated
+   * — and once the turn completes (or for historical turns) it stays
+   * collapsed, exactly like before.
+   */
+  holdsLiveThinking?: boolean;
 }): React.ReactElement {
   const view = partitionMessageParts(parts, holdsPendingAsk);
   const summary = activitySummaryLabel(view.activity);
@@ -626,12 +763,24 @@ function AssistantPartsView({
       {view.pendingAsk !== null && view.pendingAsk.type === 'tool-ask_user' && (
         <AskUserPartView part={view.pendingAsk} />
       )}
-      {view.reasoning !== null && (
-        <details className="chat-region">
-          <summary>Thinking</summary>
-          <MarkdownText text={view.reasoning} className="chat-md-thinking" />
-        </details>
-      )}
+      {view.reasoning !== null &&
+        (holdsLiveThinking ? (
+          <div className="mt-1 rounded-md border border-user-bubble-border bg-accent px-2.5 py-2" aria-live="polite">
+            <p
+              className="m-0 mb-1 flex items-center gap-1.5 text-[0.7rem] font-semibold tracking-[0.06em] text-primary uppercase"
+              aria-hidden="true"
+            >
+              <Sparkles className="size-3 animate-pulse" aria-hidden="true" />
+              Thinking
+            </p>
+            <MarkdownText text={view.reasoning} className="chat-md-thinking" />
+          </div>
+        ) : (
+          <details className="chat-region">
+            <summary>Thinking</summary>
+            <MarkdownText text={view.reasoning} className="chat-md-thinking" />
+          </details>
+        ))}
       {view.activity.length > 0 && (
         <details className="chat-region">
           <summary>

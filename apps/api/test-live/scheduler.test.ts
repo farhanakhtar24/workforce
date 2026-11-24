@@ -318,6 +318,8 @@ async function createSchedulerStack(options: StackOptions): Promise<Stack> {
       for (const chatId of chatIds) {
         await base.del(`${REDIS_KEY_PREFIX}:chat:general:${chatId}:messages`);
         await base.del(`${REDIS_KEY_PREFIX}:chat:general:${chatId}:active-stream`);
+        // The activity-index member this run's appends created.
+        await base.zRem(`${REDIS_KEY_PREFIX}:chat-index`, `general:${chatId}`);
         let idemCursor = '0';
         do {
           const scan = await base.scan(idemCursor, { MATCH: `${REDIS_KEY_PREFIX}:idempotency:general:${chatId}:*`, COUNT: 50 });

@@ -11,8 +11,8 @@ import { agentLabel } from '@/lib/workspace';
 const AGENT_TONES: Readonly<Record<WebAgentSlug, string>> = {
   general: 'bg-secondary text-secondary-foreground',
   orchestrator: 'bg-primary text-primary-foreground',
-  analyst: 'bg-emerald-100 text-emerald-900',
-  researcher: 'bg-amber-100 text-amber-900',
+  analyst: 'bg-emerald-100 text-emerald-900 dark:bg-emerald-900/60 dark:text-emerald-100',
+  researcher: 'bg-amber-100 text-amber-900 dark:bg-amber-900/60 dark:text-amber-100',
 };
 
 export function AgentAvatar({

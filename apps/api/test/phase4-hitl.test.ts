@@ -25,6 +25,7 @@ import {
 } from './helpers.js';
 import {
   ANSWER_PENDING_ASK_USER_LUA,
+  APPEND_MESSAGE_WITH_INDEX_LUA,
   REDIS_KEY_PREFIX,
   createRedisChatStore,
   type RedisLike,
@@ -207,6 +208,8 @@ class HitlTinyRedis implements RedisLike {
   readonly lsets: Array<{ key: string; index: number; value: string }> = [];
   /** Optional concurrent-writer hook fired BEFORE each CAS eval. */
   beforeEachEval: ((key: string) => void) | null = null;
+  /** Sorted sets (activity index), only ever exercised via the append script. */
+  readonly zsets = new Map<string, Map<string, number>>();
 
   async get(key: string): Promise<string | null> {
     return this.data.get(key) ?? null;
@@ -242,8 +245,43 @@ class HitlTinyRedis implements RedisLike {
     list[index] = value;
     this.lsets.push({ key, index, value });
   }
+  async lLen(key: string): Promise<number> {
+    return (this.lists.get(key) ?? []).length;
+  }
+  async zAdd(key: string, members: Array<{ value: string; score: number }>): Promise<number> {
+    const zset = this.zsets.get(key) ?? new Map<string, number>();
+    this.zsets.set(key, zset);
+    for (const member of members) {
+      zset.set(member.value, member.score);
+    }
+    return members.length;
+  }
+  async zRangeWithScores(key: string): Promise<Array<{ value: string; score: number }>> {
+    const zset = this.zsets.get(key);
+    if (zset === undefined) {
+      return [];
+    }
+    return [...zset.entries()].map(([value, score]) => ({ value, score }));
+  }
+  async scan(): Promise<{ cursor: string; keys: string[] }> {
+    return { cursor: '0', keys: [] };
+  }
+  async zScore(): Promise<number | null> {
+    return null;
+  }
   async eval(script: string, options?: { keys?: string[]; arguments?: string[] }): Promise<unknown> {
     this.lastEval = script;
+    // The activity-index append script: emulate TYPE → RPUSH → ZADD exactly.
+    if (script === APPEND_MESSAGE_WITH_INDEX_LUA) {
+      if (this.data.has(options?.keys?.[1] ?? '')) {
+        return -1;
+      }
+      const listKey = options?.keys?.[0] ?? '';
+      const [entry, score, member] = options?.arguments ?? [];
+      await this.rPush(listKey, entry ?? '');
+      this.zsets.set(options?.keys?.[1] ?? '', new Map([[member ?? '', Number(score ?? '0')]]));
+      return 1;
+    }
     if (script !== ANSWER_PENDING_ASK_USER_LUA) {
       throw new Error('unexpected script');
     }

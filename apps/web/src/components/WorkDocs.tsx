@@ -229,8 +229,8 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
                 aria-live="polite"
                 className={
                   createNotice.kind === 'ok'
-                    ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900'
-                    : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800'
+                    ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200'
+                    : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200'
                 }
               >
                 {createNotice.text}
@@ -322,7 +322,7 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
         {error !== null && (
           <div
             role="alert"
-            className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+            className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200"
           >
             <p className="m-0">{error}</p>
           </div>

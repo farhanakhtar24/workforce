@@ -154,8 +154,8 @@ function NoticeText({ notice, live = false }: { notice: Notice | null; live?: bo
       className={cn(
         'm-0 rounded-md px-2.5 py-1.5 text-[0.85rem]',
         notice.kind === 'ok'
-          ? 'border border-emerald-200 bg-emerald-50 text-emerald-900'
-          : 'border border-red-200 bg-red-50 text-red-800',
+          ? 'border border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200'
+          : 'border border-red-200 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200',
       )}
     >
       {notice.text}
@@ -169,7 +169,7 @@ function StatusLine({ text }: { text: string }): React.ReactElement {
 
 function ErrorBanner({ text, children }: { text: string; children?: React.ReactNode }): React.ReactElement {
   return (
-    <div role="alert" className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900">
+    <div role="alert" className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
       <p className="m-0">{text}</p>
       {children}
     </div>

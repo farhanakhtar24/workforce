@@ -11,6 +11,7 @@ import type { StreamContext } from './stream-context/types.js';
 import type { BackgroundTaskTracker } from './background.js';
 import type { CreateChatTurnStreamOptions } from './generation.js';
 import { createChatRoutes } from './http/routes.js';
+import { createChatListRoute } from './http/chat-list.js';
 import { createMemoryRoutes, type MemoryRouteDeps } from './memory/routes.js';
 import { sendJsonError } from './http/adapter.js';
 import { safeErrorStatus } from './errors.js';
@@ -140,6 +141,11 @@ export function buildApp(dependencies: AppDependencies): Express {
   app.post('/api/agents/:slug/chat', postChat);
   app.get('/api/agents/:slug/chat/:clientChatId', hydration);
   app.get('/api/agents/:slug/chat/:clientChatId/stream', resumeStream);
+
+  // Recent-chat sidebar history (Phase 6 UX) — mounted with the store every
+  // composition provides; legacy chats flow through the store's own
+  // bounded discovery. Safe 400/503 handling lives in the route module.
+  app.get('/api/chats', createChatListRoute({ store: dependencies.store, logger }).listChats);
 
   // Phase 3 memory routes, only when memory deps are injected.
   if (dependencies.memory !== undefined) {

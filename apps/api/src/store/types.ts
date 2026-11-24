@@ -88,6 +88,20 @@ export interface ChatStore {
    * Throws `StoreUnavailableError` when the backing storage fails.
    */
   answerPendingAskUser(chat: ChatRef, assistantMessageId: string, toolCallId: string, answer: string): Promise<AskUserAnswerStatus>;
+
+  /**
+   * Recent-chat listing for the sidebar history API (`GET /api/chats`):
+   * identity + bounded title/preview + count + activity timestamp per chat,
+   * newest activity first for chats tracked by the activity index, and chats
+   * created BEFORE the index existed (legacy) deterministically after them
+   * with `lastActivityAt: null` (never fabricated). Legacy discovery is
+   * bounded (Redis: bounded SCAN + bounded per-chat reads). Corrupt/garbage
+   * stored entries are skipped leniently here — the strict
+   * `StoreUnavailableError`-on-corruption contract stays on `loadMessages`
+   * (generation correctness), not on this read-only summary path.
+   * Throws `StoreUnavailableError` when the backing storage fails.
+   */
+  listRecentChats(limit: number): Promise<ChatSummary[]>;
 }
 
 export type AskUserAnswerStatus = 'applied' | 'unchanged' | 'stale';
@@ -97,3 +111,23 @@ export const ASK_USER_NO_ANSWER = '(no answer given)';
 
 /** Idempotency key time-to-live in seconds (ADR-005). */
 export const IDEMPOTENCY_KEY_TTL_SECONDS = 900;
+
+/**
+ * One recent-chat entry for the sidebar history API (`GET /api/chats`).
+ *
+ * Deliberately minimal: identity (`agent` slug + `chatId`), the bounded
+ * first-user-text `title`, the bounded latest visible user/assistant text
+ * `preview`, the number of stored list entries, and the last activity time.
+ * `lastActivityAt` is an ISO-8601 string for chats present in the activity
+ * index and `null` for legacy chats that predate it — it is never fabricated.
+ * No other message content (no tool payloads, no full bodies) is ever
+ * attached to a summary.
+ */
+export interface ChatSummary {
+  readonly chatId: string;
+  readonly agent: string;
+  readonly title: string;
+  readonly preview: string;
+  readonly messageCount: number;
+  readonly lastActivityAt: string | null;
+}

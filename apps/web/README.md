@@ -70,6 +70,57 @@ Notes:
   item is brought into view on mount/route change with a direct nav-list
   `scrollLeft` assignment (never `scrollIntoView`); the desktop sidebar is
   unaffected.
+- Real recent chats (`src/components/RecentChats.tsx` + `src/lib/recent-chats.ts`)
+  come from the API `GET /api/chats` (no localStorage, no fabricated data):
+  scrollable region below the primary nav on desktop, compact collapsed
+  disclosure inside the top bar on mobile; per-row agent avatar + bounded
+  title/preview, message count, and an honest timestamp (`null` renders
+  "saved chat, no timestamp" for legacy rows). Refresh triggers: route change
+  (hard) and the chat dispatching `workforce:chats-changed` once per settled
+  generation — that background refresh is SOFT: prior rows stay on screen (no
+  skeleton flash) and a soft failure never downgrades a ready list to the
+  error panel. Malformed listings map to fixed safe errors with Retry.
+- Live progress derives the honest stage from `useChat` status plus the
+  CURRENT latest assistant's raw parts (`src/lib/chat-progress.ts`:
+  `Sending your message` → `Waiting for the model` → `Thinking` (only when a
+  live reasoning part arrived) → `Using <tool>` (only while a tool part still
+  awaits its result) → `Writing response` — junk/finished parts never fake a
+  stage). The dock shows a spinner plus elapsed seconds (`aria-hidden`, so the
+  polite status region is not re-announced every second; stage changes still
+  announce); after ~12 s an honest "Taking longer than usual…" line appears —
+  no fake percentage, no stop button. Streamed reasoning renders as a visibly
+  LIVE Thinking panel only for the current generation's latest assistant turn
+  (a fresh submit never reopens previous turns' reasoning) and returns to the
+  collapsed `Thinking` details once complete, without duplicates.
+- Offline awareness uses `navigator.onLine` + online/offline events: an amber
+  warning explains that the draft and history remain, the provider request can
+  fail, and nothing resumes automatically (reconnect before retrying); while
+  busy offline it adds that the pending request has no confirmed progress.
+  Restoring the connection clears it. Errors render as "Response failed" with
+  the same safe fixed text plus connection guidance — never raw internals.
+
+- Light / dark theme via `next-themes` (class attribute, system default,
+  localStorage persistence, pre-paint script + `suppressHydrationWarning` =
+  no flash and no hydration mismatch). `ThemeToggle` in the sidebar bottom
+  utility area shows the ACTION (Moon + "Dark theme" in light, Sun + "Light
+  theme" in dark) with CSS-class-driven markup, so it is hydration-safe
+  without a mounted gate; mobile keeps a compact icon-only toggle. The
+  `.dark` token set is soft neutral graphite (main `oklch(0.28)`, sidebar
+  `oklch(0.245)`) — deliberately lighter than pure black, no green canvas; the
+  sidebar is a subtle gray in BOTH themes and green remains only a small
+  brand accent. All status colors (amber/red/emerald banners, notices,
+  badges, delegation borders, agent avatar tints) carry matching `dark:`
+  variants; custom CSS uses tokens only, verified across pages.
+- Chat surfaces match the reference: a quiet compact agent/mode header row,
+  and on an empty transcript a ChatGPT-calm centered block — greeting
+  "What should we accomplish?", THE single composer instance (same
+  ids/refs/handlers; rendered there on empty and in the pinned dock once
+  populated — exactly one is mounted at any time) and a few rounded
+  suggestion chips below. Populated chats keep the centered ~48rem
+  transcript, user bubbles, assistant answers, pinned composer and
+  transcript-only scrolling. Recent chats render as compact single-line rows
+  (agent avatar + title + real count; full metadata stays in the row
+  `title`/`aria-label` so accessibility keeps the real timestamp/preview).
 
 ## Scripts
 
@@ -243,7 +294,7 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 
 ## Tests (offline, pure — node:test)
 
-`npm test` runs 148 tests across:
+`npm test` runs 172 tests across:
 
 - `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
   hydration mapping, safe errors) — unchanged and green.
@@ -289,6 +340,26 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   fallback, and every agent gets 3–4 non-empty unique empty-state suggestions that
   stay honest to each agent toolset (general calculation-only, researcher without
   SQL, orchestrator naming its real memory/query/document/delegation verbs).
+- `test/recent-chats.test.ts` — recent-chats history contract: endpoint URL
+  (default 20, max-50 clamp, invalid limits fall back), structural mapping of
+  valid rows (bounded trimmed title/preview, integer counts, ISO timestamps)
+  with empty-title → "Untitled chat" and empty-preview kept as hidden, legacy
+  or invalid timestamps staying `null` (never fabricated), every malformed
+  shape (bad chatId/agent/title/preview/count, wrong `chats` container, non-
+  object rows) mapping to the fixed safe error, canonical agent-scoped hrefs,
+  current-row detection ignoring `?mode=`, bounded UTC stamp/meta formatting
+  (honest "saved chat, no timestamp"), surrogate-pair-safe truncation
+  (boundary-in-pair retreats; intact pairs kept), and the namespaced
+  `workforce:chats-changed` event value.
+- `test/chat-progress.test.ts` — progress stage machine: submitted → "Sending
+  your message"; streaming with empty/junk parts → "Waiting for the model";
+  thinking only for live reasoning (whitespace-only ignored); `Using <tool>`
+  only while `input-streaming`/`input-available` (finished tool parts are
+  history); visible text → "Writing response"; precedence tool > text >
+  reasoning; first pending tool wins; long-wait threshold (≥12 s honest copy,
+  never promising auto-resume); floored/clamped elapsed formatting; offline
+  copy keeping draft/history, requesting reconnect, and stating no confirmed
+  progress while busy.
 
 ## Validation limitations (honest — the phase gate is Farhan's live run)
 

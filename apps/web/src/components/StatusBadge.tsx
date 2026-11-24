@@ -9,16 +9,16 @@ import { cn } from '@/lib/utils';
  */
 
 const STATUS_TONES: Readonly<Record<string, string>> = {
-  pending: 'border-amber-300 bg-amber-50 text-amber-800',
-  retrying: 'border-amber-300 bg-amber-50 text-amber-800',
-  running: 'border-emerald-300 bg-emerald-50 text-emerald-800',
-  completed: 'border-emerald-300 bg-emerald-50 text-emerald-800',
-  ready: 'border-emerald-300 bg-emerald-50 text-emerald-800',
-  active: 'border-emerald-300 bg-emerald-50 text-emerald-800',
-  review: 'border-amber-300 bg-amber-50 text-amber-800',
-  failed: 'border-red-300 bg-red-50 text-red-800',
-  timeout: 'border-red-300 bg-red-50 text-red-800',
-  dead_letter: 'border-red-300 bg-red-50 text-red-800',
+  pending: 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200',
+  retrying: 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200',
+  running: 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200',
+  completed: 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200',
+  ready: 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200',
+  active: 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200',
+  review: 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200',
+  failed: 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200',
+  timeout: 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200',
+  dead_letter: 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200',
 };
 
 export function StatusBadge({
