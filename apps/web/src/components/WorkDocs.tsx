@@ -1,6 +1,15 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { StatusBadge } from '@/components/StatusBadge';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { NativeSelect } from '@/components/ui/native-select';
+import { Textarea } from '@/components/ui/textarea';
 import {
   buildWorkDocCreateBody,
   createWorkDoc,
@@ -30,14 +39,15 @@ interface Notice {
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 /**
- * `/work` — Work Docs library (Phase 4). Filter/list through the real GET
- * route; create through the real orchestrator POST route (draft v1) when a
- * chat context is set. Pure request/mapping/format helpers live in
- * `src/lib/workdocs.ts` (tested); this component only wires state, events and
- * rendering. Text-only rendering — React escapes everything, so there is no
- * `dangerouslySetInnerHTML` anywhere. Each entry links to its detail page
- * together with the owning chat id: the detail route answers a fixed 404
- * without that chat, so no cross-chat existence leaks either way.
+ * `/work` — Work Docs library (Phase 4) on the shared Tailwind + shadcn
+ * shell. Filter/list through the real GET route; create through the real
+ * orchestrator POST route (draft v1) when a chat context is set. Pure
+ * request/mapping/format helpers live in `src/lib/workdocs.ts` (tested); this
+ * component only wires state, events and rendering. Text-only rendering —
+ * React escapes everything, so there is no `dangerouslySetInnerHTML`
+ * anywhere. Each entry links to its detail page together with the owning
+ * chat id: the detail route answers a fixed 404 without that chat, so no
+ * cross-chat existence leaks either way.
  */
 export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialScope }: WorkDocsListProps): React.ReactElement {
   const [filters, setFilters] = useState({
@@ -131,44 +141,42 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
     void refreshRef.current();
   };
 
-  return (
-    <main className="chat-layout">
-      <header className="chat-header">
-        <h1>Work documents</h1>
-        <nav className="chat-nav" aria-label="Workforce pages">
-          {CHAT_ID_PATTERN.test(filters.chatId) && (
-            <a className="chat-new" href={backToChatUrl(filters.chatId, initialAgent)}>
-              Back to chat
-            </a>
-          )}
-          <a className="chat-new" href="/memory">
-            Memory
-          </a>
-          <a className="chat-new" href="/schedules">
-            Schedules
-          </a>
-          <a className="chat-new" href="/">
-            New chat
-          </a>
-        </nav>
-      </header>
+  const chatContext = CHAT_ID_PATTERN.test(filters.chatId);
 
-      <section className="memory-section" aria-labelledby="work-create-heading">
-        <h2 id="work-create-heading">Create a document</h2>
-        {CHAT_ID_PATTERN.test(filters.chatId) ? (
+  return (
+    <WorkspaceShell
+      active="work"
+      eyebrow="Workspace output"
+      title="Work documents"
+      description="Versioned documents agents write and you edit — every save is a new immutable version, and history is never rewritten."
+      context={
+        chatContext ? (
+          <a
+            className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+            href={backToChatUrl(filters.chatId, initialAgent)}
+          >
+            Back to chat
+          </a>
+        ) : undefined
+      }
+    >
+      <Card aria-labelledby="work-create-heading" className="gap-4 px-4 py-4 sm:px-5 sm:py-5">
+        <h2 id="work-create-heading" className="m-0 text-base font-semibold tracking-tight">
+          Create a document
+        </h2>
+        {chatContext ? (
           <form
-            className="memory-form"
+            className="flex flex-col gap-3"
             onSubmit={(event) => {
               event.preventDefault();
               void submitCreate();
             }}
           >
-            <div className="memory-fieldrow">
-              <div className="memory-field">
-                <label htmlFor="work-create-type">Type</label>
-                <select
+            <div className="flex flex-wrap gap-3">
+              <div className="flex min-w-0 flex-col gap-1 text-sm">
+                <Label htmlFor="work-create-type">Type</Label>
+                <NativeSelect
                   id="work-create-type"
-                  className="memory-input"
                   aria-label="New document type"
                   value={createType}
                   onChange={(event) => setCreateType(event.target.value)}
@@ -178,13 +186,12 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
                       {option}
                     </option>
                   ))}
-                </select>
+                </NativeSelect>
               </div>
-              <div className="memory-field memory-field-grow">
-                <label htmlFor="work-create-title">Title</label>
-                <input
+              <div className="flex flex-[2_1_14rem] min-w-56 flex-col gap-1 text-sm">
+                <Label htmlFor="work-create-title">Title</Label>
+                <Input
                   id="work-create-title"
-                  className="memory-input"
                   aria-label="New document title"
                   value={createTitle}
                   onChange={(event) => setCreateTitle(event.target.value)}
@@ -194,11 +201,10 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
                 />
               </div>
             </div>
-            <div className="memory-field">
-              <label htmlFor="work-create-content">Content</label>
-              <textarea
+            <div className="flex min-w-0 basis-full flex-col gap-1 text-sm">
+              <Label htmlFor="work-create-content">Content</Label>
+              <Textarea
                 id="work-create-content"
-                className="memory-input"
                 aria-label="New document content"
                 value={createContent}
                 onChange={(event) => setCreateContent(event.target.value)}
@@ -208,11 +214,11 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
                 placeholder="First version — saved as draft v1"
               />
             </div>
-            <div className="memory-actions">
-              <button type="submit" className="memory-button-primary" disabled={creating}>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="submit" disabled={creating}>
                 {creating ? 'Creating…' : 'Create draft'}
-              </button>
-              <span className="memory-hint">
+              </Button>
+              <span className="text-xs text-muted-foreground">
                 Created for chat {filters.chatId} as a draft (v1). Editing later happens on the
                 document's page.
               </span>
@@ -221,46 +227,50 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
               <p
                 role={createNotice.kind === 'error' ? 'alert' : 'status'}
                 aria-live="polite"
-                className={`memory-notice memory-notice-${createNotice.kind === 'ok' ? 'ok' : 'error'}`}
+                className={
+                  createNotice.kind === 'ok'
+                    ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900'
+                    : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800'
+                }
               >
                 {createNotice.text}
               </p>
             )}
           </form>
         ) : (
-          <p className="memory-muted">
-            Set a Chat ID filter (or open <code>/work</code> from a chat's Work link) to create a
+          <p className="m-0 text-sm text-muted-foreground">
+            Set a Chat ID filter (or open <code className="rounded bg-muted px-1 py-0.5 text-[0.85em]">/work</code> from a chat's Work link) to create a
             document: every document is owned by exactly one chat.
           </p>
         )}
-      </section>
+      </Card>
 
-      <section className="memory-section" aria-labelledby="work-list-heading">
-        <h2 id="work-list-heading">Find documents</h2>
+      <Card aria-labelledby="work-list-heading" className="gap-4 px-4 py-4 sm:px-5 sm:py-5">
+        <h2 id="work-list-heading" className="m-0 text-base font-semibold tracking-tight">
+          Find documents
+        </h2>
         <form
-          className="memory-form"
+          className="flex flex-col gap-3"
           onSubmit={(event) => {
             event.preventDefault();
             void refresh();
           }}
         >
-          <div className="memory-fieldrow">
-            <div className="memory-field">
-              <label htmlFor="work-list-scope">Scope</label>
-              <input
+          <div className="flex flex-wrap gap-3">
+            <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+              <Label htmlFor="work-list-scope">Scope</Label>
+              <Input
                 id="work-list-scope"
-                className="memory-input"
                 aria-label="List scope"
                 value={filters.scope}
                 onChange={(event) => setFilters((current) => ({ ...current, scope: event.target.value }))}
                 maxLength={64}
               />
             </div>
-            <div className="memory-field memory-field-grow">
-              <label htmlFor="work-list-chatid">Chat ID (ownership filter)</label>
-              <input
+            <div className="flex min-w-0 flex-[2_1_14rem] min-w-56 flex-col gap-1 text-sm">
+              <Label htmlFor="work-list-chatid">Chat ID (ownership filter)</Label>
+              <Input
                 id="work-list-chatid"
-                className="memory-input"
                 aria-label="Filter by chat ID"
                 value={filters.chatId}
                 onChange={(event) => setFilters((current) => ({ ...current, chatId: event.target.value }))}
@@ -268,12 +278,11 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
               />
             </div>
           </div>
-          <div className="memory-fieldrow">
-            <div className="memory-field">
-              <label htmlFor="work-list-type">Type</label>
-              <select
+          <div className="flex flex-wrap gap-3">
+            <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+              <Label htmlFor="work-list-type">Type</Label>
+              <NativeSelect
                 id="work-list-type"
-                className="memory-input"
                 aria-label="Filter by type"
                 value={filters.type}
                 onChange={(event) => setFilters((current) => ({ ...current, type: event.target.value }))}
@@ -284,13 +293,12 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
                     {option}
                   </option>
                 ))}
-              </select>
+              </NativeSelect>
             </div>
-            <div className="memory-field">
-              <label htmlFor="work-list-status">Status</label>
-              <select
+            <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+              <Label htmlFor="work-list-status">Status</Label>
+              <NativeSelect
                 id="work-list-status"
-                className="memory-input"
                 aria-label="Filter by status"
                 value={filters.status}
                 onChange={(event) => setFilters((current) => ({ ...current, status: event.target.value }))}
@@ -301,66 +309,74 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
                     {option}
                   </option>
                 ))}
-              </select>
+              </NativeSelect>
             </div>
           </div>
-          <div className="memory-actions">
-            <button type="submit" className="memory-button-primary" disabled={loading}>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="submit" disabled={loading}>
               {loading ? 'Refreshing…' : 'Refresh'}
-            </button>
+            </Button>
           </div>
         </form>
 
         {error !== null && (
-          <div role="alert" className="chat-banner chat-banner-error">
-            <p>{error}</p>
+          <div
+            role="alert"
+            className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+          >
+            <p className="m-0">{error}</p>
           </div>
         )}
-        <p aria-live="polite" className="memory-status">
+        <p aria-live="polite" className="m-0 min-h-5 text-sm text-muted-foreground">
           {notice?.kind === 'ok' ? notice.text : loading ? 'Loading…' : ''}
         </p>
 
-        <ul className="memory-cards">
+        <ul className="m-0 flex list-none flex-col gap-3 p-0">
           {documents.map((doc) => (
-            <WorkDocCard key={doc.id} doc={doc} />
+            <li key={doc.id} className="list-none">
+              <WorkDocCard doc={doc} />
+            </li>
           ))}
         </ul>
         {documents.length === 0 && (
-          <p className="memory-muted">
+          <p className="m-0 text-sm text-muted-foreground">
             {loading ? 'Loading documents…' : loadedOnce ? 'No documents match these filters.' : ''}
           </p>
         )}
-      </section>
-    </main>
+      </Card>
+    </WorkspaceShell>
   );
 }
 
 function WorkDocCard({ doc }: { doc: WorkDoc }): React.ReactElement {
   return (
-    <li className="memory-card">
-      <div className="memory-card-head">
-        <span className="memory-badge" data-kind={doc.type}>
+    <Card className="gap-2.5 bg-muted/50 px-3.5 py-3">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <Badge variant="secondary" data-kind={doc.type}>
           {doc.type}
-        </span>
-        <span className="memory-badge" data-status={doc.status}>
+        </Badge>
+        <StatusBadge status={doc.status}>
           {doc.status}
-        </span>
-        <span className="memory-badge">v{doc.version}</span>
+        </StatusBadge>
+        <Badge variant="outline">v{doc.version}</Badge>
       </div>
-      <p className="memory-card-title">{doc.title}</p>
-      <p className="memory-meta">
+      <p className="m-0 font-semibold break-words">{doc.title}</p>
+      <p className="m-0 text-xs break-all text-muted-foreground">
         chat {doc.chatId} · updated {formatWorkDocTime(doc.updatedAt)} · created{' '}
         {formatWorkDocTime(doc.createdAt)}
       </p>
-      <div className="memory-actions">
+      <div className="flex flex-wrap gap-2">
         {CHAT_ID_PATTERN.test(doc.chatId) ? (
-          <a className="work-link" href={workDocPagePath(doc.id, doc.chatId)}>
+          <a
+            className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+            href={workDocPagePath(doc.id, doc.chatId)}
+          >
             Open document
           </a>
         ) : (
-          <span className="memory-muted">Open this document from its own chat.</span>
+          <span className="text-sm text-muted-foreground">Open this document from its own chat.</span>
         )}
       </div>
-    </li>
+    </Card>
   );
 }

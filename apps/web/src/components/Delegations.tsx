@@ -1,6 +1,13 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { StatusBadge } from '@/components/StatusBadge';
+import { MarkdownText } from '@/components/MarkdownText';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { cn } from '@/lib/utils';
 import {
   childChatUrlFor,
   fetchDelegations,
@@ -30,42 +37,30 @@ interface Notice {
 }
 
 /**
- * `/delegations?chatId=…` — the parent chat's delegation list (Phase 4).
- * Rows come from the real `GET /api/agents/orchestrator/delegations`
- * route; polling follows the /memory pattern: only while a row is
- * pending/running, tab visible, never overlapping requests, and it stops on
- * errors. There is deliberately NO manual retry: a completed child must
- * never be regenerated, and `run` is an internal signed route the browser
- * does not have access to.
+ * `/delegations?chatId=…` — the parent chat's delegation list (Phase 4) on
+ * the shared Tailwind + shadcn shell. Rows come from the real
+ * `GET /api/agents/orchestrator/delegations` route; polling follows the
+ * /memory pattern: only while a row is pending/running, tab visible, never
+ * overlapping requests, and it stops on errors. There is deliberately NO
+ * manual retry: a completed child must never be regenerated, and `run` is an
+ * internal signed route the browser does not have access to.
  */
 export function DelegationsView({ apiBaseUrl, chatId, agent }: DelegationsProps): React.ReactElement {
   if (!CHAT_ID_PATTERN.test(chatId)) {
     return (
-      <main className="chat-layout">
-        <header className="chat-header">
-          <h1>Delegations</h1>
-          <nav className="chat-nav" aria-label="Workforce pages">
-            <a className="chat-new" href="/">
-              New chat
-            </a>
-            <a className="chat-new" href="/memory">
-              Memory
-            </a>
-            <a className="chat-new" href="/schedules">
-              Schedules
-            </a>
-            <a className="chat-new" href="/work">
-              Work
-            </a>
-          </nav>
-        </header>
-        <div role="alert" className="chat-banner chat-banner-warning">
-          <p>
+      <WorkspaceShell
+        active="delegations"
+        eyebrow="Delegation"
+        title="Delegations"
+        description="Runs this chat delegated to worker agents, with their child chats."
+      >
+        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900">
+          <p className="m-0">
             Delegations are listed per chat — open this page from a chat's <code>Delegations</code>{' '}
             link (<code>/delegations?chatId=…</code>).
           </p>
         </div>
-      </main>
+      </WorkspaceShell>
     );
   }
   return <DelegationsLoaded apiBaseUrl={apiBaseUrl} chatId={chatId} agent={agent} />;
@@ -135,94 +130,116 @@ function DelegationsLoaded({
   }, [pollActive]);
 
   return (
-    <main className="chat-layout">
-      <header className="chat-header">
-        <h1>Delegations</h1>
-        <nav className="chat-nav" aria-label="Workforce pages">
-          <a className="chat-new" href={backToChatUrl(chatId, agent)}>
-            Back to chat
-          </a>
-          <a className="chat-new" href="/memory">
-            Memory
-          </a>
-          <a className="chat-new" href="/schedules">
-            Schedules
-          </a>
-          <a className="chat-new" href="/work">
-            Work
-          </a>
-        </nav>
-      </header>
-
+    <WorkspaceShell
+      active="delegations"
+      eyebrow="Delegation"
+      title="Delegations"
+      description={`Runs delegated to worker agents from this chat (${chatId}), with their isolated child chats.`}
+      context={
+        <a
+          className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+          href={backToChatUrl(chatId, agent)}
+        >
+          Back to chat
+        </a>
+      }
+    >
       {error !== null && (
-        <div role="alert" className="chat-banner chat-banner-error">
-          <p>{error}</p>
-          <button type="button" onClick={() => void refresh()}>
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+        >
+          <p className="m-0">{error}</p>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => void refresh()}>
             Refresh
-          </button>
+          </Button>
         </div>
       )}
-      <p aria-live="polite" className="memory-status">
+      <p aria-live="polite" className="m-0 min-h-5 text-sm text-muted-foreground">
         {notice?.kind === 'ok' ? notice.text : loading ? 'Loading…' : ''}
       </p>
 
-      <ul className="memory-cards">
+      <ul className="m-0 flex list-none flex-col gap-3 p-0">
         {rows.map((row) => (
-          <DelegationCard key={row.id} row={row} />
+          <li key={row.id} className="list-none">
+            <DelegationCard row={row} />
+          </li>
         ))}
       </ul>
       {rows.length === 0 && (
-        <p className="memory-muted">
+        <p className="m-0 text-sm text-muted-foreground">
           {loading ? 'Loading delegations…' : loadedOnce ? 'No delegations have been created from this chat yet.' : ''}
         </p>
       )}
       {pollActive && (
-        <p aria-live="polite" className="memory-muted">
+        <p aria-live="polite" className="m-0 text-sm text-muted-foreground">
           Waiting for pending delegations — this list refreshes itself until each child finishes.
         </p>
       )}
-    </main>
+    </WorkspaceShell>
   );
 }
 
 function DelegationCard({ row }: { row: Delegation }): React.ReactElement {
   const childUrl = childChatUrlFor(row.childChatId, row.targetAgent);
   return (
-    <li className={`memory-card delegation-card`} data-status={row.status}>
-      <div className="memory-card-head">
-        <span className="memory-badge" data-kind={row.targetAgent}>
+    <Card
+      className={cn(
+        'gap-2.5 px-3.5 py-3',
+        row.status === 'pending' && 'border-amber-300',
+        row.status === 'running' && 'border-primary',
+        (row.status === 'failed' || row.status === 'timeout') && 'border-red-300',
+      )}
+      data-status={row.status}
+    >
+      <div className="flex flex-wrap items-baseline gap-2">
+        <Badge variant="secondary" data-kind={row.targetAgent}>
           → {row.targetAgent}
-        </span>
-        <span className="memory-badge">{row.mode}</span>
-        <span className="memory-badge">depth {row.depth}</span>
-        <span className="memory-badge" data-status={row.status}>
+        </Badge>
+        <Badge variant="outline">{row.mode}</Badge>
+        <Badge variant="outline">depth {row.depth}</Badge>
+        <StatusBadge status={row.status}>
           {delegationStatusLabel(row.status)}
-        </span>
+        </StatusBadge>
       </div>
-      <p className="memory-card-content">{truncateDelegationText(row.task, DELEGATION_TEXT_LIMIT)}</p>
+      <p className="m-0 text-sm break-words whitespace-pre-wrap">{truncateDelegationText(row.task, DELEGATION_TEXT_LIMIT)}</p>
       {row.result !== null && (
         <>
-          <p className="memory-card-title">Worker result</p>
-          <p className="memory-card-content">{truncateDelegationText(row.result, DELEGATION_TEXT_LIMIT)}</p>
+          <p className="m-0 font-semibold break-words">Worker result</p>
+          {/* The FULL result renders as Markdown inside a bounded scroll
+              region: truncating the Markdown source leaves literal unmatched
+              syntax (e.g. a cut `**…`), so the bound lives on height, not
+              content. Task and error lines keep their text truncation. */}
+          <div className="max-h-60 overflow-y-auto overscroll-contain">
+            <MarkdownText text={row.result} />
+          </div>
         </>
       )}
       {row.error !== null && (
-        <p className="memory-card-content memory-notice-error">{truncateDelegationText(row.error, DELEGATION_TEXT_LIMIT)}</p>
+        <p className="m-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-sm break-words whitespace-pre-wrap text-red-800">
+          {truncateDelegationText(row.error, DELEGATION_TEXT_LIMIT)}
+        </p>
       )}
-      <p className="memory-meta">
+      <p className="m-0 text-xs break-all text-muted-foreground">
         created {formatDelegationTime(row.createdAt)} · completed {formatDelegationTime(row.completedAt)} ·
-        delegation <span className="memory-mono">{row.id}</span>
+        delegation <span className="font-mono">{row.id}</span>
       </p>
-      <div className="memory-actions">
+      <div className="flex flex-wrap gap-3">
         {childUrl !== null && (
-          <a className="work-link" href={childUrl.href}>
+          <a
+            className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+            href={childUrl.href}
+          >
             Open child chat
           </a>
         )}
-        <a className="work-link" href={`/work?chatId=${encodeURIComponent(row.parentChatId)}`}>
+        <a
+          className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+          href={`/work?chatId=${encodeURIComponent(row.parentChatId)}`}
+        >
           Documents from this chat
         </a>
       </div>
-    </li>
+    </Card>
   );
 }

@@ -6,7 +6,8 @@ export const metadata: Metadata = {
     default: 'Workforce',
     template: '%s · Workforce',
   },
-  description: 'Minimal chat and memory workspace for the Workforce API.',
+  description:
+    'A local agent workspace: streaming chat with four agents plus memory, work documents, delegations and schedules.',
 };
 
 export const viewport: Viewport = {

@@ -1,6 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { StatusBadge } from '@/components/StatusBadge';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { NativeSelect } from '@/components/ui/native-select';
+import { Textarea } from '@/components/ui/textarea';
+import { cn } from '@/lib/utils';
 import {
   AGENT_TASK_NAME_MAX,
   AGENT_TASK_PROMPT_MAX,
@@ -116,16 +126,17 @@ function toggle(selection: string[], value: string): string[] {
 }
 
 /**
- * `/schedules` — the Phase 5 schedule dashboard. Tasks and execution history
- * come from the real `/api/scheduler` REST routes; create/edit/activate/pause
- * sync the task through create/PATCH/activate/pause, "Run now" uses the 202
- * MANUAL run route and dead-letter rows get the retry route. The browser
- * never calls the WORKER-ONLY run-scheduled / executions/:id/run routes.
- * Polling follows the /memory and /delegations pattern: 2 s only while a
- * visible execution is PENDING/RUNNING/RETRYING (or a just-submitted run is
- * settling), tab-visibility gated, never overlapping, sequence-guarded, and
- * it stops on the first error behind a manual Refresh. All schedule times
- * are UTC — minute precision, no seconds, no other timezone.
+ * `/schedules` — the Phase 5 schedule dashboard on the shared Tailwind +
+ * shadcn shell. Tasks and execution history come from the real
+ * `/api/scheduler` REST routes; create/edit/activate/pause sync the task
+ * through create/PATCH/activate/pause, "Run now" uses the 202 MANUAL run
+ * route and dead-letter rows get the retry route. The browser never calls
+ * the WORKER-ONLY run-scheduled / executions/:id/run routes. Polling follows
+ * the /memory and /delegations pattern: 2 s only while a visible execution
+ * is PENDING/RUNNING/RETRYING (or a just-submitted run is settling),
+ * tab-visibility gated, never overlapping, sequence-guarded, and it stops on
+ * the first error behind a manual Refresh. All schedule times are UTC —
+ * minute precision, no seconds, no other timezone.
  */
 export function Schedules({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactElement {
   return (
@@ -304,20 +315,24 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
   };
 
   const taskById = new Map(tasks.map((task) => [task.id, task]));
+  const noticeClass =
+    notice === null
+      ? ''
+      : notice.kind === 'ok'
+        ? 'border border-emerald-200 bg-emerald-50 text-emerald-900'
+        : notice.kind === 'warn'
+          ? 'border border-amber-200 bg-amber-50 text-amber-900'
+          : 'border border-red-200 bg-red-50 text-red-800';
 
   return (
-    <main className="chat-layout">
-      <header className="chat-header">
-        <h1>Schedules</h1>
-        <nav className="chat-nav" aria-label="Workforce pages">
-          <a className="chat-new" href="/">New chat</a>
-          <a className="chat-new" href="/memory">Memory</a>
-          <a className="chat-new" href="/work">Work</a>
-        </nav>
-      </header>
-
-      <p className="memory-hint" role="note">
-        All schedules run in UTC — minute precision only, no seconds and no other timezone. A task&apos;s
+    <WorkspaceShell
+      active="schedules"
+      eyebrow="Automation"
+      title="Schedules"
+      description="Scheduled agent tasks and their execution history — every time in UTC, minute precision."
+    >
+      <p className="m-0 text-xs text-muted-foreground" role="note">
+        All schedules run in UTC — minute precision only, no seconds and no other timezone. A task&apos;s{" "}
         <code>nextRunAt</code> is computed and kept by the API; activation/pause are separate actions.
       </p>
 
@@ -338,31 +353,36 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
       />
 
       {error !== null && (
-        <div role="alert" className="chat-banner chat-banner-error">
-          <p>{error}</p>
-          <button type="button" onClick={() => void refresh()}>
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+        >
+          <p className="m-0">{error}</p>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => void refresh()}>
             Refresh
-          </button>
+          </Button>
         </div>
       )}
       {notice !== null && (
-        <div role={notice.kind === 'ok' ? 'status' : 'alert'} className={`memory-notice ${notice.kind === 'ok' ? 'memory-notice-ok' : 'memory-notice-error'}`}>
-          <p>{notice.text}</p>
+        <div role={notice.kind === 'ok' ? 'status' : 'alert'} className={cn('m-0 rounded-md px-2.5 py-1.5 text-[0.85rem]', noticeClass)}>
+          <p className="m-0">{notice.text}</p>
         </div>
       )}
-      <p aria-live="polite" className="memory-status">
+      <p aria-live="polite" className="m-0 min-h-5 text-sm text-muted-foreground">
         {loading && error === null ? 'Loading…' : ''}
       </p>
 
-      <section className="memory-section" aria-labelledby="schedules-tasks-heading">
-        <h2 id="schedules-tasks-heading">Tasks ({tasks.length})</h2>
+      <Card aria-labelledby="schedules-tasks-heading" className="gap-4 px-4 py-4 sm:px-5 sm:py-5">
+        <h2 id="schedules-tasks-heading" className="m-0 text-base font-semibold tracking-tight">
+          Tasks ({tasks.length})
+        </h2>
         {tasks.length === 0 ? (
-          <p className="memory-muted">{loading ? 'Loading tasks…' : 'No scheduled tasks yet — create one above.'}</p>
+          <p className="m-0 text-sm text-muted-foreground">{loading ? 'Loading tasks…' : 'No scheduled tasks yet — create one above.'}</p>
         ) : (
           <>
-            <div className="sched-desktop-only sched-tablewrap">
+            <div className="hidden overflow-x-auto rounded-xl border bg-card md:block"> {/* desktop table */}
               <table className="sched-table">
-                <caption className="memory-hint">Scheduled tasks — every time shown in UTC.</caption>
+                <caption className="text-left text-[0.75rem] text-muted-foreground">Scheduled tasks — every time shown in UTC.</caption>
                 <thead>
                   <tr>
                     <th scope="col">Name</th>
@@ -378,22 +398,22 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
                     <tr key={task.id}>
                       <th scope="row" className="sched-cell-name">
                         {task.name}
-                        <span className="memory-meta">scope {task.scope}</span>
+                        <span className="meta-line text-xs font-normal text-muted-foreground">scope {task.scope}</span>
                       </th>
                       <td>
-                        <span className="memory-badge" data-kind={task.agentSlug}>{task.agentSlug}</span>{' '}
-                        <span className="memory-badge">{task.mode}</span>
+                        <Badge variant="secondary" data-kind={task.agentSlug}>{task.agentSlug}</Badge>{' '}
+                        <Badge variant="outline" className="ml-1">{task.mode}</Badge>
                       </td>
                       <td>
                         {formatRecurrenceSummary(task)}
                         {task.skipDates.length > 0 && (
-                          <span className="memory-meta"> skips {task.skipDates.length} date(s)</span>
+                          <span className="text-xs text-muted-foreground"> skips {task.skipDates.length} date(s)</span>
                         )}
                       </td>
                       <td>
-                        <span className="sched-badge" data-active={task.isActive ? 'true' : 'false'}>
+                        <Badge variant="outline" data-active={task.isActive ? 'true' : 'false'} className={task.isActive ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : ''}>
                           {task.isActive ? 'Active' : 'Paused'}
-                        </span>
+                        </Badge>
                       </td>
                       <td>{formatScheduleTime(task.nextRunAt, '— (none pending)')}</td>
                       <td>
@@ -415,50 +435,53 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
                 </tbody>
               </table>
             </div>
-            <ul className="memory-cards sched-mobile-only">
+            <ul className="m-0 flex list-none flex-col gap-3 p-0 md:hidden">
               {tasks.map((task) => (
-                <li key={task.id} className="memory-card">
-                  <p className="memory-card-title">{task.name}</p>
-                  <div className="memory-card-head">
-                    <span className="memory-badge" data-kind={task.agentSlug}>{task.agentSlug}</span>
-                    <span className="memory-badge">{task.mode}</span>
-                    <span className="sched-badge" data-active={task.isActive ? 'true' : 'false'}>
-                      {task.isActive ? 'Active' : 'Paused'}
-                    </span>
-                  </div>
-                  <p className="memory-card-content">{formatRecurrenceSummary(task)}</p>
-                  <p className="memory-meta">
-                    scope {task.scope}
-                    {task.skipDates.length > 0 ? ` · skips ${task.skipDates.length} date(s)` : ''} · next run{' '}
-                    {formatScheduleTime(task.nextRunAt, '— (none pending)')}
-                  </p>
-                  <TaskActions
-                    task={task}
-                    busy={actionBusy}
-                    onEdit={() => {
-                      setEditingId(task.id);
-                      setForm(formFromTask(task));
-                      setFormNotice(null);
-                    }}
-                    onActivate={() => void runAction('activate', () => setSchedulerTaskActive({ apiBaseUrl, taskId: task.id, isActive: true }))}
-                    onPause={() => void runAction('pause', () => setSchedulerTaskActive({ apiBaseUrl, taskId: task.id, isActive: false }))}
-                    onRun={() => void runAction('run', () => runSchedulerTaskNow({ apiBaseUrl, taskId: task.id }))}
-                  />
+                <li key={task.id} className="list-none">
+                  <Card className="gap-2.5 bg-muted/50 px-3.5 py-3">
+                    <p className="m-0 font-semibold break-words">{task.name}</p>
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <Badge variant="secondary" data-kind={task.agentSlug}>{task.agentSlug}</Badge>
+                      <Badge variant="outline">{task.mode}</Badge>
+                      <Badge variant="outline" data-active={task.isActive ? 'true' : 'false'} className={task.isActive ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : ''}>
+                        {task.isActive ? 'Active' : 'Paused'}
+                      </Badge>
+                    </div>
+                    <p className="m-0 text-sm break-words whitespace-pre-wrap">{formatRecurrenceSummary(task)}</p>
+                    <p className="m-0 text-xs break-all text-muted-foreground">
+                      scope {task.scope}
+                      {task.skipDates.length > 0 ? ` · skips ${task.skipDates.length} date(s)` : ''} · next run{' '}
+                      {formatScheduleTime(task.nextRunAt, '— (none pending)')}
+                    </p>
+                    <TaskActions
+                      task={task}
+                      busy={actionBusy}
+                      onEdit={() => {
+                        setEditingId(task.id);
+                        setForm(formFromTask(task));
+                        setFormNotice(null);
+                      }}
+                      onActivate={() => void runAction('activate', () => setSchedulerTaskActive({ apiBaseUrl, taskId: task.id, isActive: true }))}
+                      onPause={() => void runAction('pause', () => setSchedulerTaskActive({ apiBaseUrl, taskId: task.id, isActive: false }))}
+                      onRun={() => void runAction('run', () => runSchedulerTaskNow({ apiBaseUrl, taskId: task.id }))}
+                    />
+                  </Card>
                 </li>
               ))}
             </ul>
           </>
         )}
-      </section>
+      </Card>
 
-      <section className="memory-section" aria-labelledby="schedules-executions-heading">
-        <h2 id="schedules-executions-heading">Execution history ({visibleExecutions.length})</h2>
-        <div className="memory-fieldrow">
-          <div className="memory-field">
-            <label htmlFor="schedules-exec-task-filter">Filter by task</label>
-            <select
+      <Card aria-labelledby="schedules-executions-heading" className="gap-4 px-4 py-4 sm:px-5 sm:py-5">
+        <h2 id="schedules-executions-heading" className="m-0 text-base font-semibold tracking-tight">
+          Execution history ({visibleExecutions.length})
+        </h2>
+        <div className="flex flex-wrap gap-3">
+          <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-exec-task-filter">Filter by task</Label>
+            <NativeSelect
               id="schedules-exec-task-filter"
-              className="memory-input"
               aria-label="Filter executions by task"
               value={taskFilter}
               onChange={(event) => setTaskFilter(event.target.value)}
@@ -467,13 +490,12 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
               {tasks.map((task) => (
                 <option key={task.id} value={task.id}>{task.name}</option>
               ))}
-            </select>
+            </NativeSelect>
           </div>
-          <div className="memory-field">
-            <label htmlFor="schedules-exec-status-filter">Filter by status</label>
-            <select
+          <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-exec-status-filter">Filter by status</Label>
+            <NativeSelect
               id="schedules-exec-status-filter"
-              className="memory-input"
               aria-label="Filter executions by status"
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value)}
@@ -482,31 +504,32 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
               {SCHEDULER_EXECUTION_STATUSES.map((status) => (
                 <option key={status} value={status}>{status}</option>
               ))}
-            </select>
+            </NativeSelect>
           </div>
         </div>
-        <div className="memory-actions">
-          <button
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
             type="button"
-            className="memory-button"
+            variant="outline"
+            size="sm"
             aria-label="Refresh tasks and execution history"
             onClick={() => void refresh()}
           >
             Refresh
-          </button>
+          </Button>
         </div>
         {pollActive && (
-          <p aria-live="polite" className="memory-muted">
+          <p aria-live="polite" className="m-0 text-sm text-muted-foreground">
             Refreshing every {POLL_INTERVAL_MS / 1000}s while an execution is pending, running or retrying (or a just-submitted run settles) — it stops on error.
           </p>
         )}
         {visibleExecutions.length === 0 ? (
-          <p className="memory-muted">{loading ? 'Loading executions…' : 'No executions match — run a task or clear the filters.'}</p>
+          <p className="m-0 text-sm text-muted-foreground">{loading ? 'Loading executions…' : 'No executions match — run a task or clear the filters.'}</p>
         ) : (
           <>
-            <div className="sched-desktop-only sched-tablewrap">
+            <div className="hidden overflow-x-auto rounded-xl border bg-card md:block"> {/* desktop table */}
               <table className="sched-table">
-                <caption className="memory-hint">Runs of the tasks above; chat links open the execution&apos;s isolated chat.</caption>
+                <caption className="text-left text-[0.75rem] text-muted-foreground">Runs of the tasks above; chat links open the execution&apos;s isolated chat.</caption>
                 <thead>
                   <tr>
                     <th scope="col">Status</th>
@@ -533,21 +556,22 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
                 </tbody>
               </table>
             </div>
-            <ul className="memory-cards sched-mobile-only">
+            <ul className="m-0 flex list-none flex-col gap-3 p-0 md:hidden">
               {visibleExecutions.map((execution) => (
-                <ExecutionCard
-                  key={execution.id}
-                  execution={execution}
-                  task={taskById.get(execution.taskId) ?? null}
-                  busy={actionBusy}
-                  onRetry={() => void runAction('retry', () => retrySchedulerExecution({ apiBaseUrl, executionId: execution.id }))}
-                />
+                <li key={execution.id} className="list-none">
+                  <ExecutionCard
+                    execution={execution}
+                    task={taskById.get(execution.taskId) ?? null}
+                    busy={actionBusy}
+                    onRetry={() => void runAction('retry', () => retrySchedulerExecution({ apiBaseUrl, executionId: execution.id }))}
+                  />
+                </li>
               ))}
             </ul>
           </>
         )}
-      </section>
-    </main>
+      </Card>
+    </WorkspaceShell>
   );
 }
 
@@ -571,34 +595,36 @@ function TaskActions({
   onRun: () => void;
 }): React.ReactElement {
   return (
-    <div className="sched-actions">
-      <button
+    <div className="flex flex-wrap gap-1.5">
+      <Button
         type="button"
-        className="memory-button"
+        variant="outline"
+        size="sm"
         aria-label={`Edit ${task.name}`}
         disabled={busy !== null}
         onClick={onEdit}
       >
         Edit
-      </button>
-      <button
+      </Button>
+      <Button
         type="button"
-        className="memory-button"
+        variant="outline"
+        size="sm"
         aria-label={task.isActive ? `Pause ${task.name}` : `Activate ${task.name}`}
         disabled={busy !== null}
         onClick={task.isActive ? onPause : onActivate}
       >
         {task.isActive ? 'Pause' : 'Activate'}
-      </button>
-      <button
+      </Button>
+      <Button
         type="button"
-        className="memory-button"
+        size="sm"
         aria-label={`Run ${task.name} now`}
         disabled={busy !== null}
         onClick={onRun}
       >
         Run now
-      </button>
+      </Button>
     </div>
   );
 }
@@ -624,17 +650,19 @@ function ExecutionActionCell({
     ) : null;
   }
   return (
-    <details className="sched-retry-details">
-      <summary>Create a NEW linked execution and a NEW isolated chat for this dead-lettered run. The old execution&apos;s history stays unchanged.</summary>
-      <button
+    <details className="max-w-56 text-[0.8rem] text-muted-foreground">
+      <summary className="cursor-pointer">Create a NEW linked execution and a NEW isolated chat for this dead-lettered run. The old execution&apos;s history stays unchanged.</summary>
+      <Button
         type="button"
-        className="memory-button"
+        variant="outline"
+        size="sm"
+        className="mt-2"
         aria-label="Retry dead-lettered execution"
         disabled={busy !== null}
         onClick={onRetry}
       >
         Retry
-      </button>
+      </Button>
     </details>
   );
 }
@@ -648,7 +676,7 @@ function RetrySourceLinkCell({
 }): React.ReactElement | null {
   const link = retrySourceChatLink(task, execution);
   if (link === null) return null;
-  return <a className="work-link" href={link.href}>{`↩ ${link.text}`}</a>;
+  return <a className="text-sm font-medium text-primary underline-offset-4 hover:underline" href={link.href}>{`↩ ${link.text}`}</a>;
 }
 
 function ExecutionRow({
@@ -666,10 +694,10 @@ function ExecutionRow({
   return (
     <tr>
       <th scope="row">
-        <span className="sched-badge" data-status={schedulerStatusBadge(execution.status)}>{execution.status}</span>
-        <span className="memory-meta">{execution.trigger}</span>
+        <StatusBadge status={schedulerStatusBadge(execution.status)}>{execution.status}</StatusBadge>
+        <span className="block text-xs text-muted-foreground">{execution.trigger}</span>
       </th>
-      <td>{task !== null ? task.name : <span className="memory-mono">{execution.taskId}</span>}</td>
+      <td>{task !== null ? task.name : <span className="font-mono break-all">{execution.taskId}</span>}</td>
       <td>{formatScheduleTime(execution.scheduledFor)}</td>
       <td className="sched-num">{formatAttempt(execution)}</td>
       <td className="sched-num">{execution.durationMs === null ? '—' : `${execution.durationMs} ms`}</td>
@@ -677,7 +705,7 @@ function ExecutionRow({
       <td className="sched-cell-error">{formatExecutionError(execution.error)}</td>
       <td>
         {chatLink !== null ? (
-          <a className="work-link" href={chatLink.href}>{chatLink.text}</a>
+          <a className="text-sm font-medium text-primary underline-offset-4 hover:underline" href={chatLink.href}>{chatLink.text}</a>
         ) : (
           '—'
         )}
@@ -703,43 +731,43 @@ function ExecutionCard({
   const chatLink = executionChatLink(task, execution);
   const retryLink = retrySourceChatLink(task, execution);
   return (
-    <li className="memory-card">
-      <div className="memory-card-head">
-        <span className="sched-badge" data-status={schedulerStatusBadge(execution.status)}>{execution.status}</span>
-        <span className="memory-badge">{execution.trigger}</span>
-        <span className="memory-badge">{formatAttempt(execution)}</span>
+    <Card className="gap-2.5 bg-muted/50 px-3.5 py-3">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <StatusBadge status={schedulerStatusBadge(execution.status)}>{execution.status}</StatusBadge>
+        <Badge variant="outline">{execution.trigger}</Badge>
+        <Badge variant="outline">{formatAttempt(execution)}</Badge>
       </div>
-      <p className="memory-card-title">{task !== null ? task.name : execution.taskId}</p>
-      <p className="memory-meta">
+      <p className="m-0 font-semibold break-words">{task !== null ? task.name : execution.taskId}</p>
+      <p className="m-0 text-xs break-all text-muted-foreground">
         scheduled {formatScheduleTime(execution.scheduledFor)} · duration{' '}
         {execution.durationMs === null ? '—' : `${execution.durationMs} ms`} · tokens {formatTokenUsage(execution.tokenUsage)}
       </p>
-      <p className="memory-card-content sched-cell-error">{formatExecutionError(execution.error)}</p>
-      <div className="memory-actions">
+      <p className="sched-cell-error m-0 text-sm break-words">{formatExecutionError(execution.error)}</p>
+      <div className="flex flex-wrap gap-3">
         {chatLink !== null && (
-          <a className="work-link" href={chatLink.href}>{chatLink.text}</a>
+          <a className="text-sm font-medium text-primary underline-offset-4 hover:underline" href={chatLink.href}>{chatLink.text}</a>
         )}
         {retryLink !== null && (
-          <a className="work-link" href={retryLink.href}>{retryLink.text}</a>
+          <a className="text-sm font-medium text-primary underline-offset-4 hover:underline" href={retryLink.href}>{retryLink.text}</a>
         )}
       </div>
       {canRetryExecution(execution) && (
-        <div className="memory-actions">
-          <details className="sched-retry-details">
-            <summary>Creates a NEW linked execution in a NEW isolated chat. The old audit stays unchanged.</summary>
-            <button
-              type="button"
-              className="memory-button"
-              aria-label="Retry dead-lettered execution"
-              disabled={busy !== null}
-              onClick={onRetry}
-            >
-              Retry
-            </button>
-          </details>
-        </div>
+        <details className="text-[0.8rem] text-muted-foreground">
+          <summary className="cursor-pointer">Creates a NEW linked execution in a NEW isolated chat. The old audit stays unchanged.</summary>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="mt-2"
+            aria-label="Retry dead-lettered execution"
+            disabled={busy !== null}
+            onClick={onRetry}
+          >
+            Retry
+          </Button>
+        </details>
       )}
-    </li>
+    </Card>
   );
 }
 
@@ -776,21 +804,22 @@ function ScheduleFormSection({
   const headingId = 'schedules-form-heading';
   const heading = editingId !== null ? FORM_HEADING_EDIT : FORM_HEADING_CREATE;
   return (
-    <section className="memory-section" aria-labelledby={headingId}>
-      <h2 id={headingId}>{heading}{editingId !== null && editingName !== null ? ` — ${editingName}` : ''}</h2>
+    <Card aria-labelledby={headingId} className="gap-4 px-4 py-4 sm:px-5 sm:py-5">
+      <h2 id={headingId} className="m-0 text-base font-semibold tracking-tight">
+        {heading}{editingId !== null && editingName !== null ? ` — ${editingName}` : ''}
+      </h2>
       <form
-        className="memory-form"
+        className="flex flex-col gap-3"
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit();
         }}
       >
-        <div className="memory-fieldrow">
-          <div className="memory-field memory-field-grow">
-            <label htmlFor="schedules-name">Name</label>
-            <input
+        <div className="flex flex-wrap gap-3">
+          <div className="flex flex-[2_1_14rem] min-w-56 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-name">Name</Label>
+            <Input
               id="schedules-name"
-              className="memory-input"
               aria-label="Task name"
               value={form.name}
               onChange={(event) => set('name', event.target.value)}
@@ -798,11 +827,10 @@ function ScheduleFormSection({
               maxLength={AGENT_TASK_NAME_MAX}
             />
           </div>
-          <div className="memory-field">
-            <label htmlFor="schedules-agent">Agent</label>
-            <select
+          <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-agent">Agent</Label>
+            <NativeSelect
               id="schedules-agent"
-              className="memory-input"
               aria-label="Agent that runs the task"
               value={form.agentSlug}
               onChange={(event) => set('agentSlug', event.target.value)}
@@ -810,13 +838,12 @@ function ScheduleFormSection({
               {WEB_AGENT_SLUGS.map((slug) => (
                 <option key={slug} value={slug}>{slug}</option>
               ))}
-            </select>
+            </NativeSelect>
           </div>
-          <div className="memory-field">
-            <label htmlFor="schedules-mode">Mode</label>
-            <select
+          <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-mode">Mode</Label>
+            <NativeSelect
               id="schedules-mode"
-              className="memory-input"
               aria-label="Plan or action mode"
               value={form.mode}
               onChange={(event) => set('mode', event.target.value)}
@@ -824,13 +851,12 @@ function ScheduleFormSection({
               {WEB_AGENT_MODES.map((mode) => (
                 <option key={mode} value={mode}>{mode}</option>
               ))}
-            </select>
+            </NativeSelect>
           </div>
-          <div className="memory-field">
-            <label htmlFor="schedules-scope">Scope</label>
-            <input
+          <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-scope">Scope</Label>
+            <Input
               id="schedules-scope"
-              className="memory-input"
               aria-label="Memory scope"
               value={form.scope}
               onChange={(event) => set('scope', event.target.value)}
@@ -839,11 +865,10 @@ function ScheduleFormSection({
             />
           </div>
         </div>
-        <div className="memory-field">
-          <label htmlFor="schedules-prompt">Prompt</label>
-          <textarea
+        <div className="flex min-w-0 basis-full flex-col gap-1 text-sm">
+          <Label htmlFor="schedules-prompt">Prompt</Label>
+          <Textarea
             id="schedules-prompt"
-            className="memory-input"
             aria-label="Prompt the agent runs"
             value={form.prompt}
             onChange={(event) => set('prompt', event.target.value)}
@@ -853,12 +878,11 @@ function ScheduleFormSection({
           />
         </div>
 
-        <div className="memory-fieldrow">
-          <div className="memory-field">
-            <label htmlFor="schedules-recurrence">Recurrence</label>
-            <select
+        <div className="flex flex-wrap gap-3">
+          <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+            <Label htmlFor="schedules-recurrence">Recurrence</Label>
+            <NativeSelect
               id="schedules-recurrence"
-              className="memory-input"
               aria-label="Recurrence type"
               value={form.recurrenceType}
               onChange={(event) => set('recurrenceType', event.target.value as SchedulerRecurrenceType)}
@@ -866,50 +890,56 @@ function ScheduleFormSection({
               {SCHEDULER_RECURRENCE_TYPES.map((type) => (
                 <option key={type} value={type}>{type}</option>
               ))}
-            </select>
+            </NativeSelect>
           </div>
           <RecurrenceFields form={form} set={set} />
         </div>
 
-        <div className="memory-field">
-          <label htmlFor="schedules-skip-dates">Skip dates (UTC, comma or newline separated YYYY-MM-DD)</label>
-          <textarea
+        <div className="flex min-w-0 basis-full flex-col gap-1 text-sm">
+          <Label htmlFor="schedules-skip-dates">Skip dates (UTC, comma or newline separated YYYY-MM-DD)</Label>
+          <Textarea
             id="schedules-skip-dates"
-            className="memory-input"
             aria-label="Skip dates, comma or newline separated YYYY-MM-DD"
             value={form.skipDates}
             onChange={(event) => set('skipDates', event.target.value)}
             rows={2}
             placeholder="2026-12-24, 2026-12-25"
           />
-          <span className="memory-hint">
+          <span className="text-xs text-muted-foreground">
             Optional. Duplicates and invalid calendar dates are rejected. Skip counts toward at most 366 dates.
           </span>
         </div>
 
-        <p className="memory-hint" role="note">
+        <p className="m-0 text-xs text-muted-foreground" role="note">
           Every schedule — including the value you type for a one-off run — is interpreted as UTC. Minutes only: no
           seconds, no other timezone. {form.recurrenceType === 'ONCE' ? 'The one-off time below is the UTC clock time.' : ''}
         </p>
 
         {formNotice !== null && (
-          <div role={formNotice.kind === 'ok' ? 'status' : 'alert'} className={`memory-notice ${formNotice.kind === 'ok' ? 'memory-notice-ok' : 'memory-notice-error'}`}>
-            <p>{formNotice.text}</p>
+          <div
+            role={formNotice.kind === 'ok' ? 'status' : 'alert'}
+            className={
+              formNotice.kind === 'ok'
+                ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900'
+                : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800'
+            }
+          >
+            <p className="m-0">{formNotice.text}</p>
           </div>
         )}
 
-        <div className="memory-actions">
-          <button type="submit" className="memory-button-primary" disabled={formBusy}>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="submit" disabled={formBusy}>
             {editingId !== null ? 'Save changes' : 'Create task'}
-          </button>
+          </Button>
           {editingId !== null && (
-            <button type="button" className="memory-button" aria-label="Cancel editing" disabled={formBusy} onClick={onCancelEdit}>
+            <Button type="button" variant="outline" aria-label="Cancel editing" disabled={formBusy} onClick={onCancelEdit}>
               Cancel edit
-            </button>
+            </Button>
           )}
         </div>
       </form>
-    </section>
+    </Card>
   );
 }
 
@@ -923,34 +953,32 @@ function RecurrenceFields({
 }): React.ReactElement | null {
   if (form.recurrenceType === 'ONCE') {
     return (
-      <div className="memory-field">
-        <label htmlFor="schedules-runat">Run at (UTC)</label>
-        <input
+      <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+        <Label htmlFor="schedules-runat">Run at (UTC)</Label>
+        <Input
           id="schedules-runat"
-          className="memory-input"
           type="datetime-local"
           aria-label="Run at, UTC date and time"
           value={form.runAt}
           onChange={(event) => set('runAt', event.target.value)}
           step={60}
         />
-        <span className="memory-hint">Sent as a UTC instant; seconds are never stored.</span>
+        <span className="text-xs text-muted-foreground">Sent as a UTC instant; seconds are never stored.</span>
       </div>
     );
   }
   if (form.recurrenceType === 'CUSTOM_CRON') {
     return (
-      <div className="memory-field memory-field-grow">
-        <label htmlFor="schedules-cron">Cron expression (5 fields)</label>
-        <input
+      <div className="flex flex-[2_1_14rem] min-w-56 flex-col gap-1 text-sm">
+        <Label htmlFor="schedules-cron">Cron expression (5 fields)</Label>
+        <Input
           id="schedules-cron"
-          className="memory-input"
           aria-label="Custom cron expression, exactly 5 fields"
           value={form.cronExpression}
           onChange={(event) => set('cronExpression', event.target.value)}
           placeholder="*/15 * * * *"
         />
-        <span className="memory-hint">Exactly 5 whitespace-separated fields (minute hour day month weekday), at most 200 characters — evaluated in UTC.</span>
+        <span className="text-xs text-muted-foreground">Exactly 5 whitespace-separated fields (minute hour day month weekday), at most 200 characters — evaluated in UTC.</span>
       </div>
     );
   }
@@ -958,11 +986,10 @@ function RecurrenceFields({
   if (!daily) return null;
   return (
     <>
-      <div className="memory-field">
-        <label htmlFor="schedules-hour">Hour (UTC 0–23)</label>
-        <input
+      <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+        <Label htmlFor="schedules-hour">Hour (UTC 0–23)</Label>
+        <Input
           id="schedules-hour"
-          className="memory-input"
           type="number"
           inputMode="numeric"
           min={0}
@@ -973,11 +1000,10 @@ function RecurrenceFields({
           onChange={(event) => set('hour', event.target.value)}
         />
       </div>
-      <div className="memory-field">
-        <label htmlFor="schedules-minute">Minute (0–59)</label>
-        <input
+      <div className="flex min-w-0 flex-1 basis-32 flex-col gap-1 text-sm">
+        <Label htmlFor="schedules-minute">Minute (0–59)</Label>
+        <Input
           id="schedules-minute"
-          className="memory-input"
           type="number"
           inputMode="numeric"
           min={0}
@@ -989,14 +1015,14 @@ function RecurrenceFields({
         />
       </div>
       {form.recurrenceType === 'WEEKLY' && (
-        <fieldset className="chat-mode-fieldset sched-dayset-fieldset" aria-label="Weekdays to run (UTC days)">
-          <legend>Weekdays</legend>
-          <div className="sched-dayset">
+        <fieldset className="flex min-w-56 flex-1 basis-64 flex-col gap-2 rounded-md border p-2.5" aria-label="Weekdays to run (UTC days)">
+          <legend className="px-1 text-xs font-semibold text-muted-foreground">Weekdays</legend>
+          <div className="flex flex-wrap gap-1.5">
             {WEEKDAY_OPTIONS.map((option) => (
-              <label key={option.value} className="sched-dayset-option">
+              <label key={option.value} className="inline-flex cursor-pointer items-center gap-1 rounded-full border border-input bg-card px-2 py-0.5 text-[0.8rem]">
                 <input
                   type="checkbox"
-                  className="sched-dayset-input"
+                  className="sched-dayset-input size-3.5 accent-primary"
                   aria-label={`Run on ${option.label} weekday ${option.value}`}
                   checked={form.weekdays.includes(option.value)}
                   onChange={() => set('weekdays', toggle(form.weekdays, option.value))}
@@ -1005,18 +1031,18 @@ function RecurrenceFields({
               </label>
             ))}
           </div>
-          <span className="memory-hint">0 = Sunday … 6 = Saturday. At least one day, none repeated.</span>
+          <span className="text-xs text-muted-foreground">0 = Sunday … 6 = Saturday. At least one day, none repeated.</span>
         </fieldset>
       )}
       {form.recurrenceType === 'MONTHLY' && (
-        <fieldset className="chat-mode-fieldset sched-dayset-fieldset" aria-label="Days of month to run (UTC days)">
-          <legend>Days of month</legend>
-          <div className="sched-dayset">
+        <fieldset className="flex min-w-56 flex-1 basis-64 flex-col gap-2 rounded-md border p-2.5" aria-label="Days of month to run (UTC days)">
+          <legend className="px-1 text-xs font-semibold text-muted-foreground">Days of month</legend>
+          <div className="flex flex-wrap gap-1.5">
             {MONTH_DAY_OPTIONS.map((day) => (
-              <label key={day} className="sched-dayset-option">
+              <label key={day} className="inline-flex cursor-pointer items-center gap-1 rounded-full border border-input bg-card px-2 py-0.5 text-[0.8rem]">
                 <input
                   type="checkbox"
-                  className="sched-dayset-input"
+                  className="sched-dayset-input size-3.5 accent-primary"
                   aria-label={`Run on day ${day} of the month`}
                   checked={form.daysOfMonth.includes(day)}
                   onChange={() => set('daysOfMonth', toggle(form.daysOfMonth, day))}
@@ -1025,10 +1051,9 @@ function RecurrenceFields({
               </label>
             ))}
           </div>
-          <span className="memory-hint">1–31; short months skip absent days. At least one day, none repeated.</span>
+          <span className="text-xs text-muted-foreground">1–31; short months skip absent days. At least one day, none repeated.</span>
         </fieldset>
       )}
     </>
   );
 }
-

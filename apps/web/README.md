@@ -21,8 +21,55 @@ MiniLM embeddings).
 | Framework | Next.js 15 (App Router), React 19, TypeScript strict |
 | Chat state | `@ai-sdk/react` `useChat` (AI SDK v6), `DefaultChatTransport` from `ai` |
 | Markdown | `react-markdown` + `remark-gfm` (assistant text renders real Markdown; raw HTML is never enabled) |
-| UI framework | None — plain CSS (`app/globals.css`), no design system (Phase 2/3 non-goal) |
+| Styling | Tailwind CSS v4 (`@tailwindcss/postcss`, `postcss.config.mjs`, `@import "tailwindcss"` in `app/globals.css`) |
+| UI primitives | shadcn/ui — real registry sources under `src/components/ui` (Button, Card, Badge, Input, Textarea, Label, NativeSelect), `components.json`, `cn` in `src/lib/utils.ts`; icons via `lucide-react` |
+| Shell | Shared `src/components/WorkspaceShell.tsx` (dark-ink sidebar + mobile bar, one `nav` landmark, context-query deep links) consumed by every routed surface |
 | Tests | `node:test` via `tsx` on pure helpers — no browser, no live API |
+
+## Design system (UI refresh)
+
+Warm neutral canvas (`--background`), white elevated Cards, deep-green
+`--primary`/`--ring`, dark-ink `--sidebar` palette, soft status tints and the
+`--user-bubble` token all live as shadcn-compatible CSS variables in
+`app/globals.css`. No gradients. Focus uses a global `:focus-visible` ring;
+`prefers-reduced-motion` disables transitions/animation globally.
+
+Focused custom CSS (kept deliberately narrow): assistant Markdown typography
+`.chat-md*`, tool-part cards `.chat-tool*`, collapsed regions `.chat-region`,
+scheduler tables `.sched-table*`, and the Version-history excerpt `<pre>`
+`.work-doc-content*`. Everything else (buttons, cards, badges, inputs,
+textareas, labels, selects, shell, badges-pills) comes from Tailwind +
+shadcn primitives — no parallel button/card/form system exists.
+
+Notes:
+- `@source "../src"; @source "../app";` is declared in `globals.css`: Tailwind
+  v4 roots automatic detection at the CSS entry directory, which would miss
+  `src/components`. The PostCSS config is the documented Tailwind×Next object
+  shape (`plugins: { '@tailwindcss/postcss': {} }`).
+- Status pills render through `src/components/StatusBadge.tsx` (shadcn Badge
+  wrapper that keeps the original lowercase `data-status` attribute on the
+  element); the chat empty-state suggestions come from
+  `src/lib/workspace.ts` (`chatSuggestions`) and only fill the composer.
+- Safe Markdown rendering is one shared component, `src/components/MarkdownText.tsx`
+  (`react-markdown` + `remark-gfm`, raw HTML never enabled — no rehype-raw and no
+  `dangerouslySetInnerHTML`). It renders chat responses/thinking, Delegation
+  worker results (full content inside a `max-h-60` bounded scroll region —
+  truncating Markdown source would leave literal unmatched syntax), and Work Doc
+  current content (bounded, display-limit note kept). The Work Doc edit textarea
+  stays raw Markdown; version-history excerpts stay plain `<pre>`.
+- Chat layout is a viewport-constrained application frame: the shell root is
+  `h-dvh overflow-hidden` on chat surfaces, the transcript is the only scroller
+  (`min-h-0 flex-1 overflow-y-auto`), and the composer/answer dock is pinned at
+  the frame bottom — page `maxScrollY` stays 0 in browser checks (desktop and
+  mobile). The transcript scrolls to the latest turn exactly once (first
+  nonempty list per mounted chat, or on the user's own send/resume
+  re-attach via `status === 'submitted'`); streaming never auto-scrolls, so
+  reading position never moves under the user. Workspace surfaces (Memory,
+  Work, Work Doc detail, Delegations, Schedules) keep natural document scroll.
+  On mobile the shared sidebar becomes the compact top bar, and the active nav
+  item is brought into view on mount/route change with a direct nav-list
+  `scrollLeft` assignment (never `scrollIntoView`); the desktop sidebar is
+  unaffected.
 
 ## Scripts
 
@@ -196,7 +243,7 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 
 ## Tests (offline, pure — node:test)
 
-`npm test` runs 138 tests across:
+`npm test` runs 148 tests across:
 
 - `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
   hydration mapping, safe errors) — unchanged and green.
@@ -233,6 +280,15 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   OWNING task's agent+mode, DEAD_LETTER-only retry gate, poll predicate
   (PENDING/RUNNING/RETRYING + settle window, never terminal-only), and stub-fetch
   orchestration for the real routes (API error text verbatim, honest 503 status).
+- `test/workspace.test.ts` — UI-refresh shell/empty-state helpers: nav metadata
+  covers every section id once (Chat → Memory → Work docs → Delegations →
+  Schedules) with stable hrefs/prefixes, canonical `/agents/:slug/chat/:id` and
+  legacy `/chat/:id` URLs route to the chat section (`/` matches only itself,
+  never other roots), detail paths (`/work/:id`) stay in their section, unknown
+  paths fall back to chat, every servable agent has a human label with a raw-slug
+  fallback, and every agent gets 3–4 non-empty unique empty-state suggestions that
+  stay honest to each agent toolset (general calculation-only, researcher without
+  SQL, orchestrator naming its real memory/query/document/delegation verbs).
 
 ## Validation limitations (honest — the phase gate is Farhan's live run)
 

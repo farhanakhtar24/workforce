@@ -1,6 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { StatusBadge } from '@/components/StatusBadge';
+import { MarkdownText } from '@/components/MarkdownText';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { NativeSelect } from '@/components/ui/native-select';
+import { Textarea } from '@/components/ui/textarea';
 import {
   buildWorkDocPatchBody,
   buildWorkDocVersionBody,
@@ -43,35 +53,30 @@ const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 /**
  * `/work/:id?chatId=…` — one Work Doc with content, versions, revisions and
- * typed links (Phase 4). Metadata (title/status) edits go through the PATCH
- * route with the required CAS `expectedVersion`; rollbacks go through the
- * rollback route with BOTH `expectedVersion` and `toVersion` — a 409 always
- * resolves to a fixed, actionable message, never internals. Content edits go
- * through the REAL agent versions route with `expectedVersion` and
- * `source: 'user'` (a new immutable version; history is never rewritten).
+ * typed links (Phase 4) on the shared Tailwind + shadcn shell. Metadata
+ * (title/status) edits go through the PATCH route with the required CAS
+ * `expectedVersion`; rollbacks go through the rollback route with BOTH
+ * `expectedVersion` and `toVersion` — a 409 always resolves to a fixed,
+ * actionable message, never internals. Content edits go through the REAL
+ * agent versions route with `expectedVersion` and `source: 'user'` (a new
+ * immutable version; history is never rewritten).
  */
 export function WorkDocDetailView({ apiBaseUrl, workDocId, chatId }: WorkDocDetailProps): React.ReactElement {
   if (!CHAT_ID_PATTERN.test(chatId)) {
     return (
-      <main className="chat-layout">
-        <header className="chat-header">
-          <h1>Work document</h1>
-          <nav className="chat-nav" aria-label="Workforce pages">
-            <a className="chat-new" href={workListPagePath()}>
-              All documents
-            </a>
-            <a className="chat-new" href="/schedules">
-              Schedules
-            </a>
-          </nav>
-        </header>
-        <div role="alert" className="chat-banner chat-banner-warning">
-          <p>
+      <WorkspaceShell
+        active="work"
+        eyebrow="Workspace output"
+        title="Work document"
+        description="One document with its content, versions, revisions and links."
+      >
+        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900">
+          <p className="m-0">
             This page needs its owning chat as <code>?chatId=…</code> — open the document from a
             chat's Work link or a list entry on <code>/work</code>.
           </p>
         </div>
-      </main>
+      </WorkspaceShell>
     );
   }
   return <WorkDocDetailLoaded apiBaseUrl={apiBaseUrl} workDocId={workDocId} chatId={chatId} />;
@@ -270,65 +275,80 @@ function WorkDocDetailLoaded({
   };
 
   return (
-    <main className="chat-layout">
-      <header className="chat-header">
-        <h1>Work document</h1>
-        <nav className="chat-nav" aria-label="Workforce pages">
+    <WorkspaceShell
+      active="work"
+      eyebrow="Workspace output"
+      title={document !== null ? document.title : 'Work document'}
+      description="Content edits create new immutable versions; a rollback copies an older version into a new current one. History is never rewritten."
+      context={
+        <>
           {CHAT_ID_PATTERN.test(chatId) && (
-            <a className="chat-new" href={`/chat/${encodeURIComponent(chatId)}`}>
+            <a
+              className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+              href={`/chat/${encodeURIComponent(chatId)}`}
+            >
               Back to chat
             </a>
           )}
-          <a className="chat-new" href={workListPagePath(chatId)}>
-            Documents
+          <a
+            className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+            href={workListPagePath(chatId)}
+          >
+            All documents
           </a>
-          <a className="chat-new" href="/schedules">
-            Schedules
-          </a>
-        </nav>
-      </header>
-
+        </>
+      }
+    >
       {loadError !== null && loadedOnce && (
-        <div role="alert" className="chat-banner chat-banner-error">
-          <p>{loadError}</p>
-          <button type="button" onClick={() => void loadAll()}>
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+        >
+          <p className="m-0">{loadError}</p>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => void loadAll()}>
             Refresh
-          </button>
+          </Button>
         </div>
       )}
 
       {document !== null && (
         <>
-          <section className="memory-section" aria-labelledby="work-doc-heading">
-            <h2 id="work-doc-heading">{document.title}</h2>
+          <Card aria-labelledby="work-doc-heading" className="gap-3 px-4 py-4 sm:px-5 sm:py-5">
+            <h2 id="work-doc-heading" className="m-0 text-base font-semibold tracking-tight">
+              {document.title}
+            </h2>
             <WorkDocMeta doc={document} />
-            <pre className="work-doc-content">
-              {truncateWorkDocContent(document.content, WORK_DOC_DISPLAY_LIMIT)}
-              {document.content.length > WORK_DOC_DISPLAY_LIMIT &&
-                `\n\n(displaying the first ${WORK_DOC_DISPLAY_LIMIT} characters of ${document.content.length})`}
-            </pre>
+            <div className="max-h-96 overflow-y-auto overscroll-contain">
+              <MarkdownText text={truncateWorkDocContent(document.content, WORK_DOC_DISPLAY_LIMIT)} />
+            </div>
+            {document.content.length > WORK_DOC_DISPLAY_LIMIT && (
+              <p className="m-0 text-xs text-muted-foreground">
+                (displaying the first {WORK_DOC_DISPLAY_LIMIT} characters of {document.content.length})
+              </p>
+            )}
             <LinksView links={links} chatId={chatId} />
-          </section>
+          </Card>
 
-          <section className="memory-section" aria-labelledby="work-doc-edit-heading">
-            <h2 id="work-doc-edit-heading">Edit metadata</h2>
-            <p className="memory-muted">
+          <Card aria-labelledby="work-doc-edit-heading" className="gap-3 px-4 py-4 sm:px-5 sm:py-5">
+            <h2 id="work-doc-edit-heading" className="m-0 text-base font-semibold tracking-tight">
+              Edit metadata
+            </h2>
+            <p className="m-0 text-sm text-muted-foreground">
               Changes title or status with a version check (expected v{document.version}). Content
               edits live in the section below — through the versioned route with{' '}
-              <code>source: 'user'</code>; there is no separate user-content endpoint.
+              <code className="rounded bg-muted px-1 py-0.5 text-[0.85em]">source: 'user'</code>; there is no separate user-content endpoint.
             </p>
             <form
-              className="memory-form"
+              className="flex flex-col gap-3"
               onSubmit={(event) => {
                 event.preventDefault();
                 void saveMetadata();
               }}
             >
-              <div className="memory-field">
-                <label htmlFor="work-doc-title">Title</label>
-                <input
+              <div className="flex min-w-0 flex-1 basis-full flex-col gap-1 text-sm">
+                <Label htmlFor="work-doc-title">Title</Label>
+                <Input
                   id="work-doc-title"
-                  className="memory-input"
                   aria-label="Work document title"
                   value={titleDraft}
                   onChange={(event) => setTitleDraft(event.target.value)}
@@ -336,11 +356,10 @@ function WorkDocDetailLoaded({
                   maxLength={WORK_DOC_TITLE_MAX}
                 />
               </div>
-              <div className="memory-field">
-                <label htmlFor="work-doc-status">Status</label>
-                <select
+              <div className="flex min-w-0 flex-1 basis-full flex-col gap-1 text-sm">
+                <Label htmlFor="work-doc-status">Status</Label>
+                <NativeSelect
                   id="work-doc-status"
-                  className="memory-input"
                   aria-label="Work document status"
                   value={statusDraft}
                   onChange={(event) => setStatusDraft(event.target.value)}
@@ -350,40 +369,41 @@ function WorkDocDetailLoaded({
                       {option}
                     </option>
                   ))}
-                </select>
+                </NativeSelect>
               </div>
-              <div className="memory-actions">
-                <button type="submit" className="memory-button-primary" disabled={saving}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="submit" disabled={saving}>
                   {saving ? 'Saving…' : 'Save metadata'}
-                </button>
+                </Button>
               </div>
               {saveNotice !== null && (
-                <NoticeView notice={saveNotice} />
+                <NoticeTextLive kind={saveNotice.kind} text={saveNotice.text} />
               )}
             </form>
-          </section>
+          </Card>
 
-          <section className="memory-section" aria-labelledby="work-doc-content-heading">
-            <h2 id="work-doc-content-heading">Edit content (new version)</h2>
-            <p className="memory-muted">
+          <Card aria-labelledby="work-doc-content-heading" className="gap-3 px-4 py-4 sm:px-5 sm:py-5">
+            <h2 id="work-doc-content-heading" className="m-0 text-base font-semibold tracking-tight">
+              Edit content (new version)
+            </h2>
+            <p className="m-0 text-sm text-muted-foreground">
               Saving replaces the content through the versioned route with{' '}
-              <code>expectedVersion</code> = v{document.version} — a new immutable snapshot and
+              <code className="rounded bg-muted px-1 py-0.5 text-[0.85em]">expectedVersion</code> = v{document.version} — a new immutable snapshot and
               revision are recorded and the version number increases. If the document changed on
               the server meanwhile, the version check rejects the save with a fixed conflict
               message; refresh and retry.
             </p>
             <form
-              className="memory-form"
+              className="flex flex-col gap-3"
               onSubmit={(event) => {
                 event.preventDefault();
                 void saveContent();
               }}
             >
-              <div className="memory-field">
-                <label htmlFor="work-doc-content">Content</label>
-                <textarea
+              <div className="flex min-w-0 flex-1 basis-full flex-col gap-1 text-sm">
+                <Label htmlFor="work-doc-content">Content</Label>
+                <Textarea
                   id="work-doc-content"
-                  className="memory-input"
                   aria-label="Work document content"
                   value={contentDraft}
                   onChange={(event) => setContentDraft(event.target.value)}
@@ -391,15 +411,14 @@ function WorkDocDetailLoaded({
                   rows={8}
                   maxLength={WORK_DOC_CONTENT_MAX}
                 />
-                <span className="memory-hint">
+                <span className="text-xs text-muted-foreground">
                   {contentDraft.trim().length}/{WORK_DOC_CONTENT_MAX} characters — saved trimmed, 1 minimum.
                 </span>
               </div>
-              <div className="memory-field">
-                <label htmlFor="work-doc-content-summary">Revision summary (optional)</label>
-                <input
+              <div className="flex min-w-0 flex-1 basis-full flex-col gap-1 text-sm">
+                <Label htmlFor="work-doc-content-summary">Revision summary (optional)</Label>
+                <Input
                   id="work-doc-content-summary"
-                  className="memory-input"
                   aria-label="Revision summary"
                   value={contentSummary}
                   onChange={(event) => setContentSummary(event.target.value)}
@@ -407,34 +426,35 @@ function WorkDocDetailLoaded({
                   placeholder="Recorded in the audit trail"
                 />
               </div>
-              <div className="memory-actions">
-                <button type="submit" className="memory-button-primary" disabled={savingContent}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="submit" disabled={savingContent}>
                   {savingContent ? 'Saving version…' : 'Save as new version'}
-                </button>
+                </Button>
               </div>
-              {contentNotice !== null && <NoticeView notice={contentNotice} />}
+              {contentNotice !== null && <NoticeTextLive kind={contentNotice.kind} text={contentNotice.text} />}
             </form>
-          </section>
+          </Card>
 
-          <section className="memory-section" aria-labelledby="work-doc-rollback-heading">
-            <h2 id="work-doc-rollback-heading">Roll back to a version</h2>
-            <p className="memory-muted">
+          <Card aria-labelledby="work-doc-rollback-heading" className="gap-3 px-4 py-4 sm:px-5 sm:py-5">
+            <h2 id="work-doc-rollback-heading" className="m-0 text-base font-semibold tracking-tight">
+              Roll back to a version
+            </h2>
+            <p className="m-0 text-sm text-muted-foreground">
               Rollback copies a historical version into a NEW current version. Current version is{' '}
-              v{document.version}; the request sends it as <code>expectedVersion</code>. History is
+              v{document.version}; the request sends it as <code className="rounded bg-muted px-1 py-0.5 text-[0.85em]">expectedVersion</code>. History is
               never deleted or rewritten.
             </p>
             <form
-              className="memory-form"
+              className="flex flex-col gap-3"
               onSubmit={(event) => {
                 event.preventDefault();
                 void applyRollback();
               }}
             >
-              <div className="memory-field">
-                <label htmlFor="work-doc-rollback-version">Version to roll back to</label>
-                <select
+              <div className="flex min-w-0 flex-1 basis-full flex-col gap-1 text-sm">
+                <Label htmlFor="work-doc-rollback-version">Version to roll back to</Label>
+                <NativeSelect
                   id="work-doc-rollback-version"
-                  className="memory-input"
                   aria-label="Version to roll back to"
                   value={rollbackVersion}
                   onChange={(event) => setRollbackVersion(event.target.value)}
@@ -446,13 +466,12 @@ function WorkDocDetailLoaded({
                       {workDocVersionLine(version)} — {version.title}
                     </option>
                   ))}
-                </select>
+                </NativeSelect>
               </div>
-              <div className="memory-field">
-                <label htmlFor="work-doc-rollback-summary">Summary (optional)</label>
-                <input
+              <div className="flex min-w-0 flex-1 basis-full flex-col gap-1 text-sm">
+                <Label htmlFor="work-doc-rollback-summary">Summary (optional)</Label>
+                <Input
                   id="work-doc-rollback-summary"
-                  className="memory-input"
                   aria-label="Rollback summary"
                   value={rollbackSummary}
                   onChange={(event) => setRollbackSummary(event.target.value)}
@@ -460,40 +479,43 @@ function WorkDocDetailLoaded({
                   placeholder="Recorded in the audit trail"
                 />
               </div>
-              <div className="memory-field memory-check">
+              <div className="flex flex-none items-center gap-2 text-sm">
                 <input
                   id="work-doc-rollback-confirm"
                   type="checkbox"
                   aria-label="Confirm rollback creates a new version and leaves history untouched"
+                  className="size-4 accent-primary"
                   checked={rollbackConfirm}
                   onChange={(event) => setRollbackConfirm(event.target.checked)}
                 />
-                <label htmlFor="work-doc-rollback-confirm">
+                <Label htmlFor="work-doc-rollback-confirm" className="font-normal">
                   I understand this creates a new version (v{document.version + 1}) with the old
                   content
-                </label>
+                </Label>
               </div>
-              <div className="memory-actions">
-                <button
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
                   type="submit"
-                  className="memory-button-primary"
+                  variant="outline"
                   disabled={rollingBack || !rollbackConfirm || rollbackVersion === ''}
                 >
                   {rollingBack ? 'Rolling back…' : 'Roll back'}
-                </button>
+                </Button>
               </div>
               {rollbackNotice !== null && (
-                <NoticeView notice={rollbackNotice} />
+                <NoticeTextLive kind={rollbackNotice.kind} text={rollbackNotice.text} />
               )}
             </form>
-          </section>
+          </Card>
 
-          <section className="memory-section" aria-labelledby="work-doc-history-heading">
-            <h2 id="work-doc-history-heading">Version history</h2>
-            <ul className="work-history-list">
+          <Card aria-labelledby="work-doc-history-heading" className="gap-3 px-4 py-4 sm:px-5 sm:py-5">
+            <h2 id="work-doc-history-heading" className="m-0 text-base font-semibold tracking-tight">
+              Version history
+            </h2>
+            <ul className="m-0 flex list-none flex-col gap-2.5 p-0">
               {versions.map((version) => (
-                <li key={version.id} className="work-history-item">
-                  <p className="memory-meta">{workDocVersionLine(version)}</p>
+                <li key={version.id} className="rounded-md border bg-muted/50 px-2.5 py-2">
+                  <p className="m-0 text-xs break-all text-muted-foreground">{workDocVersionLine(version)}</p>
                   <pre className="work-doc-content work-doc-content-small">
                     {truncateWorkDocContent(version.content, 500)}
                   </pre>
@@ -501,32 +523,32 @@ function WorkDocDetailLoaded({
               ))}
             </ul>
 
-            <h3>Revision audit trail</h3>
-            <ul className="work-history-list">
+            <h3 className="m-0 text-[0.95rem] font-semibold">Revision audit trail</h3>
+            <ul className="m-0 flex list-none flex-col gap-2.5 p-0">
               {revisions.map((revision) => (
-                <li key={revision.id} className="work-history-item">
-                  <div className="memory-card-head">
-                    <span className="memory-badge">{revision.source}</span>
-                    <span className="memory-meta">
+                <li key={revision.id} className="rounded-md border bg-muted/50 px-2.5 py-2">
+                  <div className="flex flex-wrap items-baseline gap-2">
+                    <Badge variant="outline">{revision.source}</Badge>
+                    <span className="text-xs break-all text-muted-foreground">
                       {revision.fromVersion === null ? 'created' : `v${revision.fromVersion} →`} v
                       {revision.toVersion} · {revision.actorId !== null ? revision.actorId : 'actor unknown'} ·{' '}
                       {formatWorkDocTime(revision.createdAt, '(unknown)')}
                     </span>
                   </div>
-                  <p className="memory-meta">{revision.summary}</p>
+                  <p className="m-0 text-xs break-all text-muted-foreground">{revision.summary}</p>
                 </li>
               ))}
             </ul>
-          </section>
+          </Card>
         </>
       )}
 
       {!loadedOnce && loading && (
-        <p aria-live="polite" className="memory-status">
+        <p aria-live="polite" className="m-0 min-h-5 text-sm text-muted-foreground">
           Loading document…
         </p>
       )}
-    </main>
+    </WorkspaceShell>
   );
 }
 
@@ -534,31 +556,35 @@ function buildSaveError(error: string, conflict: boolean): string {
   return conflict ? `${error} ${WORK_DOC_CONFLICT_HINT}` : error;
 }
 
-function NoticeView({ notice }: { notice: Notice }): React.ReactElement {
+function NoticeTextLive({ kind, text }: { kind: 'ok' | 'error'; text: string }): React.ReactElement {
   return (
     <p
-      role={notice.kind === 'error' ? 'alert' : 'status'}
+      role={kind === 'error' ? 'alert' : 'status'}
       aria-live="polite"
-      className={`memory-notice memory-notice-${notice.kind}`}
+      className={
+        kind === 'ok'
+          ? 'm-0 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[0.85rem] text-emerald-900'
+          : 'm-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-[0.85rem] text-red-800'
+      }
     >
-      {notice.text}
+      {text}
     </p>
   );
 }
 
 function WorkDocMeta({ doc }: { doc: WorkDoc }): React.ReactElement {
   return (
-    <div className="memory-card-head">
-      <span className="memory-badge" data-kind={doc.type}>
+    <div className="flex flex-wrap items-baseline gap-2">
+      <Badge variant="secondary" data-kind={doc.type}>
         {doc.type}
-      </span>
-      <span className="memory-badge" data-status={doc.status}>
+      </Badge>
+      <StatusBadge status={doc.status}>
         {doc.status}
-      </span>
-      <span className="memory-badge">v{doc.version}</span>
-      <span className="memory-meta">
+      </StatusBadge>
+      <Badge variant="outline">v{doc.version}</Badge>
+      <span className="text-xs break-all text-muted-foreground">
         scope {doc.scope} · chat {doc.chatId} · created {formatTime(doc.createdAt)} · updated{' '}
-        {formatTime(doc.updatedAt)} · id <span className="memory-mono">{doc.id}</span>
+        {formatTime(doc.updatedAt)} · id <span className="font-mono">{doc.id}</span>
       </span>
     </div>
   );
@@ -574,22 +600,25 @@ function formatTime(value: string): string {
 function LinksView({ links, chatId }: { links: ReadonlyArray<WorkDocLink>; chatId: string }): React.ReactElement {
   if (links.length === 0) return <></>;
   return (
-    <div className="work-links">
-      <h3>Linked records</h3>
-      <ul className="work-history-list">
+    <div className="border-t pt-3">
+      <h3 className="mb-2 text-[0.95rem] font-semibold">Linked records</h3>
+      <ul className="m-0 flex list-none flex-col gap-2.5 p-0">
         {links.map((link) => {
           const target = workDocLinkHref(link, chatId);
           return (
-            <li key={link.id} className="work-history-item">
-              <div className="memory-card-head">
-                <span className="memory-badge">{link.targetType}</span>
+            <li key={link.id} className="rounded-md border bg-muted/50 px-2.5 py-2">
+              <div className="flex flex-wrap items-baseline gap-2">
+                <Badge variant="outline">{link.targetType}</Badge>
                 {target !== null ? (
-                  <a className="work-link" href={target.href}>
+                  <a
+                    className="text-sm font-medium text-primary underline-offset-4 hover:underline"
+                    href={target.href}
+                  >
                     {target.text}
                   </a>
                 ) : (
-                  <span className="memory-meta">
-                    <span className="memory-mono">{link.targetId}</span>
+                  <span className="text-xs break-all text-muted-foreground">
+                    <span className="font-mono">{link.targetId}</span>
                     {link.label !== null && ` — ${link.label}`}
                   </span>
                 )}

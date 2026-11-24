@@ -16,16 +16,24 @@
   "dependencies": {
     "@ai-sdk/react": "^3.0.336",
     "ai": "^6.0.333",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.79.0",
     "next": "^15.5.29",
+    "radix-ui": "^1.8.1",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "react-markdown": "10.1.0",
-    "remark-gfm": "4.0.1"
+    "remark-gfm": "4.0.1",
+    "tailwind-merge": "^3.7.1"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.5",
     "@types/node": "^24.19.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "postcss": "^8.4.31",
+    "tailwindcss": "^4.3.5",
     "tsx": "^4.23.15"
   }
 }

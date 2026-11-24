@@ -1,11 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { Loader2, Send } from 'lucide-react';
 import {
   buildReconnectRequest,
   buildSendRequest,
@@ -52,6 +51,15 @@ import {
   type ActivityItem,
 } from '@/lib/parts';
 import { createSubmissionGate } from '@/lib/submitgate';
+import { AgentAvatar } from '@/components/AgentAvatar';
+import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { MarkdownText } from '@/components/MarkdownText';
+import { agentLabel, chatSuggestions } from '@/lib/workspace';
+import { Button } from '@/components/ui/button';
+import { Label } from '@/components/ui/label';
+import { NativeSelect } from '@/components/ui/native-select';
+import { Textarea } from '@/components/ui/textarea';
+import { cn } from '@/lib/utils';
 import type {
   AskUserToolPart,
   CalculateToolPart,
@@ -139,6 +147,14 @@ export function Chat({
   const [input, setInput] = useState('');
   const [answerDraft, setAnswerDraft] = useState('');
   const [resumeNotice, setResumeNotice] = useState(hasActiveStream);
+  // Focus target so an empty-state suggestion can fill the composer without
+  // auto-sending and hand focus back to the textarea.
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const fillInput = (text: string): void => {
+    setInput(text);
+    inputRef.current?.focus();
+  };
 
   // Synchronous single-flight submission guard. One Enter keypress or Send
   // double-click can invoke submit/submitAnswer twice in the same tick while
@@ -157,6 +173,39 @@ export function Chat({
     // The mount-time auto-resume either streams or finds nothing; either way
     // the one-line notice is only worth showing for the initial attempt.
     if (status !== 'submitted') setResumeNotice(false);
+  }, [status]);
+
+  // Transcript scroll triggers (deliberately simple, no scroll listeners):
+  // 1) on mount, land at the latest turn of a resumed/long chat;
+  // 2) when a send is submitted — the user's own send, or the mount-time
+  //    resume re-attaching — catch up to the growing end.
+  // There is NO continuous auto-scroll while streaming, so the reading
+  // position never moves under the user; the composer and status line stay
+  // visible regardless because the dock is pinned below the transcript.
+  const transcriptRef = useRef<HTMLElement | null>(null);
+
+  const scrollToBottom = (): void => {
+    const element = transcriptRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  };
+
+  // Scroll exactly once when a nonempty transcript FIRST becomes available
+  // for this mounted chat (chatId/remount resets the flag). initialMessages
+  // can arrive after the first mount, and `messages` updates with the ~50 ms
+  // throttle, so the flag makes this both late-safe and cheap: later appends
+  // (streaming) are no-ops and never yank the user's reading position.
+  // Own sends still catch up via the `status === 'submitted'` effect below.
+  const initialScrollDoneRef = useRef(false);
+
+  useEffect(() => {
+    if (!initialScrollDoneRef.current && messages.length > 0) {
+      initialScrollDoneRef.current = true;
+      scrollToBottom();
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    if (status === 'submitted') scrollToBottom();
   }, [status]);
 
   const busy = status === 'submitted' || status === 'streaming';
@@ -215,47 +264,36 @@ export function Chat({
           : 'Ready';
 
   return (
-    <main className="chat-layout">
-      <header className="chat-header">
-        <h1>Workforce Chat</h1>
-        <nav className="chat-nav" aria-label="Workforce pages">
-          <a className="chat-new" href="/memory">
-            Memory
-          </a>
-          <a className="chat-new" href="/schedules">
-            Schedules
-          </a>
-          <a className="chat-new" href={`/work?chatId=${encodeURIComponent(chatId)}&agent=${agent}`}>
-            Work
-          </a>
-          <a
-            className="chat-new"
-            href={`/delegations?chatId=${encodeURIComponent(chatId)}&agent=${agent}`}
-          >
-            Delegations
-          </a>
-          <a className="chat-new" href={buildNewChatUrl(selection)}>
-            New chat
-          </a>
-        </nav>
-      </header>
-
+    <WorkspaceShell
+      variant="chat"
+      active="chat"
+      eyebrow="Agent workspace"
+      title={agentLabel(agent)}
+      newChatHref={buildNewChatUrl(selection)}
+      // Deep links into Work/Delegations keep the old chat-context behavior:
+      // the nav carries this chat id + agent so scoped filtering survives.
+      contextQuery={`chatId=${encodeURIComponent(chatId)}&agent=${agent}`}
+    >
       {hydrationError !== undefined && (
-        <div role="status" className="chat-banner chat-banner-warning">
-          <p>{hydrationError}</p>
-          <p className="chat-muted">
+        <div
+          role="status"
+          className="shrink-0 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900"
+        >
+          <p className="m-0">{hydrationError}</p>
+          <p className="m-0 mt-1 text-[0.85rem] text-amber-800">
             You can still send a message; earlier history reappears once the service is reachable and you refresh.
           </p>
         </div>
       )}
 
-      <section aria-label="Agent and mode" className="chat-controls">
-        <div className="memory-field memory-field-grow">
-          <label htmlFor="chat-agent">Agent</label>
-          <select
+      <section aria-label="Agent and mode" className="mb-1 flex shrink-0 flex-wrap items-center gap-2">
+        <div className="inline-flex min-w-0 items-center gap-2">
+          <AgentAvatar agent={agent} size={22} />
+          <NativeSelect
             id="chat-agent"
             name="chat-agent"
-            className="memory-input"
+            size="sm"
+            className="w-auto max-w-52 rounded-full"
             aria-label="Agent"
             value={agent}
             onChange={(event) => {
@@ -267,204 +305,301 @@ export function Chat({
           >
             {WEB_AGENT_SLUGS.map((slug) => (
               <option key={slug} value={slug}>
-                {slug}
+                {agentLabel(slug)}
               </option>
             ))}
-          </select>
-          <p className="memory-hint">{AGENT_GUIDANCE[agent]}</p>
+          </NativeSelect>
         </div>
-        <fieldset className="chat-mode-fieldset">
-          <legend>Mode for the next reply</legend>
-          <div className="chat-mode-options">
+        <fieldset className="m-0 inline-flex items-center rounded-full border border-input bg-muted p-0.5">
+          <legend className="sr-only">Mode for the next reply</legend>
+          <div className="inline-flex gap-0.5">
             {WEB_AGENT_MODES.map((candidate) => (
-              <span key={candidate} className="chat-mode-option">
+              <span key={candidate} className="inline-flex">
                 <input
                   type="radio"
                   id={`chat-mode-${candidate}`}
                   name="chat-mode"
                   value={candidate}
+                  className="peer sr-only"
                   aria-label={`Mode ${modeLabel(candidate)}`}
                   checked={mode === candidate}
                   onChange={() => {
                     if (mode !== candidate) navigateTo({ agent, mode: candidate });
                   }}
                 />
-                <label htmlFor={`chat-mode-${candidate}`}>{modeLabel(candidate)}</label>
+                <label
+                  htmlFor={`chat-mode-${candidate}`}
+                  className="cursor-pointer rounded-full px-3 py-0.5 text-[0.8rem] font-medium text-muted-foreground transition-colors peer-checked:bg-background peer-checked:font-semibold peer-checked:text-foreground peer-checked:shadow-xs peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
+                >
+                  {modeLabel(candidate)}
+                </label>
               </span>
             ))}
           </div>
-          <p className="memory-hint">{modeGuidance(selection)}</p>
         </fieldset>
+        <details className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground">
+          <summary className="cursor-pointer list-none font-medium whitespace-nowrap">
+            What {agentLabel(agent)} can do
+          </summary>
+          <p className="mt-2 max-w-[60ch] border-t pt-2">{AGENT_GUIDANCE[agent]}</p>
+          <p className="max-w-[60ch] pb-1">{modeGuidance(selection)}</p>
+        </details>
       </section>
 
-      <p aria-live="polite" className="chat-status chat-muted">
-        Chat {chatId} · agent {agent} · {mode === 'plan' ? 'Plan mode' : 'Action mode'}
+      <p
+        aria-live="polite"
+        className="m-0 min-h-5 shrink-0 text-xs text-muted-foreground"
+      >
+        agent {agent} · {mode === 'plan' ? 'Plan mode' : 'Action mode'}
       </p>
 
       {resumeNotice && (
-        <p aria-live="polite" className="chat-status chat-muted">
+        <p
+          aria-live="polite"
+          className="m-0 min-h-5 shrink-0 text-xs text-muted-foreground"
+        >
           Reconnecting to your in-progress reply…
         </p>
       )}
 
-      <section aria-label="Messages" aria-live="polite" className="chat-messages">
-        <ol className="chat-thread">
-          {messages.map((message, messageIndex) => (
-            <li key={message.id} className={`chat-turn chat-turn-${message.role}`}>
-              <span className="chat-role">{message.role === 'user' ? 'You' : 'Assistant'}</span>
-              <div className="chat-parts">
-                {message.role === 'assistant' ? (
-                  // Assistant turns render as separated regions: Response
-                  // (markdown), the pending HITL question top-level, then
-                  // collapsed Thinking and Tool activity. No part renders
-                  // twice and reasoning/tool results never mix into the text.
-                  <AssistantPartsView
-                    parts={message.parts}
-                    holdsPendingAsk={pendingAsk !== null && messageIndex === messages.length - 1}
-                    chatId={chatId}
-                  />
-                ) : (
-                  message.parts.map((part, index) => {
-                    if (part.type !== 'text') return null;
-                    return (
-                      <p key={index} className="chat-text">
-                        {part.text}
-                      </p>
-                    );
-                  })
+      <section
+        aria-label="Messages"
+        aria-live="polite"
+        ref={transcriptRef}
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-4"
+      >
+        {messages.length === 0 ? (
+          <ChatEmptyState agent={agent} onSuggestion={fillInput} />
+        ) : (
+          <ol className="m-0 flex list-none flex-col gap-5 p-0">
+            {messages.map((message, messageIndex) => (
+              <li
+                key={message.id}
+                className={cn(
+                  'min-w-0',
+                  message.role === 'user' && 'flex flex-col items-end',
                 )}
-              </div>
-            </li>
-          ))}
-        </ol>
+              >
+                {message.role === 'assistant' ? (
+                  <div className="mb-1 flex items-center gap-2">
+                    <AgentAvatar agent={agent} size={22} />
+                    <span className="text-[0.7rem] font-semibold tracking-[0.06em] text-muted-foreground uppercase">
+                      Assistant
+                    </span>
+                  </div>
+                ) : (
+                  <span className="mb-1 text-[0.7rem] font-semibold tracking-[0.06em] text-muted-foreground uppercase">
+                    You
+                  </span>
+                )}
+                <div className="min-w-0">
+                  {message.role === 'assistant' ? (
+                    // Assistant turns render as separated regions: Response
+                    // (markdown), the pending HITL question top-level, then
+                    // collapsed Thinking and Tool activity. No part renders
+                    // twice and reasoning/tool results never mix into the text.
+                    <AssistantPartsView
+                      parts={message.parts}
+                      holdsPendingAsk={pendingAsk !== null && messageIndex === messages.length - 1}
+                      chatId={chatId}
+                    />
+                  ) : (
+                    <div className="max-w-[85%] rounded-2xl rounded-br-md border border-user-bubble-border bg-user-bubble px-3.5 py-2 sm:max-w-[32rem]">
+                      {message.parts.map((part, index) => {
+                        if (part.type !== 'text') return null;
+                        return (
+                          <p key={index} className="m-0 wrap-anywhere whitespace-pre-wrap break-words">
+                            {part.text}
+                          </p>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ol>
+        )}
       </section>
 
-      <p aria-live="polite" className={`chat-status chat-status-${status}`}>
+      <p
+        aria-live="polite"
+        className={cn(
+          'm-0 min-h-5 shrink-0 text-xs text-muted-foreground',
+          `chat-status-${status}`,
+        )}
+      >
         {statusText}
       </p>
 
       {error !== undefined && (
-        <div role="alert" className="chat-banner chat-banner-error">
-          <p>{describeChatError(error)}</p>
-          <button type="button" onClick={() => clearError()}>
+        <div
+          role="alert"
+          className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-900"
+        >
+          <p className="m-0">{describeChatError(error)}</p>
+          <Button type="button" variant="outline" size="sm" className="shrink-0 border-red-300 bg-transparent text-red-900 hover:bg-red-100 hover:text-red-900" onClick={() => clearError()}>
             Dismiss
-          </button>
+          </Button>
         </div>
       )}
 
-      {pendingAsk !== null && (
+      <div className="mt-auto flex shrink-0 flex-col gap-2.5 border-t bg-background pt-2.5 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+        {pendingAsk !== null && (
+          <form
+            className="flex flex-col gap-2 rounded-xl border-[1.5px] border-primary bg-card px-3 py-2.5 shadow-sm"
+            onSubmit={(event) => {
+              event.preventDefault();
+              submitAnswer();
+            }}
+          >
+            <Label htmlFor="chat-answer">Your answer to the agent's question</Label>
+            <Textarea
+              id="chat-answer"
+              name="chat-answer"
+              aria-label="Answer to the agent's question"
+              value={answerDraft}
+              onChange={(event) => setAnswerDraft(event.target.value)}
+              onKeyDown={(event) => {
+                // Enter submits the answer; Shift+Enter keeps newlines.
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  submitAnswer();
+                }
+              }}
+              rows={2}
+              placeholder="Type your answer here…"
+              disabled={busy}
+            />
+            {pendingAsk.options.length > 0 && (
+              <div className="flex flex-wrap gap-2" role="group" aria-label="Suggested answers">
+                {pendingAsk.options.map((option) => (
+                  <Button
+                    key={option}
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    aria-label={`Use suggested answer: ${option}`}
+                    onClick={() => setAnswerDraft(option)}
+                    disabled={busy}
+                  >
+                    {option}
+                  </Button>
+                ))}
+              </div>
+            )}
+            <Button type="submit" size="sm" className="self-start" disabled={!canAnswer}>
+              Send answer
+            </Button>
+            <p className="m-0 text-xs text-muted-foreground">
+              The reply is sent as a normal message in this chat; the API records it as the
+              question's answer and the agent continues with it.
+            </p>
+          </form>
+        )}
+
         <form
-          className="chat-composer chat-answer-form"
+          className="flex flex-col gap-2"
           onSubmit={(event) => {
             event.preventDefault();
-            submitAnswer();
+            submit();
           }}
         >
-          <label htmlFor="chat-answer">Your answer to the agent's question</label>
-          <textarea
-            id="chat-answer"
-            name="chat-answer"
-            aria-label="Answer to the agent's question"
-            value={answerDraft}
-            onChange={(event) => setAnswerDraft(event.target.value)}
+          <Label htmlFor="chat-input" className="sr-only">
+            Message
+          </Label>
+          <Textarea
+            id="chat-input"
+            name="chat-input"
+            aria-label="Message"
+            ref={inputRef}
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
             onKeyDown={(event) => {
-              // Enter submits the answer; Shift+Enter keeps newlines.
+              // Enter submits; Shift+Enter keeps the textarea newline behavior.
               if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
-                submitAnswer();
+                submit();
               }
             }}
-            rows={2}
-            placeholder="Type your answer here…"
-            disabled={busy}
-          />
-          {pendingAsk.options.length > 0 && (
-            <div className="chat-answer-options" role="group" aria-label="Suggested answers">
-              {pendingAsk.options.map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  className="memory-button"
-                  aria-label={`Use suggested answer: ${option}`}
-                  onClick={() => setAnswerDraft(option)}
-                  disabled={busy}
-                >
-                  {option}
-                </button>
-              ))}
-            </div>
-          )}
-          <button type="submit" disabled={!canAnswer}>
-            Send answer
-          </button>
-          <p className="memory-hint">
-            The reply is sent as a normal message in this chat; the API records it as the
-            question's answer and the agent continues with it.
-          </p>
-        </form>
-      )}
-
-      <form
-        className="chat-composer"
-        onSubmit={(event) => {
-          event.preventDefault();
-          submit();
-        }}
-      >
-        <label htmlFor="chat-input">Message</label>
-        <textarea
-          id="chat-input"
-          name="chat-input"
-          aria-label="Message"
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => {
-            // Enter submits; Shift+Enter keeps the textarea newline behavior.
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault();
-              submit();
+            rows={3}
+            placeholder={
+              pendingAsk !== null
+                ? "Answer the agent's question in the form above."
+                : 'Ask anything, e.g. What is 21+21?'
             }
-          }}
-          rows={3}
-          placeholder={
-            pendingAsk !== null
-              ? "Answer the agent's question in the form above."
-              : 'Ask anything, e.g. What is 21+21?'
-          }
-          disabled={busy || pendingAsk !== null}
-        />
-        <button type="submit" disabled={!canSend}>
-          Send
-        </button>
-        {pendingAsk !== null && (
-          <p className="memory-hint">
-            Send is paused because the agent asked you a question above — answer it there.
-            The normal message channel resumes as soon as the question is answered.
-          </p>
-        )}
-      </form>
-    </main>
+            disabled={busy || pendingAsk !== null}
+          />
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="m-0 text-[0.75rem] text-muted-foreground">
+              Enter to send · Shift+Enter for a new line
+            </p>
+            <Button type="submit" size="sm" disabled={!canSend}>
+              {busy ? <Loader2 className="animate-spin" aria-hidden="true" /> : <Send aria-hidden="true" />}
+              {busy ? 'Working…' : 'Send'}
+            </Button>
+          </div>
+          {pendingAsk !== null && (
+            <p className="m-0 text-xs text-muted-foreground">
+              Send is paused because the agent asked you a question above — answer it there.
+              The normal message channel resumes as soon as the question is answered.
+            </p>
+          )}
+        </form>
+      </div>
+    </WorkspaceShell>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Empty state: agent-aware welcome + composer-filling suggestions      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Shown only while the transcript is empty. Suggestions are honest per-agent
+ * prompts (see `chatSuggestions`) that FILL the composer — they never send:
+ * creating exactly one turn stays an explicit user action through the submit
+ * gate.
+ */
+function ChatEmptyState({
+  agent,
+  onSuggestion,
+}: {
+  agent: WebAgentSlug;
+  onSuggestion: (text: string) => void;
+}): React.ReactElement {
+  const suggestions = chatSuggestions(agent);
+  return (
+    <div className="my-auto flex flex-col items-center gap-3 px-2 pt-10 pb-6 text-center">
+      <div className="inline-flex rounded-full border bg-card p-1.5 shadow-sm">
+        <AgentAvatar agent={agent} size={38} />
+      </div>
+      <h2 className="m-0 text-[1.4rem] font-semibold tracking-tight">What should we accomplish?</h2>
+      <p className="m-0 max-w-[44ch] text-[0.92rem] text-muted-foreground">{AGENT_GUIDANCE[agent]}</p>
+      <ul className="m-0 mt-2 flex w-full max-w-[26rem] list-none flex-col gap-2 p-0">
+        {suggestions.map((suggestion) => (
+          <li key={suggestion}>
+            <Button
+              type="button"
+              variant="outline"
+              className="h-auto w-full justify-start py-2.5 text-left font-normal text-[0.88rem] hover:border-ring/60 hover:bg-accent"
+              onClick={() => onSuggestion(suggestion)}
+            >
+              {suggestion}
+            </Button>
+          </li>
+        ))}
+      </ul>
+      <p className="m-0 mt-1 text-[0.78rem] text-muted-foreground">
+        A suggestion fills the composer — review it, edit, then send when ready.
+      </p>
+    </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
 /* Assistant message regions (Phase 4 formatting fix)                  */
 /* ------------------------------------------------------------------ */
-
-/**
- * Assistant markdown region: maintained `react-markdown` + `remark-gfm`.
- * Raw HTML is deliberately NOT enabled — there is no rehype-raw and no
- * `dangerouslySetInnerHTML`; the markdown AST renders through React, which
- * escapes all text. Partial streamed markdown renders as plain prose until
- * the syntax closes, so streaming never crashes.
- */
-function MarkdownText({ text, className }: { text: string; className?: string }): React.ReactElement {
-  return (
-    <div className={className}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-    </div>
-  );
-}
 
 /**
  * One assistant turn as regions (from `partitionMessageParts`, pure + tested):
@@ -487,14 +622,14 @@ function AssistantPartsView({
   const summary = activitySummaryLabel(view.activity);
   return (
     <>
-      {view.response !== null && <MarkdownText text={view.response} className="chat-md chat-md-response" />}
+      {view.response !== null && <MarkdownText text={view.response} className="chat-md-response" />}
       {view.pendingAsk !== null && view.pendingAsk.type === 'tool-ask_user' && (
         <AskUserPartView part={view.pendingAsk} />
       )}
       {view.reasoning !== null && (
         <details className="chat-region">
           <summary>Thinking</summary>
-          <MarkdownText text={view.reasoning} className="chat-md chat-md-thinking" />
+          <MarkdownText text={view.reasoning} className="chat-md-thinking" />
         </details>
       )}
       {view.activity.length > 0 && (
