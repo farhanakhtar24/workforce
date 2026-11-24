@@ -1,5 +1,11 @@
 # @workforce/api
 
+Pre-Phase 6 authentication is LIVE in this app: every API surface except
+`GET /health` and `GET /api/auth/*` requires a resolved Better Auth owner
+(browser session cookie, optional `AUTH_EMAIL_ALLOWLIST`, or a server-signed
+internal context on loopback calls). OAuth is Google + GitHub only. See
+**Authentication** below for the env contract + callbacks.
+
 Phase 2 Express API for Workforce: streaming chat over AI SDK v6 UI message
 streams, with Redis-backed resumability (`resumable-stream`) and
 `Idempotency-Key` exactly-once generation. Phase 3 adds the memory domain
@@ -90,6 +96,70 @@ node-redis clients (resumable-stream semantics preserved).
 
 ## Configuration
 
+### Authentication (pre-Phase 6 — required to START the server)
+
+| Variable | Required | Shape |
+| --- | --- | --- |
+| `BETTER_AUTH_SECRET` | REQUIRED | ≥ 16 chars signing secret for Better Auth cookies/tokens |
+| `BETTER_AUTH_URL` | REQUIRED | the API's http(s) ORIGIN, e.g. `http://localhost:3001` |
+| `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` | one complete pair | Google OAuth client (Google Cloud console, authorized JS origin `WEB_ORIGIN`, redirect callback below) |
+| `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET` | one complete pair | GitHub OAuth App (Homepage/`WEB_ORIGIN`, callback below) |
+| `AUTH_EMAIL_ALLOWLIST` | optional | comma-separated emails of ONLY the users allowed to use the app (absent/blank = no allowlist) |
+| `DELEGATION_CONTEXT_SECRET` | REQUIRED for the scheduler worker | shared HMAC secret for internal signed contexts (`X-Workforce-Delegation-Context` / `-Internal-Owner` / `-Internal-Scheduler`) |
+
+The server REFUSES to start without `BETTER_AUTH_SECRET` + `BETTER_AUTH_URL`
+and at least one COMPLETE provider pair — production never falls back to
+unauthenticated access. Values are never logged/echoed; errors name variables
+only.
+
+**OAuth callback URLs Better Auth serves** (register both in the provider):
+
+- Google: `<BETTER_AUTH_URL>/api/auth/callback/google`
+- GitHub: `<BETTER_AUTH_URL>/api/auth/callback/github`
+
+Also set the web origin in both providers to `WEB_ORIGIN` (default
+`http://localhost:3000`) for the authorization redirect. `/health` and
+`GET /api/auth/providers` (`{google: boolean, github: boolean}` — lets the web
+hide unconfigured buttons) are the only public API surfaces.
+
+Per-user data model: chats/messages/active streams/idempotency/chat index are
+namespaced per owner in Redis; work docs, delegations, agent tasks +
+executions carry a nullable `ownerId` (owner-scoped reads, foreign/ownerless
+rows read as fixed 404); memory writes/searches are forced into the owner's
+private scope (`user-<sha256(userId)>` prefix, 48 hex chars). Sessions are
+persistent DB rows (Better Auth `Session` table). Legacy pre-auth Redis keys
+and ownerless rows are structurally unreachable from any authenticated path.
+
+`query_data` (agent SQL reads) is DB-enforced isolated: every run executes
+inside `BEGIN READ ONLY` as the `workforce_query_reader` role (created by the
+forward migration `20261125000100_query_data_rls` — NOLOGIN, NOBYPASSRLS,
+SELECT granted ONLY on the nine non-auth data tables) after
+`SET LOCAL workforce.user_id = '<ownerId>'` and
+`SET LOCAL workforce.memory_scope = '<userMemoryScope(owner)>'` bind the
+RLS policies (`ownerId`/`scope`; Better Auth tables carry no grants and RLS
+is ENABLED, never FORCE, so the application's table-owner connections
+bypass exactly as before). `set_config` is revoked from PUBLIC (re-granted
+only to operators + app principals), so one statement can never re-point the
+policy GUCs; the token screen (set_config/current_setting/multi-statement/
+reads-only lead) stays as belt and braces. Deploy requirement: the API's
+`DATABASE_URL` role must be a member of `workforce_query_reader` (the
+migration grants its own CURRENT_USER and the conventional
+`workforce`/`workforce_api` roles when present; otherwise run
+`GRANT workforce_query_reader TO <api_role>;` once — fail-closed 503s until
+then).
+
+### Cookie deployment requirement (same-site, pre-Phase 6)
+
+Better Auth session cookies MUST be treated as same-site: the web app and the
+API share the deployment's site (same registrable domain, e.g.
+`app.example.com` → `api.example.com`), and `WEB_ORIGIN` + `BETTER_AUTH_URL`
+are set accordingly with HTTPS in production. **No cross-site cookie
+relaxation**: cookies carry the default Lax/strict same-site semantics the
+library sets (never `SameSite=None`), no third-party-cookie deployment is
+supported, and CSRF protection comes from those policies (Plus the single-
+origin CORS with credentials in `src/app.ts`; no wildcard `*`). Local
+development stays same-site too (localhost web + localhost:3001 API).
+
 | Variable | Default | Notes |
 |---|---|---|
 | `OLLAMA_API_KEY` | — | Required only at `src/server.ts` startup (real provider creation). Tests inject a mock model and need no key. Never logged, never returned. |
@@ -121,7 +191,7 @@ Any value already in `process.env` wins over ALL files, including a shell-export
 |---|---|---|
 | `GET` | `/health` | `{ status: "ok" }`, no details. |
 | `POST` | `/api/agents/:slug/chat` | Send the newest user `UIMessage` (exact `{ id, message }` + optional `mode: 'plan' \| 'action'`, default `action`). Slugs: `general` (calculate-only, unchanged), `orchestrator`, `analyst`, `researcher` — the Phase 4 roster requires the agent runtime to be wired (otherwise only `general` is servable, byte-compatible legacy 404s). Depth is resolved ONLY from the verified `X-Workforce-Delegation-Context` header; client body fields like `depth` are rejected (400). |
-| `GET` | `/api/agents/:slug/chat/:clientChatId` | Hydration: `{ messages: UIMessage[], hasActiveStream: boolean }`, `Cache-Control: no-store`. |
+| `GET` | `/api/agents/:slug/chat/:clientChatId` | Hydration: `{ messages: UIMessage[], hasActiveStream: boolean }` (plus `modelId` when the model composition is wired), `Cache-Control: no-store`. |
 | `GET` | `/api/agents/:slug/chat/:clientChatId/stream` | Resume the active stream; `204` when none; full replay otherwise. |
 | `GET` | `/api/chats?limit=N` | Real recent-chat history for the workspace sidebar: `{ chats: [{ chatId, agent: 'general'\|'orchestrator'\|'analyst'\|'researcher', title, preview, messageCount, lastActivityAt }] }` — default 20, max 50 (`limit` clamped; invalid → fixed 400), Redis unavailable → fixed 503, always `Cache-Control: no-store` (client copies it too). Titles/previews are real bounded plain text from stored messages (server-capped, trimmed — no Markdown guarantees); ordering uses the chat index (atomic `RPUSH` + `ZADD` on every persistence with last-activity timestamps, bounded `ZREVRANGE` reads); legacy chats have no indexed timestamp and surface `lastActivityAt: null`. Backfill for pre-index chats uses a bounded legacy `SCAN` (cursor-paged, capped). Real integration coverage: the full real-Redis suite previously passed **37/37**, and after the `zScore` edge fix the targeted real chat-history suite passed **4/4** (one new test added; no full rerun claimed). |
 | `POST` | `/api/agents/orchestrator/delegations` | Create a tracked delegation (`{parentChatId, parentMessageId, target, task, mode}`). Signed internal context required (400 without); child depth `parentDepth+1` — 3+ → 403. Sync waits for the run and returns `201 { delegation, childChatId }`; async enqueues on `workforce-delegation` and returns `202 {…, status:'pending'}`. |
@@ -250,6 +320,12 @@ workforce:phase2:chat:{slug}:{chatId}:active-stream    # active stream id, EX 86
 workforce:phase2:idempotency:{slug}:{chatId}:{key}     # SET NX, EX 900s exactly
 workforce:phase2:stream:*                              # resumable-stream checkpoints (24h)
 ```
+
+(Scopes are owner-qualified in the store: real keys are
+`workforce:phase2:chat:{ownerId}:{slug}:{chatId}:…`; the listing above shows
+the historical layout shape.) Per-chat model selections persist as
+`workforce:phase2:chat:{ownerId}:{slug}:{chatId}:model` (plain string, no
+TTL; read/copied/deleted by GET/BRANCH/DELETE scripts).
 
 Message contents are never logged by default.
 
@@ -421,14 +497,119 @@ npm run typecheck:integration --workspace @workforce/api
 - Post-crash stale producers: resume treats `Timeout waiting for ack` like a
   dead stream — compare-and-delete the (24h-TTL'd) active marker and answer
   204, so the client falls back to hydration.
+- **Zombie legacy repeat-scheduler BullMQ jobs (documented, NON-BLOCKING)**:
+  recurring jobs created BEFORE the per-user model belong to rows that are
+  now invisible (`ownedOnly: true` reconcile excludes legacy ownerless
+  tasks). The startup reconcile never deletes repeatable schedulers it
+  cannot bind a task to — deliberately, so no valid schedule is ever
+  dropped by a bug in this cleanup path. A legacy job that still fires is
+  refused by the run contract (ownerless rows cannot run — the run route
+  answers `SKIPPED`/`ownerless: true` with zero provider calls), so zombies
+  are inert. Manual cleanup of the specific queue entries is an operator
+  task, never an automated deletion.
+
+## Chat mutations (delete / branch / destructive rewind)
+
+- `DELETE /api/agents/:slug/chat/:clientChatId` — owner-scoped destructive
+  delete of one chat's Redis surfaces (messages list, active-stream marker,
+  per-chat **model selection** key `…:model`, plus its message-scoped
+  idempotency keys and the per-owner index member). `200 {deleted:true}`;
+  `409 {error:'Chat has an active generation. Resume or wait.'}` while a
+  generation runs; `404 {error:'Chat not found.'}` for unknown/foreign.
+  Artifacts SURVIVE by contract: WorkDocs, Delegation audit rows,
+  AgentTask/execution history, delegated child chats, other users' data —
+  never deleted, ever.
+- `POST /api/agents/:slug/chat/:clientChatId/branch` body `{messageId,
+  newChatId}` — copies RAW messages through the selected message inclusive
+  into a NEW chat in the SAME owner+slug (byte-identical storage entries, no
+  re-serialization, no provider call, no source mutation — active-stream
+  marker included). The source's per-chat model selection is copied into the
+  destination ATOMICALLY in the same Lua script (`GET …:model` src → `SET`
+  dest). `201 {branched:true,destinationChatId,copiedMessages}`;
+  `404 Message not found./Chat not found.`; `409 Destination chat already
+  exists.`; `400` unsafe ids/body.
+- `POST /api/agents/:slug/chat/:clientChatId/rewind` body `{messageId}` —
+  DESTRUCTIVE: keeps messages through the selection inclusive, atomically
+  LTRIMs the later tail with a byte-exact CAS against concurrent appends
+  (list length + tail entry + first-removed entry; bounded retries →
+  `409 Chat changed during rewind. Retry.`), re-scores the index honestly,
+  and deletes the idempotency keys of the REMOVED user messages (kept keys
+  untouched — a reused prompt needs a NEW message id). The per-chat model
+  selection is PRESERVED by rewind (it rewinds messages only). `200
+  {rewound:true,kept,removed,hasActiveStream:false}`; `409` while active.
+  This is the DOCUMENTED EXCEPTION to append-only: the ONLY operation that
+  removes stored message entries, and it removes ONLY a tail (kept entries'
+  raw bytes are never re-touched; LTRIM, no cjson).
+- Web contract: no special events from the API — the web app dispatches
+  `workforce:chats-changed` after successful delete/branch/rewind (its
+  existing sidebar-refresh channel).
+
+## Model catalog + per-chat model selection (pre-Phase 6)
+
+The server proxies the Ollama cloud catalog (`ollama.com`) — the API key
+never leaves the server and no account-level data (spend, balances) is
+exposed. All routes are authenticated (owner gate) with `Cache-Control:
+no-store`.
+
+- `GET /api/models` — `200 {models:[{id,name,modifiedAt,capabilities,
+  parameterSize,locked,lockReason}], defaultModelId}`. Rows are bounded
+  (unusable upstream entries are skipped); `locked` is `true` when the id
+  matches `WORKFORCE_BLOCKED_MODEL_PREFIXES` (case-insensitive prefix),
+  `lockReason` is the fixed value-free string. `503 {"error":"Model catalog
+  is temporarily unavailable."}` on upstream/timeout failure. 60s server
+  cache; bounded upstream timeout.
+- `GET /api/models/:modelId/details` — proxies `POST /api/show` upstream.
+  Valid ids match `^[A-Za-z0-9._:-]{1,80}$` (else fixed 400 `Invalid model
+  id.`). Unknown model → 404 `Model not found.` `200 {modelId, contextLength,
+  capabilities, parameterSize, thinking, pricing}` — `contextLength` is taken
+  ONLY from an actual `model_info` `*.context_length` field (`null` otherwise,
+  never guessed from architecture names); unknown stats are `null`. `pricing`
+  is the ADDITIVE picker extension `null | {inputUsdPerMillion,
+  outputUsdPerMillion}` — present ONLY when the explicit
+  `OLLAMA_MODEL_PRICING_JSON` carries rates for that exact model id
+  (absent/partial/invalid → `null`; a legitimate `0` rate stays `0`; raw
+  config JSON and account data are never exposed). 6h cache
+  per model id; upstream calls bounded (semaphore, concurrency 4).
+- `GET /api/agents/:slug/chat/:clientChatId/model` — `200 {modelId}`: the
+  chat's stored selection or the configured default.
+- `PUT /api/agents/:slug/chat/:clientChatId/model` body exactly
+  `{modelId}` — validated id pattern (400), blocked policy (fixed 400 with
+  the lock reason), catalog presence via the CACHED-FRESH catalog (absent →
+  400 `Model is not available.`), store write; catalog failure → fixed 503.
+  Applies to the NEXT generation (running streams keep their started model).
+- `GET /api/agents/:slug/chat/:clientChatId/usage` — exact per-chat token
+  accounting over the transcript: `200 {inputTokens, outputTokens,
+  totalTokens, models:[{modelId, inputTokens, outputTokens, totalTokens,
+  messages}], estimatedCostUsd, costReason}`. Only valid assistant
+  `metadata.usage` blocks count (bounded ints; the per-message total falls
+  back to `input+output` when absent). Buckets key on `metadata.modelId`
+  (persisted on every assistant finish); pre-provenance messages bucket as
+  `(unattributed)`. `estimatedCostUsd` is computed ONLY when the explicitly
+  configured `OLLAMA_MODEL_PRICING_JSON` prices EVERY used model (per-million
+  `{input,output}`; rounded to 6 decimals) — otherwise `null` with a stable
+  reason: `pricing_not_configured` (no pricing configured) or `partial`
+  (pricing exists but at least one used model lacks rates). Prices are never
+  invented; there is NO account-spend endpoint.
+- Generation behavior: every chat generation resolves `stored selection ??
+  configured default`, revalidates the blocked policy BEFORE any durable work
+  (fixed 400 `Model is not allowed.`), runs through a per-chat model client
+  (LRU-cached factory, `includeUsage` so the provider reports usage), and
+  persists `metadata.modelId` next to usage on the assistant finish.
+  Delegated CHILD chats inherit the parent chat's selection at claim time
+  (best-effort copy; fallback = default). Scheduler chats use the default;
+  the compaction model stays pinned to the configured default.
+- Chat lifecycle: branch copies the model, delete removes it, rewind keeps
+  it (see the mutations section above).
 
 ## Live integration suites (opt-in, no Ollama, no API key)
 
 ### 1. Real memory pipeline — `npm run test:integration` (workspace: `apps/api`)
 
-`test-live/*` runs three real-stack suites — the root runner totals **23 tests**
-(3 Phase 2 Redis streaming + 11 memory + 9 Phase 4), passed twice with exact
-per-run cleanup:
+Historical record (unchanged): the suite first ran as **23 tests** (3 Phase 2
+Redis streaming + 11 memory + 9 Phase 4), passed twice with exact per-run
+cleanup. Current dated entry (2026-11-24, pre-Phase-6 sprint): the root runner
+totals **54 tests / 54 passed** across the suites below, including the newer
+`chat-history`, `chat-mutations` and `personal-memory` suites:
 
 - `redis-stream.test.ts` — the Phase 2 chat/resume stack over real Redis.
 - `memory.test.ts` — the Phase 3 pipeline: real Prisma + pgvector Postgres,
@@ -521,3 +702,20 @@ Live steps: `npm run dev:infra` → put `OLLAMA_API_KEY` in `.env` (optional exp
 "include superseded" on, inspect the summary and its 30 sources, then run the
 basic create/search/correction checks. See the root README for the same
 walkthrough.
+
+## Settings — personal memory (pre-Phase 6, authenticated)
+
+Contract source of truth: `apps/api/src/settings/routes.ts` + `settings/settings.ts`
+(mounted in `src/app.ts` as `GET/PATCH /api/settings`; the owner is resolved by
+the app-wide `requireOwner` gate and NEVER accepted from the body).
+
+| Call | Route | Notes |
+|---|---|---|
+| Read | `GET /api/settings` | `{ settings: { personalMemoryEnabled: boolean } }` — `no-store`; an absent `UserSettings` row is the safe opt-OUT default (`false`). |
+| Toggle | `PATCH /api/settings` | Strict `{ personalMemoryEnabled: boolean }` (415 without JSON content type; 400 `Settings must be exactly { personalMemoryEnabled: boolean }.`). 200 answers the same nested shape with the persisted value. Store failures → fixed 503 `User settings are temporarily unavailable.` |
+
+Semantics (recording the product contract): opting in lets the workspace capture
+durable observations from COMPLETED turns going forward — nothing is imported
+retroactively; up to 3 relevant memories may later surface as untrusted context.
+Values are never echoed to other users, and this endpoint carries no account
+spend/shared-key data.

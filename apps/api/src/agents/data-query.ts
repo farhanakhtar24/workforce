@@ -1,19 +1,27 @@
 /**
- * `query_data` backend (Phase 4): one read-only SELECT/WITH statement over the
- * project Postgres, wrapped with a row cap and a statement timeout.
+ * `query_data` backend (Phase 4 + pre-Phase 6 DB-enforced isolation): one
+ * read-only SELECT/WITH statement over the project Postgres, wrapped with a
+ * row cap and a statement timeout, executed as the restricted
+ * `workforce_query_reader` role with the owner-bound RLS policies.
  *
- * Layers (demonstration-grade screening per the phase doc — NOT a production
- * SQL firewall; the READ ONLY transaction is the hard backstop):
+ * Layers (in order):
  * 1. `screenSql` (pure): strips comments, requires exactly one statement whose
  *    leading keyword is SELECT or WITH, rejects semicolons, blank SQL, and
  *    mutation keywords anywhere (data-modifying CTEs `WITH x AS (DELETE …)`
  *    included; string literals with those words are also rejected — accepted
- *    false positives, safer wrong side).
+ *    false positives, safer wrong side) plus the session-state function
+ *    tokens (set_config/current_setting/advisory/…), so no statement can
+ *    ever change its role or re-point the RLS policy GUCs.
  * 2. `wrapForRowCap` (pure): `SELECT * FROM ( <sql> ) AS __workforce_rows
  *    LIMIT <cap + 1>` — cap + 1 rows means over-cap → fixed 400, never silent
  *    truncation.
  * 3. Execution: one connection from the injected pool, `BEGIN READ ONLY`,
- *    `SET LOCAL statement_timeout = <ms>`, the wrapped statement, `COMMIT`.
+ *    `SET LOCAL statement_timeout = <ms>`, `SET LOCAL workforce.user_id` +
+ *    `SET LOCAL workforce.memory_scope` (charset-validated owner context
+ *    from the RESOLVED request identity — the DB-enforced isolation of the
+ *    `20261125000100_query_data_rls` migration), `SET LOCAL ROLE
+ *    workforce_query_reader`, the wrapped statement, `COMMIT`. All
+ *    transaction-local state reverts at the end; `DISCARD ALL` always runs.
  *
  * Errors: fixed safe messages only — SQL text, Postgres errors, connection
  * URLs and secrets never appear in any thrown message or log.
@@ -246,6 +254,43 @@ interface QueryOutcome {
   readonly rowCount?: number;
 }
 
+/**
+ * The authenticated owner context bound into the query transaction:
+ * `workforce.user_id` (RLS `ownerId` policies) and `workforce.memory_scope`
+ * (RLS `scope` policies). NEVER accepted from SQL, body, or query strings —
+ * only from the RESOLVED auth owner at the route/token boundary.
+ */
+export interface DataQueryOwner {
+  /** Better Auth `User.id` (ownerId policy binding). */
+  readonly ownerId: string;
+  /** `userMemoryScope(ownerId)` (memory block scope policy binding). */
+  readonly memoryScope: string;
+}
+
+/** Owner id shape (Better Auth `User.id`): no quotes/semicolons/GUC tricks. */
+const DATA_QUERY_OWNER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+/** Memory scope shape (`userMemoryScope` output charset). */
+const DATA_QUERY_MEMORY_SCOPE_PATTERN = /^[a-z0-9_-]{1,64}$/;
+
+/**
+ * Validates the shapes: the values are interpolated into `SET LOCAL`
+ * (Postgres cannot parameterize SET), so the charset guarantee IS the
+ * injection firewall on top of the RLS boundary itself.
+ */
+function validateQueryOwner(owner: DataQueryOwner | undefined): DataQueryOwner {
+  if (owner === undefined || owner === null) {
+    // Fail-closed: an unauthenticated context never reaches the database.
+    throw new DataQueryError('invalid', 'owner context');
+  }
+  if (typeof owner.ownerId !== 'string' || !DATA_QUERY_OWNER_ID_PATTERN.test(owner.ownerId)) {
+    throw new DataQueryError('invalid', 'owner id');
+  }
+  if (typeof owner.memoryScope !== 'string' || !DATA_QUERY_MEMORY_SCOPE_PATTERN.test(owner.memoryScope)) {
+    throw new DataQueryError('invalid', 'memory scope');
+  }
+  return owner;
+}
+
 export class DataQueryService {
   private readonly pool: QueryPoolLike;
   private readonly statementTimeoutMs: number;
@@ -262,18 +307,31 @@ export class DataQueryService {
 
   /**
    * Runs ONE screened statement in a READ ONLY transaction with a statement
-   * timeout. `limit` (user-supplied, bounded by the cap) truncates the returned
-   * rows client-side after the cap+1 fetch and reports `truncated`.
+   * timeout AND the DB-enforced isolation boundary: the authenticated owner
+   * context binds the RLS policies, the statement then executes under
+   * `SET LOCAL ROLE workforce_query_reader` (NOLOGIN role, NOBYPASSRLS, and
+   * — per migration `20261125000100_query_data_rls` — SELECT-only on the
+   * nine data tables with RLS policies that bind `ownerId`/`scope` to the
+   * transaction GUCs; the Better Auth tables carry no grants at all).
+   * `limit` (user-supplied, bounded by the cap) truncates the returned rows
+   * client-side after the cap+1 fetch and reports `truncated`. `SELECT 1`
+   * keeps working under the same role (it touches no tables).
+   *
+   * The owner context is REQUIRED (fail-closed): an unauthenticated caller
+   * never reaches the database, and the context is only ever passed from
+   * the resolved request owner — never from SQL, body, or query strings.
    *
    * Pool hygiene (B1): on EVERY non-committed failure the transaction is
    * rolled back best-effort and the session is reset with `DISCARD ALL`
    * before the client is released — an aborted transaction never poisons a
-   * pooled connection for the next tenant of that client.
+   * pooled connection for the next tenant of that client. All role/GUC/
+   * timeout state is `SET LOCAL` and reverts at transaction end anyway.
    */
-  async query(rawSql: string, limit?: number): Promise<DataQueryResult> {
+  async query(rawSql: string, limit?: number, owner?: DataQueryOwner): Promise<DataQueryResult> {
     if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > this.rowCap)) {
       throw new DataQueryError('invalid', 'limit');
     }
+    const ownerContext = validateQueryOwner(owner);
     const screen = screenSql(rawSql);
     if (!screen.ok) {
       throw new DataQueryError('invalid', screen.reason);
@@ -287,7 +345,7 @@ export class DataQueryService {
       throw new DataQueryError('unavailable', 'connect');
     }
     try {
-      const result = await this.runInTransaction(client, wrapped);
+      const result = await this.runInTransaction(client, wrapped, ownerContext);
       const rows: unknown[][] = (result.rows as unknown[]).map((row) =>
         Array.isArray(row) ? row : Object.values(row as Record<string, unknown>),
       );
@@ -316,14 +374,22 @@ export class DataQueryService {
     }
   }
 
-  private async runInTransaction(client: QueryClientLike, wrapped: string): Promise<QueryOutcome> {
+  private async runInTransaction(client: QueryClientLike, wrapped: string, owner: DataQueryOwner): Promise<QueryOutcome> {
     let began = false;
     try {
       await client.query('BEGIN READ ONLY');
       began = true;
-      // SET LOCAL is transaction-scoped and cannot be parameterized; the only
-      // interpolation is an integer validated at config load.
+      // `SET LOCAL` is transaction-scoped and cannot be parameterized; the
+      // only interpolations are the integer (validated at config load) and
+      // the owner/scope strings (charset-validated above) — on top of the
+      // RLS boundary, never instead of it.
       await client.query(`SET LOCAL statement_timeout = ${String(this.statementTimeoutMs)}`);
+      await client.query(`SET LOCAL workforce.user_id = '${owner.ownerId}'`);
+      await client.query(`SET LOCAL workforce.memory_scope = '${owner.memoryScope}'`);
+      // The user statement runs as the restricted reader role: NOLOGIN (can
+      // never be a session identity), NOBYPASSRLS, and per the migration
+      // holding SELECT ONLY on the policy-bound data tables.
+      await client.query('SET LOCAL ROLE workforce_query_reader');
       const result = await client.query(wrapped);
       const rowCount = Array.isArray(result.rows) ? result.rows.length : 0;
       if (rowCount > this.rowCap) {
@@ -336,7 +402,8 @@ export class DataQueryService {
     } catch (error: unknown) {
       if (began) {
         // Best-effort ROLLBACK before the release: an aborted or half-open
-        // transaction must not poison the pooled client (B1).
+        // transaction must not poison the pooled client (B1). `SET LOCAL
+        // ROLE` reverts with the transaction end in every case.
         try {
           await client.query('ROLLBACK');
         } catch {
@@ -353,6 +420,9 @@ export class DataQueryService {
       if (code === PG_READ_ONLY_TRANSACTION) {
         throw new DataQueryError('read_only', 'read only');
       }
+      // A missing/ungranted query role or denied privileges (e.g. the RLS
+      // migration has not been applied, or membership is missing) maps to
+      // the same honest 503: fail-closed, never a weaker fallback path.
       throw new DataQueryError('unavailable', 'query failed');
     }
   }

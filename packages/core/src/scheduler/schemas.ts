@@ -24,6 +24,9 @@
  *   honored when NO recurrence field changes (recurrence updates always
  *   recompute).
  * - ids: RFC 9562 UUIDs; `queueJobId`/`repeatJobKey`: trimmed 1..128 chars.
+ * - `ownerId`/`expectedOwnerId` (platform-user owner, Better Auth `User.id`):
+ *   trimmed 1..128 chars, optional everywhere. Owner guard mismatches read as
+ *   404; owner filters match EXACTLY and never return ownerless/other rows.
  * - `limit`: integer 1..100 (lists), defaults 20.
  * - `attempt` (claim): integer 1..3 (`maxAttempts` is fixed at 3).
  * - `durationMs`: integer 0..2147483647; `tokenUsage` fields: integer
@@ -65,6 +68,13 @@ export const schedulerExternalIdSchema = z
   .trim()
   .min(1, 'external id must not be empty')
   .max(AGENT_TASK_MAX_QUEUE_ID_LENGTH, `external id must be at most ${AGENT_TASK_MAX_QUEUE_ID_LENGTH} characters`);
+
+/**
+ * Platform-user owner id (Better Auth `User.id`, TEXT — NOT a UUID): trimmed,
+ * 1..128 characters. Legacy ownerless rows carry `null`; owner filters match
+ * EXACTLY (an expected owner never matches ownerless rows).
+ */
+export const schedulerOwnerIdSchema = schedulerExternalIdSchema;
 
 export const agentTaskNameSchema = z
   .string()
@@ -214,6 +224,12 @@ export const createTaskInputSchema = z
     skipDates: skipDatesSchema.optional().default([]),
     /** Only UTC is supported. */
     timezone: agentTaskTimezoneSchema.optional().default(AGENT_TASK_TIMEZONE),
+    /**
+     * Optional platform-user owner id (legacy callers omit it; the task is
+     * then ownerless). The authenticated API layer MUST always pass the
+     * acting user.
+     */
+    ownerId: schedulerOwnerIdSchema.optional(),
     afterAsOf: afterAsOfSchema.optional(),
   })
   .refine((value) => recurrenceConfigMatchesType(value.recurrenceType, value.recurrenceConfig), {
@@ -242,6 +258,12 @@ export const updateTaskInputSchema = z
     skipDates: skipDatesSchema.optional(),
     nextRunAt: z.iso.datetime().nullable().optional(),
     afterAsOf: afterAsOfSchema.optional(),
+    /**
+     * Owner guard (NOT a mutable field — excluded from the no-op refine):
+     * when set, the task must belong EXACTLY to this user or the update
+     * reads as 404 (ownerless legacy rows never match).
+     */
+    expectedOwnerId: schedulerOwnerIdSchema.optional(),
   })
   .refine(
     (value) =>
@@ -272,9 +294,27 @@ export const updateTaskInputSchema = z
 export const setTaskActiveInputSchema = z.strictObject({
   id: schedulerIdSchema,
   isActive: z.boolean(),
+  /**
+   * Owner guard: when set, the task must belong EXACTLY to this user
+   * (ownerless legacy rows never match) or the write reads as 404.
+   */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const listTasksInputSchema = z.strictObject({
+  /**
+   * Owner filter: EXACT match only. When set, ownerless legacy tasks and
+   * other users' tasks are never returned (prevents unbounded global reads).
+   */
+  ownerId: schedulerOwnerIdSchema.optional(),
+  /**
+   * Owner-required selector (startup reconciliation): when true, ONLY tasks
+   * with `ownerId != null` match — legacy ownerless tasks are excluded even
+   * when no exact `ownerId` is supplied.
+   */
+  ownedOnly: z.boolean().optional(),
+  /** Active filter (`isActive`); undefined leaves all tasks visible. */
+  isActive: z.boolean().optional(),
   order: z.enum(['newest', 'oldest']).optional().default('newest'),
   limit: z
     .number()
@@ -298,6 +338,12 @@ export const createExecutionInputSchema = z.strictObject({
   queueJobId: schedulerExternalIdSchema.optional(),
   repeatJobKey: schedulerExternalIdSchema.optional(),
   retryOfExecutionId: schedulerIdSchema.optional(),
+  /**
+   * Optional explicit platform-user owner id. When omitted, the execution
+   * INHERITS the owning task's `ownerId` (ownerless legacy tasks produce
+   * ownerless executions).
+   */
+  ownerId: schedulerOwnerIdSchema.optional(),
 });
 
 /** CAS claim: only PENDING|RETRYING may be claimed; attempt must increment. */
@@ -305,6 +351,12 @@ export const claimExecutionInputSchema = z.strictObject({
   id: schedulerIdSchema,
   attempt: z.number().int().min(1).max(MAX_TASK_ATTEMPTS),
   allowedFrom: z.enum(['PENDING', 'RETRYING']),
+  /**
+   * Owner guard: when set, the execution must belong EXACTLY to this user
+   * (ownerless legacy rows never match) or the claim reads as 404 BEFORE the
+   * CAS — a wrong owner is never a status/attempt oracle.
+   */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const agentTaskExecutionTokenUsageSchema = z
@@ -319,12 +371,16 @@ export const agentTaskExecutionTokenUsageSchema = z
 
 export const markExecutionRetryingInputSchema = z.strictObject({
   id: schedulerIdSchema,
+  /** Owner guard; see {@link claimExecutionInputSchema}. */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const markExecutionCompletedInputSchema = z.strictObject({
   id: schedulerIdSchema,
   durationMs: z.number().int().min(0).max(MAX_DURATION_MS),
   tokenUsage: agentTaskExecutionTokenUsageSchema.optional(),
+  /** Owner guard; see {@link claimExecutionInputSchema}. */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const markExecutionFailedInputSchema = z.strictObject({
@@ -334,6 +390,8 @@ export const markExecutionFailedInputSchema = z.strictObject({
     .trim()
     .min(1, 'error must not be empty')
     .max(AGENT_TASK_EXECUTION_MAX_ERROR_LENGTH, `error must be at most ${AGENT_TASK_EXECUTION_MAX_ERROR_LENGTH} characters`),
+  /** Owner guard; see {@link claimExecutionInputSchema}. */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const markExecutionDeadLetterInputSchema = z.strictObject({
@@ -343,15 +401,24 @@ export const markExecutionDeadLetterInputSchema = z.strictObject({
     .trim()
     .min(1, 'error must not be empty')
     .max(AGENT_TASK_EXECUTION_MAX_ERROR_LENGTH, `error must be at most ${AGENT_TASK_EXECUTION_MAX_ERROR_LENGTH} characters`),
+  /** Owner guard; see {@link claimExecutionInputSchema}. */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const markExecutionSkippedInputSchema = z.strictObject({
   id: schedulerIdSchema,
+  /** Owner guard; see {@link claimExecutionInputSchema}. */
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 export const listExecutionsInputSchema = z.strictObject({
   taskId: schedulerIdSchema.optional(),
   status: agentTaskExecutionStatusSchema.optional(),
+  /**
+   * Owner filter: EXACT match only. When set, ownerless legacy executions and
+   * other users' executions are never returned (prevents unbounded reads).
+   */
+  ownerId: schedulerOwnerIdSchema.optional(),
   order: z.enum(['newest', 'oldest']).optional().default('newest'),
   limit: z
     .number()
@@ -360,6 +427,14 @@ export const listExecutionsInputSchema = z.strictObject({
     .max(SCHEDULER_LIST_LIMIT_MAX)
     .optional()
     .default(SCHEDULER_LIST_LIMIT_DEFAULT),
+});
+
+/**
+ * Read options for `getTask`/`getExecution`: the owner guard reads a foreign
+ * or ownerless row as absent (`null`) — never an existence oracle.
+ */
+export const schedulerReadOptionsSchema = z.strictObject({
+  expectedOwnerId: schedulerOwnerIdSchema.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -398,6 +473,11 @@ export type ParsedMarkExecutionFailedInput = z.output<typeof markExecutionFailed
 export type ParsedMarkExecutionDeadLetterInput = z.output<typeof markExecutionDeadLetterInputSchema>;
 export type ParsedMarkExecutionSkippedInput = z.output<typeof markExecutionSkippedInputSchema>;
 export type ParsedListExecutionsInput = z.output<typeof listExecutionsInputSchema>;
+// NOTE: the SchedulerReadOptions interface lives in `./store.js` (the store
+// contract); the parsed `schedulerReadOptionsSchema` output is structurally
+// assignable to it, so the service parses with the schema and passes it
+// through.
+export type ParsedSchedulerReadOptions = z.output<typeof schedulerReadOptionsSchema>;
 
 /**
  * Parse route/service input against `schema`, converting Zod errors into the

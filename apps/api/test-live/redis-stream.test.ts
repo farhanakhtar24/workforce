@@ -40,6 +40,8 @@ const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379';
 const RUN_ID = `${process.pid}-${Date.now().toString(36)}`;
 const STREAM_KEY_PREFIX = `workforce:phase2:stream-live-test:${RUN_ID}`;
 const SLUG = 'general';
+/** One fixed live-test owner: all key shapes are owner-scoped (pre-Phase 6). */
+const OWNER_ID = `owner-${process.pid}-live`;
 const CHAT_ID = `live-chat-${RUN_ID}`;
 const USER_MESSAGE_ID = 'm-live-1';
 const IDEMPOTENCY_KEY = `${CHAT_ID}:${USER_MESSAGE_ID}`;
@@ -55,7 +57,7 @@ interface LiveStack {
   server: Server;
   port: number;
   background: BackgroundTaskTracker;
-  chatRef: { slug: string; chatId: string };
+  chatRef: { ownerId: string; slug: string; chatId: string };
   /** Registers one more exact Redis key to delete on close (never a SCAN). */
   ownKey(key: string): string;
   /** Closes the server, drains background work, deletes owned keys, quits clients. */
@@ -81,13 +83,13 @@ async function waitFor(
 }
 
 function messagesKey(chatId: string): string {
-  return `${REDIS_KEY_PREFIX}:chat:${SLUG}:${chatId}:messages`;
+  return `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${chatId}:messages`;
 }
 function activeStreamKey(chatId: string): string {
-  return `${REDIS_KEY_PREFIX}:chat:${SLUG}:${chatId}:active-stream`;
+  return `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${chatId}:active-stream`;
 }
 function idempotencyKey(chatId: string, key: string): string {
-  return `${REDIS_KEY_PREFIX}:idempotency:${SLUG}:${chatId}:${key}`;
+  return `${REDIS_KEY_PREFIX}:idempotency:${OWNER_ID}:${SLUG}:${chatId}:${key}`;
 }
 
 /**
@@ -146,7 +148,16 @@ async function createLiveStack(model: LanguageModel): Promise<LiveStack> {
     keyPrefix: STREAM_KEY_PREFIX,
   });
   const config = loadApiConfig({ OLLAMA_API_KEY: 'test-only-not-a-real-key', PORT: '3001', REDIS_URL });
-  const app = buildApp({ config, store, streamContext, model, background });
+  // Test-only owner injection (never a production bypass): every gated route
+  // in this suite acts as the SAME per-run owner the Redis keys use.
+  const app = buildApp({
+    config,
+    store,
+    streamContext,
+    model,
+    background,
+    auth: { staticOwner: { userId: OWNER_ID, email: 'live-redis-stream@example.com', emailVerified: true } },
+  });
   const server = app.listen(0);
   await new Promise<void>((resolve, reject) => {
     server.once('listening', () => resolve());
@@ -177,7 +188,7 @@ async function createLiveStack(model: LanguageModel): Promise<LiveStack> {
     server,
     port: address.port,
     background,
-    chatRef: { slug: SLUG, chatId: CHAT_ID },
+    chatRef: { ownerId: OWNER_ID, slug: SLUG, chatId: CHAT_ID },
     ownKey,
     async close() {
       await new Promise<void>((resolve, reject) => {
@@ -424,7 +435,7 @@ test('live: direct resumable-stream replay through the real adapter and Redis pu
 test('live: real Redis store primitives — idempotency, marker TTL, compare-and-delete', { timeout: 10_000 }, async () => {
   const stack = await createLiveStack(null as unknown as LanguageModel);
   try {
-    const chat = { slug: SLUG, chatId: `${CHAT_ID}-prims` };
+    const chat = { ownerId: OWNER_ID, slug: SLUG, chatId: `${CHAT_ID}-prims` };
     stack.ownKey(messagesKey(chat.chatId));
     stack.ownKey(activeStreamKey(chat.chatId));
     stack.ownKey(idempotencyKey(chat.chatId, 'k'));

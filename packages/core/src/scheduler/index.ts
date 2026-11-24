@@ -95,6 +95,8 @@ export {
   parseSchedulerInput,
   schedulerIdSchema,
   schedulerExternalIdSchema,
+  schedulerOwnerIdSchema,
+  schedulerReadOptionsSchema,
   type CreateTaskInput,
   type UpdateTaskInput,
   type SetTaskActiveInput,
@@ -124,6 +126,7 @@ export {
   type ParsedMarkExecutionDeadLetterInput,
   type ParsedMarkExecutionSkippedInput,
   type ParsedListExecutionsInput,
+  type ParsedSchedulerReadOptions,
 } from './schemas.js';
 
 export type {
@@ -137,6 +140,7 @@ export type {
   SchedulerStoreExecutionClaim,
   SchedulerStoreExecutionMark,
   SchedulerMarkTarget,
+  SchedulerReadOptions,
 } from './store.js';
 export { schedulerMarkTargets } from './store.js';
 
@@ -160,6 +164,9 @@ export {
   assertExecutionRowShape,
   notFound,
   assertCondition,
+  validateOwnerId,
+  validateReadOptions,
+  enforceRowOwner,
   type ValidatedTaskCreate,
   type ValidatedTaskUpdate,
   type ValidatedExecutionCreate,

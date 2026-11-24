@@ -34,9 +34,11 @@ import {
   listWorkDocRevisionsInputSchema,
   addWorkDocLinkInputSchema,
   parseWorkDocInput,
+  workDocGetOptionsSchema,
   workDocIdSchema,
   type ParsedWorkDocAddLinkInput,
   type ParsedWorkDocCreateInput,
+  type ParsedWorkDocGetOptions,
   type ParsedWorkDocListInput,
   type ParsedWorkDocListRevisionsInput,
   type ParsedWorkDocListVersionsInput,
@@ -50,6 +52,7 @@ import {
   type WorkDocRollbackInput,
   type WorkDocUpdateInput,
 } from './schemas.js';
+import type { WorkDocGetOptions } from './store.js';
 import type {
   WorkDocHistoryListOptions,
   WorkDocStore,
@@ -86,15 +89,22 @@ export class WorkDocService {
       title: parsed.title,
       content: parsed.content,
       status: parsed.status,
+      ownerId: parsed.ownerId ?? null,
     });
   }
 
-  async get(id: string): Promise<WorkDoc | null> {
+  /**
+   * Read one document, or null when absent. With `options.expectedOwnerId`
+   * (the owner guard authenticated API callers MUST supply), a foreign or
+   * ownerless row also reads as null — never an existence oracle.
+   */
+  async get(id: string, options?: WorkDocGetOptions): Promise<WorkDoc | null> {
     const parsedId = parseWorkDocInput(workDocIdSchema, id);
-    return this.store.get(parsedId);
+    const parsedOptions: ParsedWorkDocGetOptions = parseWorkDocInput(workDocGetOptionsSchema, options ?? {});
+    return this.store.get(parsedId, parsedOptions);
   }
 
-  /** Bounded deterministic listing filtered by scope/chat/type/status. */
+  /** Bounded deterministic listing filtered by scope/chat/type/status/owner. */
   async list(input: WorkDocListInput): Promise<readonly WorkDoc[]> {
     const parsed: ParsedWorkDocListInput = parseWorkDocInput(listWorkDocsInputSchema, input);
     return this.store.list({
@@ -102,6 +112,7 @@ export class WorkDocService {
       chatId: parsed.chatId,
       type: parsed.type,
       status: parsed.status,
+      ownerId: parsed.ownerId ?? null,
       order: parsed.order,
       limit: parsed.limit,
     });
@@ -110,8 +121,9 @@ export class WorkDocService {
   /**
    * CAS update: bumps the version, appends the snapshot and audit revision.
    * `source` is required; `summary` defaults to `updated doc`. Optional
-   * `expectedScope`/`expectedChatId` enforce chat ownership; a mismatch is a
-   * typed 404, never a cross-scope existence oracle.
+   * `expectedScope`/`expectedChatId`/`expectedOwnerId` enforce ownership; a
+   * mismatch is a typed 404, never a cross-tenant existence oracle. The
+   * authenticated API layer MUST always pass `expectedOwnerId`.
    */
   async update(input: WorkDocUpdateInput): Promise<WorkDoc> {
     const parsed: ParsedWorkDocUpdateInput = parseWorkDocInput(updateWorkDocInputSchema, input);
@@ -126,12 +138,14 @@ export class WorkDocService {
       summary: parsed.summary,
       expectedScope: parsed.expectedScope,
       expectedChatId: parsed.expectedChatId,
+      expectedOwnerId: parsed.expectedOwnerId ?? null,
     });
   }
 
   /**
    * CAS rollback: copies the target snapshot into a NEW version. `summary`
-   * defaults to `restored content from version <toVersion>`.
+   * defaults to `restored content from version <toVersion>`. Ownership guards
+   * behave like on `update` (mismatch reads as 404, no oracle).
    */
   async rollback(input: WorkDocRollbackInput): Promise<WorkDoc> {
     const parsed: ParsedWorkDocRollbackInput = parseWorkDocInput(rollbackWorkDocInputSchema, input);
@@ -144,6 +158,7 @@ export class WorkDocService {
       summary: parsed.summary ?? `restored content from version ${parsed.toVersion}`,
       expectedScope: parsed.expectedScope,
       expectedChatId: parsed.expectedChatId,
+      expectedOwnerId: parsed.expectedOwnerId ?? null,
     });
   }
 
@@ -159,7 +174,7 @@ export class WorkDocService {
     return this.store.listRevisions(parsed.id, this.historyOptions(parsed));
   }
 
-  /** Idempotent per (document, targetType, target) tuple, with chat ownership guards. */
+  /** Idempotent per (document, targetType, target) tuple, with ownership guards. */
   async addLink(input: WorkDocAddLinkInput): Promise<WorkDocLink> {
     const parsed: ParsedWorkDocAddLinkInput = parseWorkDocInput(addWorkDocLinkInputSchema, input);
     return this.store.addLink({
@@ -169,18 +184,27 @@ export class WorkDocService {
       label: parsed.label,
       expectedScope: parsed.expectedScope,
       expectedChatId: parsed.expectedChatId,
+      expectedOwnerId: parsed.expectedOwnerId ?? null,
     });
   }
 
-  /** Links for one document, oldest-first (createdAt then id). */
-  async listLinks(id: string): Promise<readonly WorkDocLink[]> {
+  /**
+   * Links for one document, oldest-first (createdAt then id). With
+   * `options.expectedOwnerId` a foreign/ownerless document reads as 404.
+   */
+  async listLinks(id: string, options?: WorkDocGetOptions): Promise<readonly WorkDocLink[]> {
     const parsedId = parseWorkDocInput(workDocIdSchema, id);
-    return this.store.listLinks(parsedId);
+    const parsedOptions: ParsedWorkDocGetOptions = parseWorkDocInput(workDocGetOptionsSchema, options ?? {});
+    return this.store.listLinks(parsedId, parsedOptions);
   }
 
   private historyOptions(
     parsed: ParsedWorkDocListVersionsInput,
   ): WorkDocHistoryListOptions {
-    return { order: parsed.order, limit: parsed.limit };
+    return {
+      order: parsed.order,
+      limit: parsed.limit,
+      expectedOwnerId: parsed.expectedOwnerId ?? null,
+    };
   }
 }

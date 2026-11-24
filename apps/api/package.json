@@ -27,6 +27,7 @@
     "@workforce/core": "0.1.0",
     "@workforce/queue": "0.1.0",
     "ai": "^6.0.333",
+    "better-auth": "^1.7.27",
     "bullmq": "^6.7.8",
     "express": "^4.22.3",
     "ioredis": "^5.8.1",

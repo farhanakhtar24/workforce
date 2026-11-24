@@ -138,11 +138,17 @@ model WorkDoc {
   version   Int
   createdAt DateTime       @default(now())
   updatedAt DateTime       @default(now())
+  // Pre-Phase 6 ownership: NULLABLE BY DESIGN. Legacy rows created before the
+  // per-user model have no owner and become inaccessible through user-scoped
+  // queries; nothing back-fills or auto-assigns ownership (no leaks).
+  ownerId   String?
+  owner     User?          @relation(fields: [ownerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   versions  WorkDocVersion[]
   revisions WorkDocRevision[]
   links     WorkDocLink[]
 
+  @@index([ownerId])
   @@index([scope, chatId, updatedAt(sort: Desc)])
   @@index([type])
   @@index([status])
@@ -237,7 +243,12 @@ model Delegation {
   createdAt       DateTime             @default(now())
   updatedAt       DateTime             @default(now())
   completedAt     DateTime?
+  // Pre-Phase 6 ownership: nullable by design (see WorkDoc comment);
+  // deleting the owning user sets owner NULL instead of cascading.
+  ownerId         String?
+  owner           User?                @relation(fields: [ownerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
+  @@index([ownerId])
   @@index([parentChatId, createdAt(sort: Desc)])
   @@index([status])
 }
@@ -317,9 +328,14 @@ model AgentTask {
   nextRunAt        DateTime?
   createdAt        DateTime                @default(now())
   updatedAt        DateTime                @default(now())
+  // Pre-Phase 6 ownership: nullable by design (see WorkDoc comment);
+  // deleting the owning user sets owner NULL instead of cascading.
+  ownerId          String?
+  owner            User?                   @relation(fields: [ownerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   executions AgentTaskExecution[]
 
+  @@index([ownerId])
   @@index([isActive, nextRunAt(sort: Desc)])
   @@index([createdAt(sort: Desc)])
   @@index([agentSlug])
@@ -343,13 +359,118 @@ model AgentTaskExecution {
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @default(now())
   finishedAt         DateTime?
+  // Pre-Phase 6 ownership: nullable by design (see WorkDoc comment);
+  // deleting the owning user sets owner NULL instead of cascading.
+  ownerId            String?
+  owner              User?                    @relation(fields: [ownerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   task    AgentTask            @relation(fields: [taskId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   // Self-FK: a RETRY execution points at the DEAD_LETTER execution it retries.
   retryOf AgentTaskExecution?  @relation("AgentTaskExecutionRetryOf", fields: [retryOfExecutionId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   retries AgentTaskExecution[] @relation("AgentTaskExecutionRetryOf")
 
+  @@index([ownerId])
   @@index([taskId, scheduledFor])
   @@index([status])
   @@index([scheduledFor])
+}
+
+// ---------------------------------------------------------------------------
+// Pre-Phase 6: Better Auth (Google + GitHub OAuth) + per-user private data
+// ---------------------------------------------------------------------------
+// Documented choices:
+// - User/Session/Account/Verification follow the official Better Auth 1.7
+//   Prisma schema generation (`npx auth@<version> generate --adapter prisma
+//   --dialect postgresql`): ids are plain TEXT (`String @id`, NO @db.Uuid)
+//   minted by Better Auth itself, and relations are declared so the Prisma
+//   adapter can use joins. The CLI-generated lowercase `@@map` renames are
+//   omitted ON PURPOSE — this repo binds to Prisma-default quoted PascalCase
+//   identifiers (see the header note and prisma/README.md); the adapter binds
+//   by model name, so the mapped SQL name is irrelevant to it.
+// - Sessions persist in the Session table (no secondary storage configured)
+//   and are only handed to clients as an httpOnly cookie token.
+// - Only the Google and GitHub social providers are wired by the API auth
+//   factory; email/password enrollment stays disabled at the factory level,
+//   so the schema stays provider-neutral (email + emailVerified exist).
+// - UserSettings is the explicit per-user personal-memory opt-in store:
+//   `personalMemoryEnabled` defaults to FALSE and is only ever enabled by the
+//   user. `userId` is unique (one settings row per user, TEXT like User.id)
+//   and cascades on user deletion (private data dies with the owner).
+model User {
+  id            String    @id
+  name          String
+  email         String
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions Session[]
+  accounts Account[]
+
+  // Per-user private data (repo-owned models).
+  settings             UserSettings?
+  workDocs             WorkDoc[]
+  delegations          Delegation[]
+  agentTasks           AgentTask[]
+  agentTaskExecutions  AgentTaskExecution[]
+
+  @@unique([email])
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+model UserSettings {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                String   @unique
+  // Explicit opt-in: the default is opt-OUT (no personal memory until the
+  // user turns this on themselves).
+  personalMemoryEnabled Boolean  @default(false)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 }

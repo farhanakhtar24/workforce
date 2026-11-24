@@ -37,6 +37,15 @@ export interface WorkDoc {
   readonly version: number;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * The platform user (Better Auth `User.id`, TEXT) that owns this document,
+   * or `null` for LEGACY rows created before the per-user model. Core keeps
+   * the field optional at call sites; the authenticated API layer MUST always
+   * pass an owner filter/creation value so users never touch each other's
+   * (or legacy ownerless) rows. Owner filters match EXACTLY: an expected
+   * owner never matches ownerless rows.
+   */
+  readonly ownerId: string | null;
 }
 
 /** One immutable historical snapshot of a document. Never mutated. */

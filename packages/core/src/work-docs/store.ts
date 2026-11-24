@@ -20,6 +20,10 @@
  * - Validation re-runs inside stores (defense in depth): scope normalization
  *   reuses the memory-domain `normalizeScope`, and every mutation re-checks
  *   document existence (404) before any state change.
+ * - Ownership: `ownerId` is the platform user (Better Auth `User.id`, TEXT)
+ *   or null for legacy rows. Owner guards/filters match EXACTLY — an expected
+ *   owner NEVER matches ownerless or other-user rows, and a mismatch reads as
+ *   not-found (or null on plain reads): no cross-tenant oracle.
  * - Dates: stores expose ISO strings on all public types (see `./types.js`).
  */
 
@@ -38,6 +42,11 @@ export interface WorkDocStoreCreate {
   /** Validated upstream; defaults to `draft`. */
   readonly status?: WorkDocStatus;
   /**
+   * Optional platform-user owner id (Better Auth `User.id`); omit/`null` for
+   * legacy ownerless rows. The authenticated API layer MUST always pass it.
+   */
+  readonly ownerId?: string | null;
+  /**
    * Optional creation timestamp override (ISO string or Date). Defaults to
    * the store clock. The v1 snapshot and creation revision share it.
    */
@@ -50,10 +59,24 @@ export interface WorkDocListParams {
   readonly chatId?: string;
   readonly type?: WorkDocType;
   readonly status?: WorkDocStatus;
+  /**
+   * Owner filter: EXACT match only. When set, ownerless legacy rows and other
+   * users' rows are never returned (prevents unbounded global reads).
+   */
+  readonly ownerId?: string | null;
   /** `newest` = descending createdAt then id; `oldest` = ascending. */
   readonly order: 'newest' | 'oldest';
   /** 1..100 enforced by schemas; stores trust but bound defensively. */
   readonly limit: number;
+}
+
+/** Owner guard for single-document reads (`get`, `listLinks`). */
+export interface WorkDocGetOptions {
+  /**
+   * When set, the document must belong EXACTLY to this user — ownerless rows
+   * and other users' rows read as absent (null), never an oracle.
+   */
+  readonly expectedOwnerId?: string | null;
 }
 
 /** CAS update payload. At least one field of the patch is present. */
@@ -75,6 +98,12 @@ export interface WorkDocStoreUpdate {
    */
   readonly expectedScope?: string | null;
   readonly expectedChatId?: string | null;
+  /**
+   * Owner guard (optional): when set, the document must belong EXACTLY to
+   * this platform user — ownerless legacy rows never match — or the write is
+   * rejected as not-found (404, no oracle).
+   */
+  readonly expectedOwnerId?: string | null;
 }
 
 /** Rollback payload: copy version `toVersion`'s snapshot into a NEW version. */
@@ -89,6 +118,8 @@ export interface WorkDocStoreRollback {
   /** Ownership guards; see {@link WorkDocStoreUpdate}. */
   readonly expectedScope?: string | null;
   readonly expectedChatId?: string | null;
+  /** Owner guard; see {@link WorkDocStoreUpdate}. */
+  readonly expectedOwnerId?: string | null;
 }
 
 /** Options for bounded deterministic history listings. */
@@ -96,6 +127,8 @@ export interface WorkDocHistoryListOptions {
   /** Ascending = chronological; descending = latest first. */
   readonly order: 'oldest' | 'newest';
   readonly limit: number;
+  /** Owner guard on the document; mismatch reads as 404 (never an oracle). */
+  readonly expectedOwnerId?: string | null;
 }
 
 /** Payload for adding one typed link (idempotent per document/target tuple). */
@@ -107,6 +140,8 @@ export interface WorkDocLinkInsert {
   /** Ownership guards; see {@link WorkDocStoreUpdate}. */
   readonly expectedScope?: string | null;
   readonly expectedChatId?: string | null;
+  /** Owner guard; see {@link WorkDocStoreUpdate}. */
+  readonly expectedOwnerId?: string | null;
 }
 
 export interface WorkDocStore {
@@ -116,7 +151,12 @@ export interface WorkDocStore {
    */
   create(data: WorkDocStoreCreate): Promise<WorkDoc>;
 
-  get(id: string): Promise<WorkDoc | null>;
+  /**
+   * Read one document, or `null` when absent. With
+   * `options.expectedOwnerId`, a foreign or ownerless row also reads as
+   * `null` — no existence oracle across owners.
+   */
+  get(id: string, options?: WorkDocGetOptions): Promise<WorkDoc | null>;
 
   /** Bounded, deterministic listing (createdAt then id tie-break). */
   list(params: WorkDocListParams): Promise<readonly WorkDoc[]>;
@@ -150,6 +190,9 @@ export interface WorkDocStore {
    */
   addLink(data: WorkDocLinkInsert): Promise<WorkDocLink>;
 
-  /** Links for one document, ordered by createdAt then id. */
-  listLinks(documentId: string): Promise<readonly WorkDocLink[]>;
+  /**
+   * Links for one document, ordered by createdAt then id. With
+   * `options.expectedOwnerId` a foreign/ownerless document reads as 404.
+   */
+  listLinks(documentId: string, options?: WorkDocGetOptions): Promise<readonly WorkDocLink[]>;
 }

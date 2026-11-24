@@ -14,9 +14,11 @@
  * - GET  /api/agents/:slug/work-docs/:id/links          — typed links
  * - POST /api/agents/:slug/work-docs/:id/links          — add typed link
  *
- * Ownership: every doc-scoped read/mutation demands the owning `chatId`
- * (query for GET, body otherwise). A mismatch reads as fixed 404 — no
- * existence oracle. Documents are single-scope (`default`). No document
+ * Ownership (pre-Phase 6): every doc-scoped read/mutation demands the
+ * authenticated owner (`ownerId` — never a client-controllable field) AND the
+ * owning `chatId` (query for GET, body otherwise). Core guards
+ * (`expectedOwnerId`) match EXACTLY: a foreign or ownerless row reads as
+ * fixed 404 — no existence oracle, no cross-tenant leakage. No document
  * content is ever logged; errors are fixed safe strings.
  */
 import type { Request, Response, RequestHandler } from 'express';
@@ -37,6 +39,7 @@ import {
 
 import type { SafeLogger } from '../logging.js';
 import { clientIdSchema } from '../validation.js';
+import { ownerOf, AUTH_401_MESSAGE } from '../auth/owner.js';
 
 export interface WorkDocRouteDeps {
   readonly service: WorkDocService;
@@ -147,7 +150,21 @@ const addLinkBodySchema = z.strictObject({
 export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandlers {
   const { service } = deps;
 
+  /** Fixed-401 guard (the app-wide owner middleware should precede this). */
+  const ownerIdOr401 = (res: Response): string | null => {
+    const owner = ownerOf(res);
+    if (owner === null) {
+      json(res, 401, { error: AUTH_401_MESSAGE });
+      return null;
+    }
+    return owner.userId;
+  };
+
   const list: RequestHandler = async (req, res) => {
+    const ownerId = ownerIdOr401(res);
+    if (ownerId === null) {
+      return;
+    }
     const slug = req.params['slug'] ?? '';
     if (!SLUGS.includes(slug)) {
       json(res, 404, { error: 'Unknown agent slug.' });
@@ -170,6 +187,9 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
       }
       input['limit'] = Number(limitRaw);
     }
+    // The owner filter is FORCED from the resolved owner: only that user's
+    // documents (never ownerless legacy rows) can ever return.
+    input['ownerId'] = ownerId;
     try {
       const documents = await service.list(input);
       json(res, 200, { documents });
@@ -180,6 +200,10 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
   };
 
   const create: RequestHandler = async (req, res) => {
+    const ownerId = ownerIdOr401(res);
+    if (ownerId === null) {
+      return;
+    }
     const slug = req.params['slug'] ?? '';
     // Creation is the orchestrator's own agent-sourced route (fixed path).
     if (slug !== 'orchestrator') {
@@ -199,6 +223,8 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         title: parsed.data.title,
         content: parsed.data.content,
         status: 'draft',
+        // The owner is the RESOLVED identity, never a body field.
+        ownerId,
       });
       json(res, 201, { document });
     } catch (error) {
@@ -207,13 +233,13 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
     }
   };
 
-  /** Loads a doc and enforces chat ownership (mismatch → fixed 404). */
+  /** Loads a doc and enforces chat + owner ownership (mismatches → fixed 404). */
   const chatIdQuery = (req: Request): string | undefined => {
     const value = req.query['chatId'];
     return typeof value === 'string' ? value : undefined;
   };
 
-  const getOwned = async (id: string, chatId: string | undefined): Promise<{ ok: true } | { ok: false; status: number }> => {
+  const getOwned = async (id: string, chatId: string | undefined, ownerId: string): Promise<{ ok: true } | { ok: false; status: number }> => {
     if (typeof chatId !== 'string' || chatId.length === 0) {
       return { ok: false, status: 400 };
     }
@@ -221,7 +247,8 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
     if (!identity.success) {
       return { ok: false, status: 404 };
     }
-    const doc = await service.get(id);
+    // Core owner guard: foreign AND ownerless rows read as null (no oracle).
+    const doc = await service.get(id, { expectedOwnerId: ownerId });
     if (doc === null) {
       return { ok: false, status: 404 };
     }
@@ -234,20 +261,24 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const getDoc: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req));
+      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req), ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
       }
       const [document, versions, links] = await Promise.all([
-        service.get(req.params['id'] ?? ''),
-        service.listVersions({ id: req.params['id'] as string, order: 'newest', limit: 5 }),
-        service.listLinks(req.params['id'] as string),
+        service.get(req.params['id'] ?? '', { expectedOwnerId: ownerId }),
+        service.listVersions({ id: req.params['id'] as string, order: 'newest', limit: 5, expectedOwnerId: ownerId }),
+        service.listLinks(req.params['id'] as string, { expectedOwnerId: ownerId }),
       ]);
       json(res, 200, { document, recentVersions: versions, links });
     } catch (error) {
@@ -258,6 +289,10 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const patchDoc: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
@@ -268,7 +303,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         json(res, 400, { error: INVALID_WORKDOC_REQUEST });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId);
+      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId, ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
@@ -282,6 +317,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         actorId: parsed.data.chatId,
         expectedScope: 'default',
         expectedChatId: parsed.data.chatId,
+        expectedOwnerId: ownerId,
       });
       json(res, 200, { document });
     } catch (error) {
@@ -292,13 +328,17 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const listVersions: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
         return;
       }
       const limitRaw = req.query['limit'];
-      const input: { id: string; limit?: number } = { id: req.params['id'] ?? '' };
+      const input: { id: string; limit?: number; expectedOwnerId: string } = { id: req.params['id'] ?? '', expectedOwnerId: ownerId };
       if (limitRaw !== undefined) {
         if (typeof limitRaw !== 'string' || !INTEGER_STRING.test(limitRaw)) {
           json(res, 400, { error: INVALID_WORKDOC_REQUEST });
@@ -306,7 +346,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         }
         input['limit'] = Number(limitRaw);
       }
-      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req));
+      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req), ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
@@ -321,6 +361,10 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const getVersion: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
@@ -331,12 +375,12 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         json(res, 400, { error: INVALID_WORKDOC_REQUEST });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req));
+      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req), ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
       }
-      const versions = await service.listVersions({ id: req.params['id'] as string, limit: 1000 });
+      const versions = await service.listVersions({ id: req.params['id'] as string, limit: 1000, expectedOwnerId: ownerId });
       const version = versions.find((candidate) => candidate.version === Number(versionRaw));
       if (version === undefined) {
         json(res, 404, { error: WORKDOC_NOT_FOUND });
@@ -351,6 +395,10 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const postVersion: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       // Agent content updates go through the orchestrator's route (the tool's
       // only writer path); other slugs stay 404.
@@ -363,7 +411,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         json(res, 400, { error: INVALID_WORKDOC_REQUEST });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId);
+      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId, ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
@@ -379,6 +427,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         ...(parsed.data.summary !== undefined ? { summary: parsed.data.summary } : {}),
         expectedScope: 'default',
         expectedChatId: parsed.data.chatId,
+        expectedOwnerId: ownerId,
       });
       json(res, 200, { document });
     } catch (error) {
@@ -389,6 +438,10 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const rollback: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
@@ -399,7 +452,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         json(res, 400, { error: INVALID_WORKDOC_REQUEST });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId);
+      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId, ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
@@ -413,6 +466,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         ...(parsed.data.summary !== undefined ? { summary: parsed.data.summary } : {}),
         expectedScope: 'default',
         expectedChatId: parsed.data.chatId,
+        expectedOwnerId: ownerId,
       });
       json(res, 200, { document });
     } catch (error) {
@@ -423,13 +477,17 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const listRevisions: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
         return;
       }
       const limitRaw = req.query['limit'];
-      const input: { id: string; limit?: number } = { id: req.params['id'] ?? '' };
+      const input: { id: string; limit?: number; expectedOwnerId: string } = { id: req.params['id'] ?? '', expectedOwnerId: ownerId };
       if (limitRaw !== undefined) {
         if (typeof limitRaw !== 'string' || !INTEGER_STRING.test(limitRaw)) {
           json(res, 400, { error: INVALID_WORKDOC_REQUEST });
@@ -437,7 +495,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         }
         input['limit'] = Number(limitRaw);
       }
-      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req));
+      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req), ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
@@ -452,6 +510,10 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const addLink: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
@@ -462,7 +524,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         json(res, 400, { error: INVALID_WORKDOC_REQUEST });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId);
+      const owned = await getOwned(req.params['id'] ?? '', parsed.data.chatId, ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
@@ -474,6 +536,7 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
         ...(parsed.data.label !== undefined ? { label: parsed.data.label } : {}),
         expectedScope: 'default',
         expectedChatId: parsed.data.chatId,
+        expectedOwnerId: ownerId,
       });
       json(res, 201, { link });
     } catch (error) {
@@ -484,17 +547,21 @@ export function createWorkDocRoutes(deps: WorkDocRouteDeps): WorkDocRouteHandler
 
   const listLinks: RequestHandler = async (req, res) => {
     try {
+      const ownerId = ownerIdOr401(res);
+      if (ownerId === null) {
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!SLUGS.includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
         return;
       }
-      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req));
+      const owned = await getOwned(req.params['id'] ?? '', chatIdQuery(req), ownerId);
       if (!owned.ok) {
         json(res, owned.status, { error: owned.status === 400 ? INVALID_WORKDOC_REQUEST : WORKDOC_NOT_FOUND });
         return;
       }
-      const links = await service.listLinks(req.params['id'] as string);
+      const links = await service.listLinks(req.params['id'] as string, { expectedOwnerId: ownerId });
       json(res, 200, { links });
     } catch (error) {
       const mapped = handleStoreError(error);

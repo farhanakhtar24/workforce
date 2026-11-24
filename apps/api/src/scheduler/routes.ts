@@ -35,6 +35,12 @@ import { isIsoInstantZ, isValidSchedulerQueueId } from '@workforce/queue/schedul
 import { randomUUID } from 'node:crypto';
 
 import type { SafeLogger } from '../logging.js';
+import { ownerOf, AUTH_401_MESSAGE } from '../auth/owner.js';
+import {
+  INTERNAL_SCHEDULER_HEADER,
+  contextWindow,
+  type DelegationContextSigner,
+} from '../agents/delegation-context.js';
 import type {
   SchedulerQueuePort,
   SchedulerRunBudgets,
@@ -48,6 +54,8 @@ import {
   SCHEDULER_STORE_UNAVAILABLE,
   SCHEDULER_TASK_NOT_FOUND,
   SCHEDULER_WORKER_HEADER_REQUIRED,
+  OWNERLESS_TASK_MESSAGE,
+  SCHEDULER_CONTEXT_INVALID,
 } from './types.js';
 import { schedulerWorkerHeaderValue } from './worker-contract.js';
 import {
@@ -79,9 +87,19 @@ export interface SchedulerRouteDeps {
   readonly service: SchedulerService;
   /** Real BullMQ queue in production; `null` keeps every sync an honest 503. */
   readonly queue: SchedulerQueuePort | null;
-  /** Own-REST run budgets (fetch/baseUrl/timeout budgets/logger). */
+  /** Own-REST run budgets (fetch/baseUrl/timeout budgets/logger + signer). */
   readonly run: SchedulerRunBudgets;
   readonly logger: SafeLogger;
+}
+
+/** Owner-derived helpers shared by the browser-facing scheduler handlers. */
+function schedulerOwnerId(res: Response): string | null {
+  const owner = ownerOf(res);
+  if (owner === null) {
+    json(res, 401, { error: AUTH_401_MESSAGE });
+    return null;
+  }
+  return owner.userId;
 }
 
 export interface SchedulerRouteHandlers {
@@ -151,14 +169,15 @@ function parseLimit(value: unknown): number | 'invalid' | 'absent' {
 async function landEnqueueFailure(
   service: SchedulerService,
   executionId: string,
+  ownerId: string,
 ): Promise<AgentTaskExecution | null> {
   try {
     // Fresh MANUAL/RETRY rows are PENDING/attempt-0: claim then mark. Any
     // claim failure still lets the mark decide the truth (a RUNNING row is
     // not hidden; a terminal row stays immutable).
-    await service.claimExecution({ id: executionId, attempt: 1, allowedFrom: 'PENDING' }).catch(() => undefined);
-    await service.markDeadLetter({ id: executionId, error: RUN_ERROR_QUEUE_ENQUEUE });
-    return await service.getExecution(executionId);
+    await service.claimExecution({ id: executionId, attempt: 1, allowedFrom: 'PENDING', expectedOwnerId: ownerId }).catch(() => undefined);
+    await service.markDeadLetter({ id: executionId, error: RUN_ERROR_QUEUE_ENQUEUE, expectedOwnerId: ownerId });
+    return await service.getExecution(executionId, { expectedOwnerId: ownerId });
   } catch {
     return null;
   }
@@ -184,10 +203,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
     }
   };
 
-  const enqueueExecutionOr503 = async (execution: AgentTaskExecution, res: Response): Promise<boolean> => {
+  const enqueueExecutionOr503 = async (execution: AgentTaskExecution, ownerId: string, res: Response): Promise<boolean> => {
     if (queue === null) {
       logger.error('scheduler-queue-unavailable-enqueue', new Error('scheduler queue is not wired'));
-      await landEnqueueFailure(service, execution.id);
+      await landEnqueueFailure(service, execution.id, ownerId);
       json(res, 503, { error: SCHEDULER_QUEUE_UNAVAILABLE });
       return false;
     }
@@ -196,7 +215,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       return true;
     } catch (error) {
       logger.error('scheduler-queue-enqueue-failed', error);
-      await landEnqueueFailure(service, execution.id);
+      await landEnqueueFailure(service, execution.id, ownerId);
       json(res, 503, { error: SCHEDULER_QUEUE_UNAVAILABLE });
       return false;
     }
@@ -207,6 +226,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
 
   const createTask: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const body = req.body;
       if (body === null || typeof body !== 'object') {
         json(res, 400, { error: INVALID_SCHEDULER_REQUEST });
@@ -214,9 +237,9 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let task: AgentTask;
       try {
-        // Route-level parse keeps unknown JSON typed; the service re-validates
-        // (defense in depth). Zod issues never echo submitted values.
-        const parsed = parseSchedulerInput(createTaskInputSchema, body);
+        // The owner is FORCED from the resolved identity (never from the
+        // body); the client cannot name an owner for a new task.
+        const parsed = parseSchedulerInput(createTaskInputSchema, { ...(body as Record<string, unknown>), ownerId });
         task = await service.createTask(parsed);
       } catch (error) {
         schedulerErrorResponse(res, error);
@@ -234,6 +257,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
 
   const listTasks: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const limit = parseLimit(req.query['limit']);
       if (limit === 'invalid') {
         json(res, 400, { error: INVALID_SCHEDULER_REQUEST });
@@ -251,7 +278,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let tasks: readonly AgentTask[];
       try {
+        // EXACT owner filter: this user's tasks only — ownerless legacy rows
+        // and other users' rows can never return.
         tasks = await service.listTasks({
+          ownerId,
           ...(limit !== 'absent' ? { limit } : {}),
         });
       } catch (error) {
@@ -269,6 +299,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
 
   const getTask: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const id = taskIdOr404(req.params['id']);
       if (id === null) {
         json(res, 404, { error: SCHEDULER_TASK_NOT_FOUND });
@@ -276,7 +310,8 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let task: AgentTask | null;
       try {
-        task = await service.getTask(id);
+        // Owner guard: foreign/ownerless rows read as null (no oracle).
+        task = await service.getTask(id, { expectedOwnerId: ownerId });
       } catch (error) {
         schedulerErrorResponse(res, error);
         return;
@@ -287,7 +322,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let executions: readonly AgentTaskExecution[];
       try {
-        executions = await service.listExecutions({ taskId: task.id, limit: 10 });
+        executions = await service.listExecutions({ taskId: task.id, limit: 10, ownerId });
       } catch {
         executions = []; // detail stays servable when the execution read fails
       }
@@ -299,6 +334,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
 
   const patchTask: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const id = taskIdOr404(req.params['id']);
       if (id === null) {
         json(res, 404, { error: SCHEDULER_TASK_NOT_FOUND });
@@ -311,9 +350,15 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let task: AgentTask;
       try {
-        // Route-level parse (id is bound to the path param); the service
-        // re-validates. Unknown/extra keys are rejected by the strict schema.
-        const parsed = parseSchedulerInput(updateTaskInputSchema, { ...(body as Record<string, unknown>), id });
+        // Route-level parse (id bound to the path; owner FORCED from the
+        // resolved identity — never a mutable or client-settable field); the
+        // service re-validates and the store enforces the owner CAS (foreign/
+        // ownerless rows read as 404 before any patch).
+        const parsed = parseSchedulerInput(updateTaskInputSchema, {
+          ...(body as Record<string, unknown>),
+          id,
+          expectedOwnerId: ownerId,
+        });
         task = await service.updateTask(parsed);
       } catch (error) {
         schedulerErrorResponse(res, error);
@@ -332,6 +377,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
   const setTaskActiveHandler = (isActive: boolean): RequestHandler => {
     return async (req, res, next) => {
       try {
+        const ownerId = schedulerOwnerId(res);
+        if (ownerId === null) {
+          return;
+        }
         const id = taskIdOr404(req.params['id']);
         if (id === null) {
           json(res, 404, { error: SCHEDULER_TASK_NOT_FOUND });
@@ -339,7 +388,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
         }
         let task: AgentTask;
         try {
-          task = await service.setTaskActive({ id, isActive });
+          task = await service.setTaskActive({ id, isActive, expectedOwnerId: ownerId });
         } catch (error) {
           schedulerErrorResponse(res, error);
           return;
@@ -361,6 +410,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
   /** MANUAL run: NEW execution (trigger MANUAL) + immediate enqueue, 202. */
   const runTask: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const id = taskIdOr404(req.params['id']);
       if (id === null) {
         json(res, 404, { error: SCHEDULER_TASK_NOT_FOUND });
@@ -368,7 +421,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let task: AgentTask | null;
       try {
-        task = await service.getTask(id);
+        task = await service.getTask(id, { expectedOwnerId: ownerId });
       } catch (error) {
         schedulerErrorResponse(res, error);
         return;
@@ -379,6 +432,8 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let execution: AgentTaskExecution;
       try {
+        // Inherits the task's owner in the store (both stores); the owner
+        // match was already proven by the guarded read above.
         const created = await service.createExecution(task, {
           id: randomUUID(),
           scheduledFor: new Date().toISOString(),
@@ -389,7 +444,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
         schedulerErrorResponse(res, error);
         return;
       }
-      const enqueued = await enqueueExecutionOr503(execution, res);
+      const enqueued = await enqueueExecutionOr503(execution, ownerId, res);
       if (!enqueued) {
         return;
       }
@@ -400,19 +455,36 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
   };
 
   /**
-   * WORKER-ONLY (convention, not auth — see `worker-contract.ts`): one BullMQ
-   * occurrence. The body carries the occurrence metadata the browser never
-   * mints: `{ scheduledFor, queueJobId?, repeatJobKey?, attempt }`.
+   * WORKER-ONLY run route (mounted BEFORE the browser owner gate): one BullMQ
+   * occurrence. TWO layers of trust — the worker convention header AND a
+   * SIGNED `internal-scheduler-run` context bound to THIS task id (short TTL;
+   * the literal worker header alone is no longer sufficient). The platform
+   * owner is DERIVED from the task row inside the run service (the row is
+   * the authority); ownerless legacy tasks are refused — they can never run.
    */
   const runScheduledOccurrence: RequestHandler = async (req, res, next) => {
     try {
       if (schedulerWorkerHeaderValue((name: string) => req.get(name)) === undefined) {
-        json(res, 400, { error: SCHEDULER_WORKER_HEADER_REQUIRED });
+        json(res, 401, { error: SCHEDULER_WORKER_HEADER_REQUIRED });
         return;
       }
       const id = taskIdOr404(req.params['id']);
       if (id === null || !isValidSchedulerQueueId(id)) {
         json(res, 404, { error: SCHEDULER_TASK_NOT_FOUND });
+        return;
+      }
+      if (deps.run.signer === undefined) {
+        // Startup wiring guarantees the signer; refusing to guess is honest.
+        json(res, 503, { error: SCHEDULER_STORE_UNAVAILABLE });
+        return;
+      }
+      const signedHeader = req.get(INTERNAL_SCHEDULER_HEADER) ?? req.get('x-workforce-internal-scheduler');
+      const verified = deps.run.signer.verify(typeof signedHeader === 'string' ? signedHeader : '', {
+        kind: 'internal-scheduler-run',
+        taskId: id,
+      });
+      if (!verified.ok) {
+        json(res, 400, { error: SCHEDULER_CONTEXT_INVALID });
         return;
       }
       const parsedBody = runScheduledBodySchema.safeParse(req.body);
@@ -454,18 +526,32 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
   };
 
   /**
-   * WORKER-ONLY (convention, not auth): one MANUAL/RETRY execution run.
-   * Body: `{ attempt, queueJobId? }` — BullMQ job metadata only.
+   * WORKER-ONLY run route (mounted BEFORE the browser owner gate). Same trust
+   * contract as `runScheduledOccurrence`, bound to the EXECUTION id; the row
+   * supplies the owner and ownerless rows are refused.
    */
   const runExecution: RequestHandler = async (req, res, next) => {
     try {
       if (schedulerWorkerHeaderValue((name: string) => req.get(name)) === undefined) {
-        json(res, 400, { error: SCHEDULER_WORKER_HEADER_REQUIRED });
+        json(res, 401, { error: SCHEDULER_WORKER_HEADER_REQUIRED });
         return;
       }
       const id = taskIdOr404(req.params['id']);
       if (id === null) {
         json(res, 404, { error: SCHEDULER_EXECUTION_NOT_FOUND });
+        return;
+      }
+      if (deps.run.signer === undefined) {
+        json(res, 503, { error: SCHEDULER_STORE_UNAVAILABLE });
+        return;
+      }
+      const signedHeader = req.get(INTERNAL_SCHEDULER_HEADER) ?? req.get('x-workforce-internal-scheduler');
+      const verified = deps.run.signer.verify(typeof signedHeader === 'string' ? signedHeader : '', {
+        kind: 'internal-scheduler-run',
+        executionId: id,
+      });
+      if (!verified.ok) {
+        json(res, 400, { error: SCHEDULER_CONTEXT_INVALID });
         return;
       }
       const parsedBody = runExecutionBodySchema.safeParse(req.body);
@@ -495,6 +581,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
 
   const listExecutions: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const limit = parseLimit(req.query['limit']);
       if (limit === 'invalid') {
         json(res, 400, { error: INVALID_SCHEDULER_REQUEST });
@@ -530,6 +620,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
           ...(typeof taskIdRaw === 'string' ? { taskId: taskIdRaw } : {}),
           ...(status !== undefined ? { status } : {}),
           ...(limit !== 'absent' ? { limit } : {}),
+          ownerId,
         });
       } catch (error) {
         schedulerErrorResponse(res, error);
@@ -543,6 +634,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
 
   const getExecution: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const id = taskIdOr404(req.params['id']);
       if (id === null) {
         json(res, 404, { error: SCHEDULER_EXECUTION_NOT_FOUND });
@@ -550,7 +645,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let execution: AgentTaskExecution | null;
       try {
-        execution = await service.getExecution(id);
+        execution = await service.getExecution(id, { expectedOwnerId: ownerId });
       } catch (error) {
         schedulerErrorResponse(res, error, SCHEDULER_EXECUTION_NOT_FOUND);
         return;
@@ -568,6 +663,10 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
   /** MANUAL retry: NEW linked execution from a DEAD_LETTER row, 202. */
   const retryExecution: RequestHandler = async (req, res, next) => {
     try {
+      const ownerId = schedulerOwnerId(res);
+      if (ownerId === null) {
+        return;
+      }
       const id = taskIdOr404(req.params['id']);
       if (id === null) {
         json(res, 404, { error: SCHEDULER_EXECUTION_NOT_FOUND });
@@ -575,7 +674,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
       }
       let source: AgentTaskExecution | null;
       try {
-        source = await service.getExecution(id);
+        source = await service.getExecution(id, { expectedOwnerId: ownerId });
       } catch (error) {
         schedulerErrorResponse(res, error, SCHEDULER_EXECUTION_NOT_FOUND);
         return;
@@ -589,7 +688,9 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
         json(res, 409, { error: SCHEDULER_CONFLICT });
         return;
       }
-      const task: AgentTask | null = await service.getTask(source.taskId).catch(() => null);
+      const task: AgentTask | null = await service
+        .getTask(source.taskId, { expectedOwnerId: ownerId })
+        .catch(() => null);
       if (task === null) {
         json(res, 404, { error: SCHEDULER_TASK_NOT_FOUND });
         return;
@@ -607,7 +708,7 @@ export function createSchedulerRoutes(deps: SchedulerRouteDeps): SchedulerRouteH
         schedulerErrorResponse(res, error);
         return;
       }
-      const enqueued = await enqueueExecutionOr503(execution, res);
+      const enqueued = await enqueueExecutionOr503(execution, ownerId, res);
       if (!enqueued) {
         return;
       }

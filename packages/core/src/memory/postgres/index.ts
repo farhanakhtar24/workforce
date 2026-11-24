@@ -76,6 +76,7 @@ import {
 } from '../kinds.js';
 import { normalizeMemoryPath, normalizeScope } from '../paths.js';
 import type {
+  DerivedChatPurgeParams,
   MemoryActiveBlockListOptions,
   MemoryBlockInsert,
   MemoryEmbeddingFailedUpdate,
@@ -804,6 +805,54 @@ export class PostgresMemoryStore implements MemoryStore {
       WHERE "id" IN (${Prisma.join(uniqueIds.map((id) => Prisma.sql`${id}::uuid`))})
     `;
   }
+
+  async purgeDerivedChatBlocks(params: DerivedChatPurgeParams): Promise<number> {
+    const scope = normalizeScope(params.scope);
+    const path = normalizeMemoryPath(params.path);
+    const ids = normalizePurgeMessageIds(params.assistantMessageIds);
+    // ONE short transaction: the DELETE cascade removes source AND incoming
+    // relation rows; a supersededBy reference from a survivor is set NULL.
+    const idFilter =
+      ids === null
+        ? Prisma.empty
+        : Prisma.sql` AND "metadata"->>'assistantMessageId' IN (${Prisma.join(
+            ids.map((id) => Prisma.sql`${id}`),
+          )})`;
+    return await this.prisma.$transaction(async (tx) => {
+      const deleted = await tx.$executeRaw`
+        DELETE FROM "MemoryBlock"
+        WHERE "scope" = ${scope} AND "path" = ${path}${idFilter}
+      `;
+      return deleted;
+    });
+  }
+}
+
+const PURGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const PURGE_MAX_IDS = 512;
+
+/**
+ * Validated (chars `A-Za-z0-9_-`, 1..64 each), deduplicated, bounded
+ * (<= 512) assistant-message id set; `null` when the caller purges the
+ * whole exact path. Same validation contract as the in-memory store.
+ */
+function normalizePurgeMessageIds(ids: readonly string[] | undefined): string[] | null {
+  if (ids === undefined) {
+    return null;
+  }
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new MemoryValidationError('assistantMessageIds must be a non-empty array of message ids');
+  }
+  if (ids.length > PURGE_MAX_IDS) {
+    throw new MemoryValidationError(`assistantMessageIds must list at most ${PURGE_MAX_IDS} ids`);
+  }
+  const unique = [...new Set(ids)];
+  for (const id of unique) {
+    if (typeof id !== 'string' || PURGE_ID_PATTERN.test(id) === false) {
+      throw new MemoryValidationError('assistantMessageIds entries must be 1..64 characters of A-Z a-z 0-9 _ -');
+    }
+  }
+  return unique;
 }
 
 /**

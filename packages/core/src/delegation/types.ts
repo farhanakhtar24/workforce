@@ -37,4 +37,13 @@ export interface Delegation {
   readonly updatedAt: string;
   /** Set when the delegation first reaches a terminal status; never rewritten. */
   readonly completedAt: string | null;
+  /**
+   * The platform user (Better Auth `User.id`, TEXT) that owns this
+   * delegation, or `null` for LEGACY rows. Core keeps the field optional at
+   * call sites; the authenticated API layer MUST always pass an owner filter
+   * /creation value so users never touch each other's (or legacy ownerless)
+   * rows. Owner filters match EXACTLY — an expected owner never matches
+   * ownerless rows.
+   */
+  readonly ownerId: string | null;
 }

@@ -16,6 +16,7 @@ import {
   isDefaultSelection,
   isPlanActionMeaningful,
   modeGuidance,
+  parseChatPageMode,
   modeLabel,
   parseAgentSelection,
 } from '../src/lib/agents.js';
@@ -39,7 +40,8 @@ test('roster + defaults match the API slug/mode vocabulary', () => {
   assert.deepEqual([...WEB_AGENT_SLUGS], ['general', 'orchestrator', 'analyst', 'researcher']);
   assert.deepEqual([...WEB_AGENT_MODES], ['plan', 'action']);
   assert.equal(DEFAULT_AGENT, 'general');
-  assert.equal(DEFAULT_MODE, 'action');
+  // New chats default to `plan` (web-only default; API contract unchanged).
+  assert.equal(DEFAULT_MODE, 'plan');
   for (const slug of WEB_AGENT_SLUGS) assert.equal(isAgentSlug(slug), true);
   for (const mode of WEB_AGENT_MODES) assert.equal(isAgentMode(mode), true);
   assert.equal(isAgentSlug('orchestrator '), false);
@@ -49,10 +51,25 @@ test('roster + defaults match the API slug/mode vocabulary', () => {
   assert.equal(isAgentMode(undefined), false);
 });
 
-test('parseAgentSelection: unknown/missing values fall back to general/action', () => {
-  assert.deepEqual(parseAgentSelection({}), { agent: 'general', mode: 'action' });
-  assert.deepEqual(parseAgentSelection({ agent: null, mode: null }), { agent: 'general', mode: 'action' });
-  assert.deepEqual(parseAgentSelection({ agent: 'hacker', mode: 'PLAN' }), { agent: 'general', mode: 'action' });
+test('parseChatPageMode: absent/unknown ?mode= → web default plan; explicit honored', () => {
+  // Regression: the chat page fell back to the hardcoded 'action' default,
+  // breaking new chats defaulting to plan.
+  assert.equal(parseChatPageMode(undefined), 'plan');
+  assert.equal(parseChatPageMode(null), 'plan');
+  assert.equal(parseChatPageMode(''), 'plan');
+  assert.equal(parseChatPageMode('nonsense'), 'plan');
+  assert.equal(parseChatPageMode('PLAN'), 'plan');
+  // Explicit modes are honored verbatim (legacy links unchanged).
+  assert.equal(parseChatPageMode('action'), 'action');
+  assert.equal(parseChatPageMode('plan'), 'plan');
+});
+
+test('parseAgentSelection: unknown/missing values fall back to general/plan; explicit modes unchanged', () => {
+  assert.deepEqual(parseAgentSelection({}), { agent: 'general', mode: 'plan' });
+  assert.deepEqual(parseAgentSelection({ agent: null, mode: null }), { agent: 'general', mode: 'plan' });
+  assert.deepEqual(parseAgentSelection({ agent: 'hacker', mode: 'PLAN' }), { agent: 'general', mode: 'plan' });
+  // Explicit modes never change meaning (legacy links keep working).
+  assert.deepEqual(parseAgentSelection({ mode: 'action' }), { agent: 'general', mode: 'action' });
   assert.deepEqual(parseAgentSelection({ agent: 'orchestrator', mode: 'plan' }), {
     agent: 'orchestrator',
     mode: 'plan',
@@ -60,19 +77,26 @@ test('parseAgentSelection: unknown/missing values fall back to general/action', 
   // A valid agent with a garbage mode keeps the agent, defaults the mode.
   assert.deepEqual(parseAgentSelection({ agent: 'analyst', mode: 'nonsense' }), {
     agent: 'analyst',
-    mode: 'action',
+    mode: 'plan',
   });
+  assert.equal(parseAgentSelection({ mode: 'action' }).mode, 'action');
 });
 
-test('buildChatUrl: canonical agent-scoped URLs; action/default omitted', () => {
+test('buildChatUrl: canonical agent-scoped URLs; default PLAN omitted, action explicit', () => {
+  // Absent/plan mode keeps clean URLs (plan is the new-chat default).
   assert.equal(buildChatUrl(UUID), `/agents/general/chat/${UUID}`);
-  assert.equal(buildChatUrl(UUID, { agent: 'general', mode: 'action' }), `/agents/general/chat/${UUID}`);
+  assert.equal(buildChatUrl(UUID, { agent: 'general', mode: 'plan' }), `/agents/general/chat/${UUID}`);
   assert.equal(buildChatUrl(UUID, { agent: 'orchestrator' }), `/agents/orchestrator/chat/${UUID}`);
+  assert.equal(buildChatUrl(UUID, { agent: 'orchestrator', mode: 'plan' }), `/agents/orchestrator/chat/${UUID}`);
+  // Explicit action is preserved verbatim.
   assert.equal(
-    buildChatUrl(UUID, { agent: 'orchestrator', mode: 'plan' }),
-    `/agents/orchestrator/chat/${UUID}?mode=plan`,
+    buildChatUrl(UUID, { agent: 'general', mode: 'action' }),
+    `/agents/general/chat/${UUID}?mode=action`,
   );
-  assert.equal(buildChatUrl(UUID, { agent: 'general', mode: 'plan' }), `/agents/general/chat/${UUID}?mode=plan`);
+  assert.equal(
+    buildChatUrl(UUID, { agent: 'orchestrator', mode: 'action' }),
+    `/agents/orchestrator/chat/${UUID}?mode=action`,
+  );
   // Unknown selection values are coerced to the defaults, never echoed.
   assert.equal(
     buildChatUrl('a_b-c', { agent: 'evil' as never, mode: 'steal' as never }),
@@ -86,11 +110,13 @@ test('buildChatUrl: encodes unsafe chat ids but pages notFound on them', () => {
   assert.equal(buildChatUrl('chat/with slash'), '/agents/general/chat/chat%2Fwith%20slash');
 });
 
-test('buildNewChatUrl: "/" when default; selection travels as params', () => {
+test('buildNewChatUrl: "/" when default (plan); explicit action travels as param', () => {
   assert.equal(buildNewChatUrl(), '/');
-  assert.equal(buildNewChatUrl({ agent: 'general', mode: 'action' }), '/');
+  assert.equal(buildNewChatUrl({ agent: 'general', mode: 'plan' }), '/');
   assert.equal(buildNewChatUrl({ agent: 'orchestrator' }), '/?agent=orchestrator');
-  assert.equal(buildNewChatUrl({ agent: 'orchestrator', mode: 'plan' }), '/?agent=orchestrator&mode=plan');
+  // Explicit action on a new chat carries through as a clean param.
+  assert.equal(buildNewChatUrl({ mode: 'action' }), '/?mode=action');
+  assert.equal(buildNewChatUrl({ agent: 'orchestrator', mode: 'action' }), '/?agent=orchestrator&mode=action');
 });
 
 test('childChatUrl: worker children only, canonical form', () => {
@@ -145,7 +171,7 @@ test('buildSendRequest: mode rides the documented body; idempotency header uncha
   assert.deepEqual(withoutMode.headers, { 'Idempotency-Key': 'chat-abc:m-9' });
 });
 
-test('mode selector semantics: plan guidance names only withheld tools; default action', () => {
+test('mode selector semantics: plan guidance names only withheld tools; default plan', () => {
   assert.equal(modeLabel('plan'), 'Plan');
   assert.equal(modeLabel('action'), 'Action');
   assert.equal(isPlanActionMeaningful('orchestrator'), true);

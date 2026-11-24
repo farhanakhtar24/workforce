@@ -41,6 +41,13 @@ import { createBackgroundTracker } from './background.js';
 import { loadApiConfig } from './config.js';
 import { loadProjectEnvFiles } from './env.js';
 import { consoleLogger, type SafeLogger } from './logging.js';
+import { createRuntimeModelFactory } from './models/runtime.js';
+import { createModelCatalog } from './models/catalog.js';
+import {
+  createWorkforceAuth,
+  type WorkforceAuth,
+} from './auth/index.js';
+import type { ParsedAuthEnvironment } from './auth/env-config.js';
 import { createResumableStreamAdapter } from './stream-context/resumable.js';
 import { createRedisChatStore } from './store/redis.js';
 import { buildApp } from './app.js';
@@ -48,6 +55,7 @@ import { createLocalEmbeddingProvider } from './memory/embedding.js';
 import { createOllamaCompactor } from './memory/ollama-compactor.js';
 import { BullMQMemoryJobQueue } from './memory/bullmq-queue.js';
 import { createMemoryWorker, type MemoryWorkerHandle } from './memory/worker.js';
+import { createPrismaSettingsService, type SettingsServiceLike } from './settings/settings.js';
 import {
   createDataQueryService,
   type DataQueryService,
@@ -106,6 +114,12 @@ export function startupFailureReason(error: unknown): string {
     if (message === 'DATABASE_URL is required to start the API server.') {
       return 'DATABASE_URL is missing';
     }
+    if (message === 'BETTER_AUTH_SECRET and BETTER_AUTH_URL are required to start the API server.') {
+      return 'BETTER_AUTH_SECRET / BETTER_AUTH_URL are missing';
+    }
+    if (message === 'At least one complete OAuth provider (Google or GitHub) is required to start the API server.') {
+      return 'No complete OAuth provider credentials are configured';
+    }
     // Env-file hydration failure (env.ts throws this fixed literal; parser
     // errors, paths and contents are never attached nor echoed).
     if (message === 'Environment file could not be loaded.') {
@@ -125,6 +139,9 @@ export function startupFailureReason(error: unknown): string {
     // composed detail can contain schema-declared default URLs.
     if (message.startsWith('Invalid API configuration (values are never included)')) {
       return 'API configuration is invalid (check OLLAMA/REDIS/DATABASE settings)';
+    }
+    if (message.startsWith('Invalid auth configuration (values are never included)')) {
+      return 'Auth configuration is invalid (check BETTER_AUTH/GOOGLE/GITHUB settings)';
     }
   }
   // A bounded, identifier-shaped error name is the last safe surface.
@@ -203,6 +220,16 @@ export async function startServer(): Promise<ApiServerHandle> {
   if (config.databaseUrl === null) {
     // Fixed text only; never mentions the URL value.
     throw new Error('DATABASE_URL is required to start the API server.');
+  }
+  // Pre-Phase 6: the server NEVER falls back to unauthenticated access. A
+  // complete auth environment (secret + baseURL) AND at least one COMPLETE
+  // OAuth provider credential pair are startup requirements.
+  const authEnv = config.auth;
+  if (authEnv === null) {
+    throw new Error('BETTER_AUTH_SECRET and BETTER_AUTH_URL are required to start the API server.');
+  }
+  if (authEnv.google === null && authEnv.github === null) {
+    throw new Error('At least one complete OAuth provider (Google or GitHub) is required to start the API server.');
   }
 
   const provider = createOpenAICompatible({
@@ -295,14 +322,28 @@ export async function startServer(): Promise<ApiServerHandle> {
       compactor,
       logger: memoryLogger(logger),
     });
-    // Worker with its own blocking connection; concurrency 2 per spec.
-    const workerHandle = createMemoryWorker({ service: memoryService, redisUrl: config.redisUrl, logger });
+    // Pre-Phase 6: per-user opt-in settings (UserSettings upsert/read).
+    const settingsService: SettingsServiceLike = createPrismaSettingsService(prisma);
+    // Worker with its own blocking connection; concurrency 2 per spec. The
+    // personal-capture handler shares the SAME memory service (store/embed
+    // pipeline), the SAME pinned-default model, the settings gate, and the
+    // transcript store.
+    const workerHandle = createMemoryWorker({
+      service: memoryService,
+      redisUrl: config.redisUrl,
+      logger,
+      personalCapture: {
+        memory: memoryService,
+        settings: settingsService,
+        chatStore: store,
+        logger,
+      },
+    });
     queue = bullmqQueue;
     worker = workerHandle;
 
     // Startup honesty: PING the BullMQ queue connection (bounded). A down
-    // Redis must fail startup instead of serving memory writes that all 503.
-    await bullmqQueue.ping(REDIS_CONNECT_TIMEOUT_MS);
+    // Redis must fail startup instead of serving memory writes that all 503.    await bullmqQueue.ping(REDIS_CONNECT_TIMEOUT_MS);
 
     // -- Phase 4 agent runtime wiring ----------------------------------------
     // Internal delegation context: the configured secret (validated at config
@@ -326,6 +367,18 @@ export async function startServer(): Promise<ApiServerHandle> {
       signer,
       delegationTimeoutMs: config.delegationTimeoutMs,
     } as const;
+
+    // Pre-Phase 6: the Better Auth instance binds the SAME Prisma client
+    // (Prisma 6 plain-instance adapter, Prisma-adapter provider
+    // 'postgresql'). Built from the safe-parsed auth environment only.
+    const auth: WorkforceAuth = createWorkforceAuth({
+      database: prisma,
+      secret: authEnv.secret,
+      baseURL: authEnv.baseURL,
+      trustedOrigins: [config.webOrigin],
+      ...(authEnv.google !== undefined && authEnv.google !== null ? { google: authEnv.google } : {}),
+      ...(authEnv.github !== undefined && authEnv.github !== null ? { github: authEnv.github } : {}),
+    });
 
     const workDocService = new WorkDocService({ store: createPrismaWorkDocStore(prisma) });
     const delegationRepo = createPrismaDelegationRepository(prisma);
@@ -362,9 +415,16 @@ export async function startServer(): Promise<ApiServerHandle> {
     // task BEFORE listen — a down Redis must fail startup instead of serving
     // scheduler writes that all 503. Every create/update/activate/pause sync
     // is eventually re-derived here (queue state is a cache of the rows).
+    // Pre-Phase 6: reconcile ONLY OWNED, ACTIVE tasks (`ownedOnly: true`) —
+    // legacy ownerless tasks cannot run, so they are reconciled away from
+    // the queue and BullMQ never triggers them.
     await schedulerQueue.ping(REDIS_CONNECT_TIMEOUT_MS);
     try {
-      const tasks = await schedulerService.listTasks({ limit: SCHEDULER_LIST_LIMIT_MAX });
+      const tasks = await schedulerService.listTasks({
+        isActive: true,
+        ownedOnly: true,
+        limit: SCHEDULER_LIST_LIMIT_MAX,
+      });
       if (tasks.length > 0) {
         await schedulerQueue.reconcile(tasks);
       }
@@ -373,6 +433,19 @@ export async function startServer(): Promise<ApiServerHandle> {
       throw error instanceof Error ? error : new Error('Scheduler startup reconciliation failed');
     }
 
+    // Pre-Phase 6 model composition: the runtime factory (per-chat model
+    // client with the official includeUsage option) + the server-proxied
+    // catalog (60s list / 6h details caches, bounded timeout + concurrency).
+    const runtimeModels = createRuntimeModelFactory({
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+    });
+    const catalog = createModelCatalog({
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+      blockedPrefixes: config.blockedModelPrefixes,
+    });
+
     const app = buildApp({
       config,
       store,
@@ -380,6 +453,23 @@ export async function startServer(): Promise<ApiServerHandle> {
       model,
       background,
       logger,
+      models: {
+        catalog,
+        modelFor: runtimeModels.modelFor,
+        defaultModelId: config.model,
+      },
+      settings: settingsService,
+      personal: {
+        settings: settingsService,
+        memory: memoryService,
+        capture: bullmqQueue,
+      },
+      auth: {
+        auth,
+        emailAllowlist: authEnv.emailAllowlist ?? [],
+        signer,
+        providerAvailability: authEnv.providerAvailability,
+      },
       memory: { service: memoryService, queue: bullmqQueue },
       agents: {
         hostDeps,
@@ -407,6 +497,10 @@ export async function startServer(): Promise<ApiServerHandle> {
           // Bounded budgets for hydration/resume recovery reads.
           metadataTimeoutMs: SCHEDULER_METADATA_TIMEOUT_MS,
           staleRunningMs: SCHEDULER_RUNNING_STALE_MS,
+          // Signs the `internal-owner` headers scheduler runs carry on their
+          // loopback chat/hydration/resume calls (the owner comes from the
+          // DATABASE row, never the worker or a request body).
+          signer,
           logger,
         },
         logger,

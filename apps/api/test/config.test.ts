@@ -150,3 +150,44 @@ test('loadApiConfig resolves EMBEDDING_CACHE_DIR to an absolute repo-local path'
   const absolute = loadApiConfig({ ...BASE_ENV, EMBEDDING_CACHE_DIR: '/var/cache/workforce-models' });
   assert.equal(absolute.embeddingCacheDir, '/var/cache/workforce-models');
 });
+
+// ---------------------------------------------------------------------------
+// Pre-Phase 6: model policy + honest usage pricing
+// ---------------------------------------------------------------------------
+
+test('loadApiConfig defaults blocked prefixes to kimi and parses the CSV', () => {
+  const defaults = loadApiConfig(BASE_ENV);
+  assert.deepEqual(defaults.blockedModelPrefixes, ['kimi']);
+  // Case-insensitive, deduplicated, sorted; blank segments dropped.
+  assert.deepEqual(loadApiConfig({ ...BASE_ENV, WORKFORCE_BLOCKED_MODEL_PREFIXES: 'Kimi, gpt-oss , KIMI,' }).blockedModelPrefixes, ['gpt-oss', 'kimi']);
+});
+
+test('loadApiConfig bounds the blocked-prefix CSV and never echoes values', () => {
+  assert.throws(() => loadApiConfig({ ...BASE_ENV, WORKFORCE_BLOCKED_MODEL_PREFIXES: 'bad/slash' }), /WORKFORCE_BLOCKED_MODEL_PREFIXES/);
+  assert.throws(() => loadApiConfig({ ...BASE_ENV, WORKFORCE_BLOCKED_MODEL_PREFIXES: `${'x'.repeat(65)}` }), /WORKFORCE_BLOCKED_MODEL_PREFIXES/);
+  assert.throws(() => loadApiConfig({ ...BASE_ENV, WORKFORCE_BLOCKED_MODEL_PREFIXES: Array.from({ length: 17 }, (_, i) => `p${i}`).join(',') }), /at most 16/);
+});
+
+test('loadApiConfig treats blank/absent OLLAMA_MODEL_PRICING_JSON as null pricing', () => {
+  assert.equal(loadApiConfig(BASE_ENV).modelPricing, null);
+  assert.equal(loadApiConfig({ ...BASE_ENV, OLLAMA_MODEL_PRICING_JSON: '  ' }).modelPricing, null);
+});
+
+test('loadApiConfig parses bounded pricing JSON with the safe error contract', () => {
+  const pricing = loadApiConfig({ ...BASE_ENV, OLLAMA_MODEL_PRICING_JSON: JSON.stringify({ 'glm-5.3-flash': { input: 1, output: 2 } }) }).modelPricing;
+  assert.ok(pricing !== null);
+  assert.deepEqual(pricing['glm-5.3-flash'], { input: 1, output: 2 });
+
+  for (const bad of ['[]', '"x"', '{bad', '{"m":1}', '{"m":{"input":1}}', '{"m":{"input":1,"output":-2}}', '{"m":{"input":1,"output":true}}', `{"${'x'.repeat(81)}":{"input":1,"output":2}}`]) {
+    try {
+      loadApiConfig({ ...BASE_ENV, OLLAMA_MODEL_PRICING_JSON: bad });
+      assert.fail(`expected throw for ${bad}`);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /OLLAMA_MODEL_PRICING_JSON/);
+      assert.match(error.message, /values are never included/);
+    }
+  }
+  const oversized = Object.fromEntries(Array.from({ length: 201 }, (_, i) => [`m-${i}`, { input: 1, output: 1 }]));
+  assert.throws(() => loadApiConfig({ ...BASE_ENV, OLLAMA_MODEL_PRICING_JSON: JSON.stringify(oversized) }), /at most 200/);
+});

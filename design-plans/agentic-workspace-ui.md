@@ -154,3 +154,56 @@ test flaked once and passed in isolation plus the full rerun). Orchestrator
 browser verification still open for both themes × desktop/mobile ×
 empty/populated chat, including dark-contrast eyeballing of the graphite
 surfaces.
+
+## Follow-up implementation record (2026-11-24 — signed-in workspace + layout controls; all phase validation/approval statuses unchanged)
+
+Farhan's follow-up: real accounts. Implemented on `apps/web` plus the
+API-owned endpoints; better-auth pinned to the API's exact **1.7.27**.
+
+- **Same-version Better Auth React client** (`src/lib/auth-client.ts`) pointed
+  at `${API_BASE}/api/auth` with `credentials: 'include'`. **Every browser
+  API call now sends cookies**: a shared `browserApiFetch` became the default
+  fetch impl of the memory/scheduler/workdocs/delegations/recent-chats
+  request helpers and the client hydration fetch, and `browserChatFetch`
+  (standard signature) backs the AI-SDK `DefaultChatTransport.fetch` so chat
+  sends and resume carry the session too. Bodies, idempotency headers and
+  resume semantics byte-unchanged.
+- **Auth surface**: a standalone, theme-consistent `/sign-in` page — value
+  copy, ONLY the providers the API configured (public
+  `GET /api/auth/providers` booleans drive the buttons; no fake providers),
+  per-provider loading, fixed provider/offline/`?error=` access-denied copy,
+  signed-in visitors bounced to the intended route. `callbackURL` is the
+  sanitized same-origin local route (`safeLocalCallback`: absolute URLs,
+  `//`, `/\`, empty → `/`); Better Auth performs the redirect itself and
+  validates `trustedOrigins` server-side.
+- **Guard + identity**: `WorkspaceGate`/`AuthGate` wraps every shell surface
+  — loading skeleton, unauthenticated redirect to
+  `/sign-in?next=<intended local route>`, fixed access-denied panel on
+  session failures, identity row (initials/name/email) and working Sign out
+  (history never deleted) in the rail/drawer. Server-side chat hydration now
+  forwards the incoming `Cookie` header through Next `headers()` (never
+  logged); 401 in any client fetcher redirects to sign-in, 403 shows the
+  fixed denial. No test bypass exists.
+- **Layout controls**: desktop rail collapses to a `md:w-[64px]` icon rail
+  and expands back (labels hidden; New chat/Sign out reachable via icons;
+  `localStorage['workforce:sidebar-collapsed']` persistence with
+  corrupt/throwing-storage fallbacks); mobile gains an accessible drawer
+  (role=dialog, aria-modal, Esc + labelled backdrop, focus on open, body
+  scroll lock) holding nav + history while New chat stays permanently in the
+  top bar. The chat column widened ~10% to `max-w-[52.8rem]` (header block
+  aligned to the same width). Vertical nav replaced the horizontally
+  scrolled mobile nav, so the old scroll-centering helper was superseded.
+- **New chats default Plan**: absent/plan URLs keep clean canonical routes,
+  explicit `?mode=action` links work verbatim; only the web default changed
+  (`DEFAULT_MODE = 'plan'`), never an API default.
+
+Validation: web typecheck green; web tests **182/182** (172 preserved — only
+the action→plan default expectations changed intentionally — plus new
+`test/auth.test.ts` and `test/layout-controls.test.ts`); root typecheck/test
+**currently failing only inside `apps/api`'s own in-flight auth work**
+(`dbg-branch.ts` debug file, chat-mutations runtime test + chat-mutations/
+chat-routes test-stub typecheck errors — `deleteChat/branchChat/rewindChat`
+interface work owned by the API workspace; zero `apps/web` items in the
+failure logs). Real OAuth needs the provider credential pairs and remains
+the orchestrator's live gate; the `credentials: 'include'` contract itself
+is unit-tested.

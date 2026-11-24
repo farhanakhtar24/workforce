@@ -26,6 +26,8 @@ import {
   type SchedulerRunOutcome,
 } from '../src/scheduler/run-service.js';
 import { createSchedulerRestRunClient } from '../src/scheduler/run-client.js';
+import { INTERNAL_SCHEDULER_HEADER } from '../src/agents/delegation-context.js';
+import { TEST_OWNER, testInternalSigner } from './helpers.js';
 import {
   createSchedulerWorker,
   processSchedulerJob,
@@ -126,6 +128,9 @@ async function setupFixture(options: { staleRunningMs?: number; isActive?: boole
       executionTimeoutMs: 5_000,
       metadataTimeoutMs: 2_000,
       staleRunningMs: options.staleRunningMs ?? 30_000,
+      // Scheduler runs sign their loopback chat/hydration/resume calls with
+      // the ROW-derived owner (tests use the fixed TEST owner identity).
+      signer: testInternalSigner(),
       logger: silentLogger,
     },
   });
@@ -136,6 +141,7 @@ async function setupFixture(options: { staleRunningMs?: number; isActive?: boole
     prompt: TASK_PROMPT,
     recurrenceType: 'DAILY',
     recurrenceConfig: { hour: 9, minute: 0 },
+    ownerId: TEST_OWNER.userId,
     ...(options.skipDates !== undefined ? { skipDates: [...options.skipDates] } : {}),
   });
   if (options.isActive === false) {
@@ -242,6 +248,9 @@ test('claimed execution posts the isolated chat ONCE and completes with usage', 
   assert.equal(post.init?.method, 'POST');
   const headers = post.init?.headers as Record<string, string>;
   assert.equal(headers['Idempotency-Key'], `${execution.id}:${execution.id}`);
+  // The SIGNED internal-owner context is present and bound to the owner.
+  const ownerHeaderName = Object.keys(headers).find((name) => name === 'X-Workforce-Internal-Owner') ?? '';
+  assert.ok(ownerHeaderName !== '' && String(headers[ownerHeaderName]).length > 0);
   const payload = JSON.parse(String(post.init?.body)) as Record<string, unknown>;
   assert.equal(payload.id, execution.chatId);
   assert.deepEqual(payload.message, {
@@ -251,7 +260,7 @@ test('claimed execution posts the isolated chat ONCE and completes with usage', 
   });
   assert.equal(payload.mode, 'plan');
   // No delegation context header, no worker header on the chat POST.
-  assert.equal(Object.keys(headers).length, 2);
+  assert.equal(Object.keys(headers).length, 3);
 });
 
 test('tokenUsage stays null when the provider exposed no metadata', async () => {
@@ -417,6 +426,7 @@ test('ONCE occurrence nulls nextRunAt; duplicates leave it null (no dead re-add)
     prompt: TASK_PROMPT,
     recurrenceType: 'ONCE',
     recurrenceConfig: { runAt },
+    ownerId: TEST_OWNER.userId,
   });
   assert.equal(onceTask.nextRunAt, runAt);
 
@@ -790,6 +800,7 @@ function runClientFixture(
     fetchFn: fetchFn ?? rec.fetchFn,
     baseUrl: 'http://api-test',
     executionTimeoutMs: 1_000,
+    signer: testInternalSigner(),
   });
   return {
     rec,
@@ -812,6 +823,11 @@ test('run client posts the worker header and occurrence metadata; ok maps', asyn
   assert.equal(call.url, 'http://api-test/api/scheduler/tasks/00000000-0000-4000-8000-00000000def0/run-scheduled');
   const headers = call.init?.headers as Record<string, string>;
   assert.equal(headers['X-Workforce-Scheduler-Worker'], '1');
+  // The signed `internal-scheduler-run` context is bound to THIS task id.
+  const signedContext = testInternalSigner().verify(String(headers[INTERNAL_SCHEDULER_HEADER]), { kind: 'internal-scheduler-run', taskId: '00000000-0000-4000-8000-00000000def0' });
+  assert.equal(signedContext.ok, true);
+  // ...and carries NO owner (the run route derives the owner from the row).
+  assert.equal(signedContext.ok === true ? (signedContext.payload as unknown as Record<string, unknown>)['ownerId'] : 'leaked', undefined);
   const payload = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
   assert.deepEqual(payload, {
     scheduledFor: '2026-11-21T09:00:00.000Z',

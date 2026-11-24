@@ -22,6 +22,7 @@ import {
   userMessage,
   assistantMessageWithAskUser,
   randomId,
+  TEST_OWNER,
 } from './helpers.js';
 import {
   ANSWER_PENDING_ASK_USER_LUA,
@@ -103,7 +104,7 @@ test('next user turn answers the pending question (output-available) then genera
   const app = await agentsApp([textStep(), textStep()]);
   try {
     // Seed: a pending ask_user question as the LATEST assistant message.
-    await seedMessages(app.store, { slug: 'orchestrator', chatId }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId }, [
       { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'hello orchestrator' }] },
       assistantMessageWithAskUser({ id: 'a1', question: 'Which scope?', toolCallId: 'tc-1' }),
     ]);
@@ -133,7 +134,7 @@ test('an invalid new message fails 400 and never answers or mutates the pending 
   const chatId = 'hitl-invalid';
   const app = await agentsApp([textStep(), textStep()]);
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId }, [
       assistantMessageWithAskUser({ id: 'a1', question: 'Pick A or B?', toolCallId: 'tc-2' }),
     ]);
     // 256 parts (oversized) → invalid newest message.
@@ -158,7 +159,7 @@ test('duplicate submit (same idempotency key) 409s and never double-answers', { 
   const chatId = 'hitl-duplicate';
   const app = await agentsApp([textStep(), textStep()]);
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId }, [
       assistantMessageWithAskUser({ id: 'a1', question: 'Confirm?', toolCallId: 'tc-3' }),
     ]);
     const body = { id: chatId, message: userMessage('yes', 'u2') };
@@ -179,7 +180,7 @@ test('duplicate submit (same idempotency key) 409s and never double-answers', { 
 
 test('a stale/mismatched answers map to no-op updates (unresolved pending does not stick turns)', { concurrency: false }, async () => {
   const store = createInMemoryChatStore();
-  const chat = { slug: 'orchestrator', chatId: 'stale-1' };
+  const chat = { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'stale-1' };
   await store.appendMessage(chat, assistantMessageWithAskUser({ id: 'a1', question: 'Q?', toolCallId: 'tc-9' }));
   // Wrong assistant message id: typed no-op.
   assert.equal(await store.answerPendingAskUser(chat, 'a-other', 'tc-9', 'answer'), 'unchanged');
@@ -303,20 +304,20 @@ class HitlTinyRedis implements RedisLike {
 test('redis store: ask_user answers CAS exactly one entry off the raw bytes (no cjson, no re-serialize)', async () => {
   const redis = new HitlTinyRedis();
   const store = createRedisChatStore(redis);
-  const chat = { slug: 'orchestrator', chatId: 'hitl-redis' };
+  const chat = { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'hitl-redis' };
   await store.appendMessage(chat, userMessage('hi', 'u1'));
   // Raw entry carries `options: []` (an ARRAY, not {}) and a numeric literal
   // far outside double precision — the round-trip hazards of the old cjson
   // script.
   const raw = `{"id":"a1","role":"assistant","parts":[{"type":"tool-ask_user","state":"input-available","toolCallId":"tc","input":{"question":"Q","options":[],"meta":{"big":12345678901234567890,"tiny":1.5,"flag":true}}}]}`;
-  await redis.rPush(`${REDIS_KEY_PREFIX}:chat:orchestrator:hitl-redis:messages`, raw);
+  await redis.rPush(`${REDIS_KEY_PREFIX}:chat:${TEST_OWNER.userId}:orchestrator:hitl-redis:messages`, raw);
 
   const resolved = await store.answerPendingAskUser(chat, 'a1', 'tc', 'the answer');
   assert.equal(resolved, 'applied');
   assert.equal(redis.lastEval, ANSWER_PENDING_ASK_USER_LUA);
   // Exactly ONE LSET; entry count unchanged; user entry untouched.
   assert.equal(redis.lsets.length, 1);
-  const entries = redis.lists.get(`${REDIS_KEY_PREFIX}:chat:orchestrator:hitl-redis:messages`) ?? [];
+  const entries = redis.lists.get(`${REDIS_KEY_PREFIX}:chat:${TEST_OWNER.userId}:orchestrator:hitl-redis:messages`) ?? [];
   assert.equal(entries.length, 2);
 
   // BYTE assertions on the stored entry: options stayed `[]`, the large
@@ -347,15 +348,15 @@ test('redis store: ask_user answers CAS exactly one entry off the raw bytes (no 
   assert.equal(redis.lsets.length, lsetsBefore);
   // Missing ids: typed no-ops, never throws.
   assert.equal(await store.answerPendingAskUser(chat, 'a-missing', 'tc', 'x'), 'unchanged');
-  assert.equal(await store.answerPendingAskUser({ slug: 'orchestrator', chatId: 'nope' } satisfies { slug: string; chatId: string }, 'a1', 'tc', 'x'), 'unchanged');
+  assert.equal(await store.answerPendingAskUser({ ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'nope' } satisfies { ownerId: string; slug: string; chatId: string }, 'a1', 'tc', 'x'), 'unchanged');
 });
 
 test('redis store: stale CAS (concurrent writer between read and CAS) reports stale WITHOUT corrupting', async () => {
   const redis = new HitlTinyRedis();
   const store = createRedisChatStore(redis);
-  const chat = { slug: 'orchestrator', chatId: 'hitl-stale' };
+  const chat = { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'hitl-stale' };
   await store.appendMessage(chat, assistantMessageWithAskUser({ id: 'a1', question: 'Q', toolCallId: 'tc' }));
-  const messagesKey = `${REDIS_KEY_PREFIX}:chat:orchestrator:hitl-stale:messages`;
+  const messagesKey = `${REDIS_KEY_PREFIX}:chat:${TEST_OWNER.userId}:orchestrator:hitl-stale:messages`;
 
   let racedCount = 0;
   redis.beforeEachEval = () => {
@@ -391,7 +392,7 @@ test('hydration shows the answered state after resume (mid-stream refresh safe)'
   const chatId = 'hitl-hydration';
   const app = await agentsApp([textStep(), textStep()]);
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId }, [
       assistantMessageWithAskUser({ id: 'a1', question: 'Ready?', toolCallId: 'tc-5' }),
     ]);
     const before = await storedParts(app, chatId);
@@ -410,7 +411,7 @@ test('unresolved pending questions from older assistant messages do not block ne
   const chatId = 'hitl-old-pending';
   const app = await agentsApp([textStep(), textStep(), textStep()]);
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId }, [
       assistantMessageWithAskUser({ id: 'a-older', question: 'Old question', toolCallId: 'tc-old' }),
       { id: 'u-between', role: 'user', parts: [{ type: 'text', text: 'moving on' }] },
       { id: 'a-latest', role: 'assistant', parts: [{ type: 'text', text: 'sure.' }] },
@@ -438,7 +439,7 @@ test('unresolved pending questions from older assistant messages do not block ne
 
 test('in-memory store matches Redis semantics: co-located values byte/value-stable across the answer', { concurrency: false }, async () => {
   const store = createInMemoryChatStore();
-  const chat = { slug: 'orchestrator', chatId: 'hitl-memory' };
+  const chat = { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'hitl-memory' };
   await store.appendMessage(chat, {
     id: 'a-m',
     role: 'assistant',
@@ -474,7 +475,7 @@ test('multi-assistant stale pendings: newest gets the real answer, older get the
   const chatId = 'hitl-multi-stale';
   const app = await agentsApp([textStep(), textStep()]);
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId }, [
       { id: 'u0', role: 'user', parts: [{ type: 'text', text: 'start' }] },
       assistantMessageWithAskUser({ id: 'a-1', question: 'First question', toolCallId: 'tc-1' }),
       { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'skip that' }] },

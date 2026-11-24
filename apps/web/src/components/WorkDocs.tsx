@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { WorkspaceGate } from '@/components/WorkspaceShell';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -144,7 +144,7 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
   const chatContext = CHAT_ID_PATTERN.test(filters.chatId);
 
   return (
-    <WorkspaceShell
+    <WorkspaceGate
       active="work"
       eyebrow="Workspace output"
       title="Work documents"
@@ -344,7 +344,7 @@ export function WorkDocsList({ apiBaseUrl, initialChatId, initialAgent, initialS
           </p>
         )}
       </Card>
-    </WorkspaceShell>
+    </WorkspaceGate>
   );
 }
 

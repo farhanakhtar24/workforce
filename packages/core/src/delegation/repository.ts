@@ -17,8 +17,11 @@
  * - `listByParent` is deterministic (createdAt then id; see `./types.js`).
  * - `completedAt` is stamped exactly once, at the first terminal write, and
  *   never rewritten by later (idempotent) same-status writes.
- * - All multi-field writes are atomic; scope/chat ownership is encoded in the
- *   ids themselves (parentChatId/childChatId are the keys).
+ * - All multi-field writes are atomic; parent/child chat ownership is encoded
+ *   in the ids themselves (parentChatId/childChatId are the keys); platform
+ *   user ownership travels in `ownerId` (nullable, guards match EXACTLY —
+ *   `expectedOwnerId` mismatch reads as 404 before the claim/transition
+ *   logic, never a status or existence oracle).
  * - Dates: ISO strings at the public boundary.
  */
 
@@ -27,6 +30,7 @@ import type { Delegation } from './types.js';
 import type {
   DelegationCreateInput,
   DelegationListByParentInput,
+  DelegationReadOptions,
   DelegationUpdateStatusInput,
 } from './schemas.js';
 
@@ -34,32 +38,49 @@ import type {
  * Repository interface. Inputs are the RAW (z.input) shapes — defaults such as
  * `order: 'newest'` and `limit: 20` are applied by the implementation's Zod
  * schemas, so callers may pass partial objects safely.
+ *
+ * ## Ownership (documented)
+ * `ownerId` is the platform user (Better Auth `User.id`, TEXT) or null for
+ * legacy rows. Owner guards/filters match EXACTLY — an expected owner NEVER
+ * matches ownerless or other-user rows — and mismatches read as 404/null (no
+ * cross-tenant oracle). Core keeps every owner argument optional; the
+ * authenticated API layer MUST always pass the acting user's id.
  */
 export interface DelegationRepository {
   /**
    * Record a new delegation (status `pending`). Duplicate `childChatId` ->
    * DelegationConflictError. The child chat is NOT created here — the API
    * layer owns chat/prompt transport; this repository only records the
-   * hand-off.
+   * hand-off. `ownerId` persists as given (null/omitted -> ownerless legacy
+   * row).
    */
   create(input: DelegationCreateInput): Promise<Delegation>;
 
-  get(id: string): Promise<Delegation | null>;
+  /**
+   * The delegation, or null when absent. With `options.expectedOwnerId`, a
+   * foreign or ownerless row also reads as null — never an existence oracle.
+   */
+  get(id: string, options?: DelegationReadOptions): Promise<Delegation | null>;
 
   /** Deterministic list of a parent's delegations (see `./types.js`). */
   listByParent(input: DelegationListByParentInput): Promise<readonly Delegation[]>;
 
-  /** The delegation owning `childChatId`; null when absent. */
-  getByChild(childChatId: string): Promise<Delegation | null>;
+  /**
+   * The delegation owning `childChatId`; null when absent. With
+   * `options.expectedOwnerId`, foreign/ownerless rows read as null.
+   */
+  getByChild(childChatId: string, options?: DelegationReadOptions): Promise<Delegation | null>;
 
   /**
    * Transition the status machine. Same-status writes are idempotent and may
    * refresh `result`/`error`. Terminal -> anything-but-same and pending ->
    * terminal are rejected as conflicts. Missing id -> DelegationNotFoundError.
-   * When `expectedFrom` is set, the write additionally requires the CURRENT
-   * status to equal it atomically (single compare-and-set): two concurrent
-   * claims of `expectedFrom: 'pending'` produce exactly one
-   * {@link DelegationConflictError} and one winner.
+   * When `expectedOwnerId` is set, the row must belong EXACTLY to that user
+   * (ownerless legacy rows never match) or the write reads as 404 BEFORE the
+   * claim/transition logic. When `expectedFrom` is set, the write additionally
+   * requires the CURRENT status to equal it atomically (single compare-and-
+   * set): two concurrent claims of `expectedFrom: 'pending'` produce exactly
+   * one {@link DelegationConflictError} and one winner.
    */
   updateStatus(input: DelegationUpdateStatusInput): Promise<Delegation>;
 }

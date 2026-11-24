@@ -51,6 +51,7 @@ function makeTask(overrides?: Partial<AgentTask>): AgentTask {
     isActive: true,
     timezone: 'UTC',
     nextRunAt: '2026-07-02T09:30:00.000Z',
+    ownerId: null, // legacy ownerless task (type requires the field)
     createdAt: '2026-07-01T00:00:00.000Z',
     updatedAt: '2026-07-01T00:00:00.000Z',
     ...overrides,

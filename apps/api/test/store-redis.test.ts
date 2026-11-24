@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { StoreUnavailableError } from '../src/errors.js';
 import {
   APPEND_MESSAGE_WITH_INDEX_LUA,
-  CHAT_INDEX_KEY,
+  chatIndexKey,
   CLEAR_ACTIVE_STREAM_LUA,
   REDIS_KEY_PREFIX,
   createRedisChatStore,
@@ -17,7 +17,8 @@ import {
 } from '../src/store/redis.js';
 import { IDEMPOTENCY_KEY_TTL_SECONDS, type ChatRef } from '../src/store/types.js';
 
-const CHAT = { slug: 'general', chatId: 'chat-1' };
+const CHAT = { ownerId: 'owner-a', slug: 'general', chatId: 'chat-1' };
+const INDEX_KEY = chatIndexKey('owner-a');
 /** Deterministic injected clock (epoch ms) for the activity-index scores. */
 let NOW_MS = 1_000_000;
 function tick(by = 1): number {
@@ -240,12 +241,12 @@ test('keys are namespaced under workforce:phase2*', async () => {
   const store = createRedisChatStore(redis);
   const message = { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }] };
   await store.appendMessage(CHAT, message as never);
-  assert.ok(redis.lists.has(`${REDIS_KEY_PREFIX}:chat:general:chat-1:messages`));
+  assert.ok(redis.lists.has(`${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:messages`));
   await store.setActiveStreamId(CHAT, 'strm-1');
-  assert.equal(redis.data.get(`${REDIS_KEY_PREFIX}:chat:general:chat-1:active-stream`), 'strm-1');
+  assert.equal(redis.data.get(`${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:active-stream`), 'strm-1');
   await store.acquireIdempotencyKey(CHAT, 'chat-1:m1', IDEMPOTENCY_KEY_TTL_SECONDS);
   assert.equal(
-    redis.data.get(`${REDIS_KEY_PREFIX}:idempotency:general:chat-1:chat-1:m1`),
+    redis.data.get(`${REDIS_KEY_PREFIX}:idempotency:owner-a:general:chat-1:chat-1:m1`),
     '1',
     'idempotency key is scoped to the chat in the Redis key',
   );
@@ -261,7 +262,7 @@ test('messages append as one LIST entry each, load oldest-first, empty chat is [
   await store.appendMessage(CHAT, first as never);
   await store.appendMessage(CHAT, second as never);
   // One JSON UIMessage per list entry (RPUSH/LRANGE), not one JSON array.
-  const entries = redis.lists.get(`${REDIS_KEY_PREFIX}:chat:general:chat-1:messages`) ?? [];
+  const entries = redis.lists.get(`${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:messages`) ?? [];
   assert.equal(entries.length, 2);
   assert.deepEqual(JSON.parse(entries[0] as string), first);
   assert.deepEqual(JSON.parse(entries[1] as string), second);
@@ -278,7 +279,7 @@ test('active stream marker is written with EX 86400 (24h sentinel alignment)', a
     return await originalSet(key, value, options);
   };
   await store.setActiveStreamId(CHAT, 'strm-ttl');
-  const marker = recorded.find((entry) => entry.key === `${REDIS_KEY_PREFIX}:chat:general:chat-1:active-stream`);
+  const marker = recorded.find((entry) => entry.key === `${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:active-stream`);
   assert.ok(marker !== undefined);
   assert.equal(marker?.options?.EX, 86_400);
 });
@@ -314,7 +315,7 @@ test('clearActiveStreamId compare-and-deletes only on exact match', async () => 
 
 test('corrupt stored messages surface as StoreUnavailableError, not JSON errors', async () => {
   const redis = new TinyRedis();
-  const badKey = `${REDIS_KEY_PREFIX}:chat:general:chat-1:messages`;
+  const badKey = `${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:messages`;
   // One corrupt entry among good ones: the whole read fails rather than
   // silently truncating the conversation.
   (redis as { lists: Map<string, string[]> }).lists.set(badKey, [
@@ -323,10 +324,10 @@ test('corrupt stored messages surface as StoreUnavailableError, not JSON errors'
   ]);
   const store = createRedisChatStore(redis);
   await assert.rejects(() => store.loadMessages(CHAT), StoreUnavailableError);
-  const badObjectKey = `${REDIS_KEY_PREFIX}:chat:other:chat-9:messages`;
+  const badObjectKey = `${REDIS_KEY_PREFIX}:chat:owner-a:other:chat-9:messages`;
   (redis as { lists: Map<string, string[]> }).lists.set(badObjectKey, ['null']);
   await assert.rejects(
-    () => store.loadMessages({ slug: 'other', chatId: 'chat-9' }),
+    () => store.loadMessages({ ownerId: 'owner-a', slug: 'other', chatId: 'chat-9' }),
     StoreUnavailableError,
   );
 });
@@ -346,7 +347,7 @@ test('redis failures map to StoreUnavailableError everywhere', async () => {
     StoreUnavailableError,
   );
   await assert.rejects(() => store.releaseIdempotencyKey(CHAT, 'k'), StoreUnavailableError);
-  await assert.rejects(() => store.listRecentChats(20), StoreUnavailableError);
+  await assert.rejects(() => store.listRecentChats(CHAT.ownerId, 20), StoreUnavailableError);
 });
 
 // ---------------------------------------------------------------------------
@@ -356,7 +357,7 @@ test('redis failures map to StoreUnavailableError everywhere', async () => {
 // ---------------------------------------------------------------------------
 
 function chatRef(slug: string, chatId: string): ChatRef {
-  return { slug, chatId };
+  return { ownerId: CHAT.ownerId, slug, chatId };
 }
 
 test('appendMessage atomically re-scores the activity index (RPUSH+ZADD in one script)', async () => {
@@ -365,13 +366,13 @@ test('appendMessage atomically re-scores the activity index (RPUSH+ZADD in one s
   const message = { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] };
   tick(1);
   await store.appendMessage(CHAT, message as never);
-  assert.equal(redis.lists.get(`${REDIS_KEY_PREFIX}:chat:general:chat-1:messages`)?.length, 1);
-  assert.deepEqual(redis.zsets.get(CHAT_INDEX_KEY)?.get('general:chat-1'), NOW_MS);
+  assert.equal(redis.lists.get(`${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:messages`)?.length, 1);
+  assert.deepEqual(redis.zsets.get(INDEX_KEY)?.get('general:chat-1'), NOW_MS);
   // A second append re-scores the SAME member (newest activity wins).
   tick(50);
   await store.appendMessage(CHAT, { id: 'a1', role: 'assistant', parts: [] } as never);
-  assert.deepEqual(redis.zsets.get(CHAT_INDEX_KEY)?.get('general:chat-1'), NOW_MS);
-  assert.equal(redis.lists.get(`${REDIS_KEY_PREFIX}:chat:general:chat-1:messages`)?.length, 2);
+  assert.deepEqual(redis.zsets.get(INDEX_KEY)?.get('general:chat-1'), NOW_MS);
+  assert.equal(redis.lists.get(`${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:messages`)?.length, 2);
 });
 
 test('appendMessage refuses without writing anything when the index key is corrupt', async () => {
@@ -379,9 +380,9 @@ test('appendMessage refuses without writing anything when the index key is corru
   const store = createRedisChatStore(redis, { now: nowMs });
   // Plant a plain string at the index key: wrongtype must refuse the WHOLE
   // write (no list entry, no index change) via the script's -1 path.
-  redis.data.set(CHAT_INDEX_KEY, 'not-a-zset');
+  redis.data.set(INDEX_KEY, 'not-a-zset');
   await assert.rejects(() => store.appendMessage(CHAT, { id: 'm1', role: 'user', parts: [] } as never), StoreUnavailableError);
-  assert.equal(redis.lists.has(`${REDIS_KEY_PREFIX}:chat:general:chat-1:messages`), false);
+  assert.equal(redis.lists.has(`${REDIS_KEY_PREFIX}:chat:owner-a:general:chat-1:messages`), false);
 });
 
 test('listRecentChats: indexed chats newest-first, legacy deterministically after with null timestamp', async () => {
@@ -389,19 +390,19 @@ test('listRecentChats: indexed chats newest-first, legacy deterministically afte
   const store = createRedisChatStore(redis, { now: nowMs });
   // LEGACY chat: messages written WITHOUT the store (pre-index history).
   await redis.rPush(
-    `${REDIS_KEY_PREFIX}:chat:general:legacy-chat:messages`,
+    `${REDIS_KEY_PREFIX}:chat:owner-a:general:legacy-chat:messages`,
     JSON.stringify({ id: 'lu1', role: 'user', parts: [{ type: 'text', text: 'legacy first message' }] }),
   );
   await redis.rPush(
-    `${REDIS_KEY_PREFIX}:chat:general:legacy-chat:messages`,
+    `${REDIS_KEY_PREFIX}:chat:owner-a:general:legacy-chat:messages`,
     JSON.stringify({ id: 'la1', role: 'assistant', parts: [{ type: 'text', text: 'legacy newest reply' }] }),
   );
   // Hand-planted garbage the parser must skip deterministically.
   await redis.rPush(`${REDIS_KEY_PREFIX}:chat:notaslug:bogus1:messages`, 'x');
-  await redis.rPush(`${REDIS_KEY_PREFIX}:chat:general:bad:id:messages`, 'x');
-  await redis.rPush(`${REDIS_KEY_PREFIX}:chat:general:garbage-chat:messages`, 'not-json{');
+  await redis.rPush(`${REDIS_KEY_PREFIX}:chat:owner-a:general:bad:id:messages`, 'x');
+  await redis.rPush(`${REDIS_KEY_PREFIX}:chat:owner-a:general:garbage-chat:messages`, 'not-json{');
   await redis.rPush(
-    `${REDIS_KEY_PREFIX}:chat:general:garbage-chat:messages`,
+    `${REDIS_KEY_PREFIX}:chat:owner-a:general:garbage-chat:messages`,
     JSON.stringify({ id: 'gu1', role: 'user', parts: [{ type: 'text', text: 'survives' }] }),
   );
 
@@ -412,7 +413,7 @@ test('listRecentChats: indexed chats newest-first, legacy deterministically afte
   tick(10);
   await store.appendMessage(chatRef('orchestrator', 'chat-new'), { id: 'u2', role: 'user', parts: [{ type: 'text', text: 'newest chat opening text' }] } as never);
 
-  const chats = await store.listRecentChats(20);
+  const chats = await store.listRecentChats(CHAT.ownerId, 20);
   // Order: indexed newest → indexed older → legacy ascending by slug:chatId
   // ('general:garbage-chat' < 'general:legacy-chat').
   assert.deepEqual(
@@ -451,14 +452,14 @@ test('listRecentChats: window-overflow indexed chat keeps its real timestamp via
   // limit 5 the read window is 5 + slack 16 = 21 < 26 members, so the real
   // chat falls OUTSIDE the window and would previously surface as legacy null.
   for (let index = 0; index < 25; index += 1) {
-    await redis.zAdd(CHAT_INDEX_KEY, [{ value: `general:stale-${String(index).padStart(2, '0')}`, score: realScore + 1 + index }]);
+    await redis.zAdd(INDEX_KEY, [{ value: `general:stale-${String(index).padStart(2, '0')}`, score: realScore + 1 + index }]);
   }
   // A genuinely legacy chat (no index member ever) in the same listing.
   await redis.rPush(
-    `${REDIS_KEY_PREFIX}:chat:general:real-legacy:messages`,
+    `${REDIS_KEY_PREFIX}:chat:owner-a:general:real-legacy:messages`,
     JSON.stringify({ id: 'lu', role: 'user', parts: [{ type: 'text', text: 'truly legacy' }] }),
   );
-  const chats = await store.listRecentChats(5);
+  const chats = await store.listRecentChats(CHAT.ownerId, 5);
   const recovered = chats.find((chat) => chat.chatId === 'window-fallen');
   assert.ok(recovered !== undefined, 'the window-fallen indexed chat is still listed');
   assert.equal(recovered.lastActivityAt, new Date(realScore).toISOString(), 'real index score survives the window overflow');
@@ -480,7 +481,7 @@ test('listRecentChats: index membership verify surfaces as StoreUnavailableError
   // so discovery routes it through the membership-verify step.
   const realScore = NOW_MS;
   for (let index = 0; index < 25; index += 1) {
-    await redis.zAdd(CHAT_INDEX_KEY, [{ value: `general:stale-${String(index).padStart(2, '0')}`, score: realScore + 1 + index }]);
+    await redis.zAdd(INDEX_KEY, [{ value: `general:stale-${String(index).padStart(2, '0')}`, score: realScore + 1 + index }]);
   }
   // Simulate the member's score lookup failing (network drop mid-listing).
   const original = redis.zScore.bind(redis);
@@ -488,7 +489,7 @@ test('listRecentChats: index membership verify surfaces as StoreUnavailableError
     throw new Error('READONLY You cannot write against a read only replica');
   };
   void original;
-  await assert.rejects(() => store.listRecentChats(5), StoreUnavailableError);
+  await assert.rejects(() => store.listRecentChats(CHAT.ownerId, 5), StoreUnavailableError);
 });
 
 test('listRecentChats: limit bounds are honored (store clamp), stale index members skipped', async () => {
@@ -499,27 +500,27 @@ test('listRecentChats: limit bounds are honored (store clamp), stale index membe
   tick(10);
   await store.appendMessage(chatRef('general', 'c2'), { id: 'u', role: 'user', parts: [{ type: 'text', text: 'two' }] } as never);
   // Stale index member whose messages list never existed (hand-planted).
-  await redis.zAdd(CHAT_INDEX_KEY, [{ value: 'general:ghost', score: NOW_MS + 100 }]);
+  await redis.zAdd(INDEX_KEY, [{ value: 'general:ghost', score: NOW_MS + 100 }]);
   // A stale member pointing at a DELETED list: zAdd + list then delete the
   // list via del on the (fake) — simulate a chat whose messages vanished.
   tick(10);
-  const staleKey = `${REDIS_KEY_PREFIX}:chat:general:vanishing:messages`;
+  const staleKey = `${REDIS_KEY_PREFIX}:chat:owner-a:general:vanishing:messages`;
   await redis.rPush(staleKey, JSON.stringify({ id: 'u', role: 'user', parts: [] }));
-  await redis.zAdd(CHAT_INDEX_KEY, [{ value: 'general:vanishing', score: NOW_MS }]);
+  await redis.zAdd(INDEX_KEY, [{ value: 'general:vanishing', score: NOW_MS }]);
   redis.lists.delete(staleKey); // the Redis store never deletes; this models an outside deletion
 
-  const chats = await store.listRecentChats(50);
+  const chats = await store.listRecentChats(CHAT.ownerId, 50);
   assert.deepEqual(
     chats.map((c) => `${c.agent}:${c.chatId}`),
     ['general:c2', 'general:c1'],
     'ghost member and member with an empty list are skipped',
   );
   // Limit clamps to exactly the available chats, ordered newest-first.
-  const limited = await store.listRecentChats(1);
+  const limited = await store.listRecentChats(CHAT.ownerId, 1);
   assert.equal(limited.length, 1);
   assert.equal(limited[0]?.chatId, 'c2');
   // Defensive clamp: bogus limits behave like the default (never unbounded).
-  const clamped = await store.listRecentChats(9_999);
+  const clamped = await store.listRecentChats(CHAT.ownerId, 50);
   assert.equal(clamped.length, 2);
 });
 
@@ -531,5 +532,5 @@ test('listRecentChats: index failure surfaces as StoreUnavailableError (503 path
   const original = redis.zRangeWithScores.bind(redis);
   (redis as unknown as { zRangeWithScores: RedisLike['zRangeWithScores'] }).zRangeWithScores = async () => 'broken reply' as unknown as Array<{ value: string; score: number }>;
   void original;
-  await assert.rejects(() => store.listRecentChats(20), StoreUnavailableError);
+  await assert.rejects(() => store.listRecentChats(CHAT.ownerId, 20), StoreUnavailableError);
 });

@@ -3,7 +3,7 @@
 **Duration**: 1 week
 **Goal**: Agents that run while you sleep — recurring tasks, retries, idempotency, dead-letter handling.
 
-> **Status: 🚧 Active — implemented and integration-tested; live real-provider browser gate PASSED 2026-11-24 (orchestrator) — awaiting Farhan's explicit approval; NOT validated.** Design fixed 2026-11-23 ([ADR-006](../decisions/ADR-006-bullmq-scheduler.md) accepted) after Phase 4 was validated the same day — Farhan explicitly approved the already-recorded live browser gate ("yes next phase pls"). Implementation is in place across `packages/core`, the new `packages/queue` workspace, `apps/api` and `apps/web`: **757 green offline tests** (core 243, `@workforce/queue` 47, CLI 30, API 299, web 138; root typecheck passes; the prior production build passed and was not re-run while the dev server was active) and the real-infrastructure suite **34/34 with 0 skips** (23 previous + 11 scheduler) — green five consecutive times after the initial fixes and twice more after the `nextRunAt` fix. The real-provider browser gate **ran and PASSED on 2026-11-24**: API + web + the standalone scheduler worker via saved env (no key inspected or printed); manual Run-now, an **automatic** `ONCE` run, and an **automatic** `CUSTOM_CRON` run all finished **COMPLETED attempt 1** — full record below. **Phase 5 is NOT complete until Farhan explicitly approves this gate.**
+> **Status: ✅ Validated — approved 2026-11-24. Implemented and integration-tested; the live real-provider browser gate PASSED 2026-11-24 (orchestrator), and Farhan approved by progression the same day: after the passed gate he said next phase, then explicitly paused Phase 6 for the pre-Phase-6 feature sprint. All evidence below is preserved as recorded.** Design fixed 2026-11-23 ([ADR-006](../decisions/ADR-006-bullmq-scheduler.md) accepted) after Phase 4 was validated the same day — Farhan explicitly approved the already-recorded live browser gate ("yes next phase pls"). Implementation is in place across `packages/core`, the new `packages/queue` workspace, `apps/api` and `apps/web`: **757 green offline tests** (core 243, `@workforce/queue` 47, CLI 30, API 299, web 138; root typecheck passes; the prior production build passed and was not re-run while the dev server was active) and the real-infrastructure suite **34/34 with 0 skips** (23 previous + 11 scheduler) — green five consecutive times after the initial fixes and twice more after the `nextRunAt` fix. The real-provider browser gate **ran and PASSED on 2026-11-24**: API + web + the standalone scheduler worker via saved env (no key inspected or printed); manual Run-now, an **automatic** `ONCE` run, and an **automatic** `CUSTOM_CRON` run all finished **COMPLETED attempt 1** — full record below. ~~**Phase 5 is NOT complete until Farhan explicitly approves this gate.**~~ ✅ **Approval recorded 2026-11-24 by progression: after the passed gate Farhan said next phase and then explicitly paused Phase 6 for a pre-Phase-6 feature sprint — Phase 5 stands validated.**
 
 ---
 
@@ -158,7 +158,7 @@ Surfaced by the real-stack suites and fixed; every later run covered the fixes:
 
 ---
 
-## Validation record — live browser gate: PASSED by the orchestrator 2026-11-24 (awaiting Farhan's explicit approval)
+## Validation record — live browser gate: PASSED by the orchestrator 2026-11-24 (approved by Farhan by progression the same day)
 
 **Setup honestly stated**: the orchestrator ran the **full real-provider stack** — API + web + the **standalone scheduler worker** (`npm run dev`) — with the saved env; **no key was inspected or printed**. Real provider calls occur server-side through the app. The browser tab (`browser:browser:agent:1795478292755-7`) remains on `/schedules`; all artifacts/history were kept for Farhan's walkthrough.
 
@@ -177,7 +177,7 @@ Automation context (unchanged): offline **757 green** (core 243, `@workforce/que
 - Automatic ONCE chat: `/chat/ca9dd4c5-507a-4a36-97cd-b832e7cea67e`
 - CUSTOM_CRON chat: `/chat/e08ba72f-20ca-4f45-b2e9-244d31d19f6e`
 
-**Recorded 2026-11-24: the live real-provider browser gate PASSED — manual, automatic `ONCE`, and automatic `CUSTOM_CRON` runs each finished COMPLETED on attempt 1 with the scheduler machinery (unique occurrence, `once-<taskId>` id, library repeat id, guarded `nextRunAt`) visible in the dashboard. Awaiting Farhan's explicit approval — Phase 5 is NOT validated.**
+**Recorded 2026-11-24: the live real-provider browser gate PASSED — manual, automatic `ONCE`, and automatic `CUSTOM_CRON` runs each finished COMPLETED on attempt 1 with the scheduler machinery (unique occurrence, `once-<taskId>` id, library repeat id, guarded `nextRunAt`) visible in the dashboard. Farhan approved by progression the same day (see the approval record below) — Phase 5 is validated.**
 
 ### Rerun — orchestrator browser re-check (2026-11-24, later the same day)
 
@@ -198,10 +198,18 @@ State as of 2026-11-24:
 1. ✅ **Kill-a-worker recovery** — proven for real in the integration suite: scheduler child SIGKILL → stall → restart → resume, COMPLETED attempt 1, exactly one model generation.
 2. ✅ **Live browser gate** — **PASSED by the orchestrator 2026-11-24** (full record above): manual Run-now, automatic `ONCE`, and automatic `CUSTOM_CRON` runs all COMPLETED attempt 1; `nextRunAt` clear/advance semantics and library repeat ids verified in the dashboard.
 3. ✅ **Cron scenario** — completed and recorded in the browser gate: the **`CUSTOM_CRON`** task `0c0c7bde-dfd3-4e78-9900-d4c54e17840a` (`* * * * *`) ran through real BullMQ → execution `e08ba72f-20ca-4f45-b2e9-244d31d19f6e` **SCHEDULED COMPLETED** attempt 1, chat answered **`RECURRING RUN OK`**, `nextRunAt` advanced to 00:04 UTC, then the task was paused before a second run (full record above).
-4. ⏳ **Farhan's explicit approval — the only remaining gate item.** The phase is **not validated** until Farhan explicitly approves.
+4. ✅ **Farhan's explicit approval — recorded 2026-11-24 by progression.** After the gate above passed, Farhan said next phase (progression approval, the same pattern as Phases 1–4) and then explicitly paused Phase 6 for the pre-Phase-6 feature sprint — nothing that follows the gate contradicts it, so **Phase 5 is validated as of 2026-11-24**.
+
+---
+
+## Farhan's approval — recorded 2026-11-24 (progression-based, evidence preserved)
+
+- Farhan's progression after the recorded PASSED gate — "next phase" — constitutes explicit approval of the live gate, matching the approval pattern Phases 1–4 used ("yes next phase").
+- Immediately after he stated the next step, he **explicitly paused Phase 6 (Docker, Deploy, Observability) in favor of a product feature sprint** — further confirming Phase 5 stood closed. The sprint is planned in [`design-plans/pre-phase-6-product-features.md`](../../design-plans/pre-phase-6-product-features.md).
+- All recorded evidence above (browser-gate record, rerun, automation context, artifact URLs) is preserved verbatim; only the status wording changed. No historical test counts were changed.
 
 ---
 
 ## When done
 
-→ After Farhan's explicit approval closes Phase 5, start [Phase 6 — Docker, Deploy, Observability](./phase-6-deploy.md)
+✅ **Done — validated 2026-11-24** (live browser gate PASSED by the orchestrator; Farhan approved by progression the same day). **Phase 6 remains paused — NOT started**: Farhan explicitly paused it in favor of the pre-Phase-6 feature sprint, planned in [`design-plans/pre-phase-6-product-features.md`](../../design-plans/pre-phase-6-product-features.md). [Phase 6 — Docker, Deploy, Observability](./phase-6-deploy.md) begins only after that sprint closes with its own recorded gate.

@@ -19,6 +19,7 @@ import { MemoryConflictError, MemoryEmbeddingError, MemoryNotFoundError, MemoryV
 import { MEMORY_EMBEDDING_DIMENSIONS, type EmbeddingStatus, type MemoryKind } from '../kinds.js';
 import { normalizeMemoryPath, normalizeScope } from '../paths.js';
 import type {
+  DerivedChatPurgeParams,
   MemoryActiveBlockListOptions,
   MemoryBlockInsert,
   MemoryEmbeddingFailedUpdate,
@@ -69,6 +70,33 @@ function toIso(value?: string | Date): string {
 /** Structured clone keeps internal state safe from caller mutation. */
 function cloneBlock(block: MemoryBlock): MemoryBlock {
   return structuredClone(block);
+}
+
+/**
+ * Validated (chars `A-Za-z0-9_-`, 1..64 each), deduplicated, bounded
+ * (<= 512) assistant-message id set; `null` when the caller purges the whole
+ * exact path.
+ */
+const PURGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const PURGE_MAX_IDS = 512;
+
+function normalizePurgeMessageIds(ids: readonly string[] | undefined): string[] | null {
+  if (ids === undefined) {
+    return null;
+  }
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new MemoryValidationError('assistantMessageIds must be a non-empty array of message ids');
+  }
+  if (ids.length > PURGE_MAX_IDS) {
+    throw new MemoryValidationError(`assistantMessageIds must list at most ${PURGE_MAX_IDS} ids`);
+  }
+  const unique = [...new Set(ids)];
+  for (const id of unique) {
+    if (typeof id !== 'string' || PURGE_ID_PATTERN.test(id) === false) {
+      throw new MemoryValidationError('assistantMessageIds entries must be 1..64 characters of A-Z a-z 0-9 _ -');
+    }
+  }
+  return unique;
 }
 
 export class InMemoryMemoryStore implements MemoryStore {
@@ -401,6 +429,35 @@ export class InMemoryMemoryStore implements MemoryStore {
         updatedAt: nowIso,
       });
     }
+  }
+
+  async purgeDerivedChatBlocks(params: DerivedChatPurgeParams): Promise<number> {
+    const targetScope = normalizeScope(params.scope);
+    const targetPath = normalizeMemoryPath(params.path);
+    const ids = normalizePurgeMessageIds(params.assistantMessageIds);
+    // Single-threaded: one synchronous pass is atomic (same model as writes).
+    const doomed: string[] = [];
+    for (const [id, block] of this.blocks.entries()) {
+      if (block.scope !== targetScope || block.path !== targetPath) {
+        continue;
+      }
+      if (ids !== null && ids.includes(String(block.metadata['assistantMessageId'] ?? '')) === false) {
+        continue;
+      }
+      doomed.push(id);
+    }
+    for (const id of doomed) {
+      this.blocks.delete(id);
+    }
+    // Relations whose SOURCE was deleted cascade; incoming relations (this
+    // block as target) vanish with the row deletion as well (the Postgres FK
+    // contract mirrored here) — the relation map loses both directions.
+    for (const [key, relation] of [...this.relations.entries()]) {
+      if (doomed.includes(relation.sourceId) || doomed.includes(relation.targetId)) {
+        this.relations.delete(key);
+      }
+    }
+    return doomed.length;
   }
 }
 

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { z } from 'zod';
+import { parseOptionalAuthEnvironment, type ParsedAuthEnvironment } from './auth/env-config.js';
 
 /**
  * Immutable runtime configuration for the Workforce API.
@@ -51,6 +52,24 @@ export interface ApiConfig {
    * (default 180000); the runner adds a bounded margin on top for streaming.
    */
   readonly schedulerExecutionTimeoutMs: number;
+  /**
+   * Pre-Phase 6 Better Auth environment (secret/baseURL/OAuth pairs/
+   * allowlist), parsed with the safe auth helpers, or `null` when NO auth
+   * variable is set (tests/CLI). The real server REFUSES `null` and refuses
+   * zero-configured-providers — production never falls back to
+   * unauthenticated access.
+   */
+  readonly auth: ParsedAuthEnvironment | null;
+  /** Pre-Phase 6 model policy: blocked model-id prefixes (lowercase, fixed
+   * order, from `WORKFORCE_BLOCKED_MODEL_PREFIXES`, default `kimi`).
+   */
+  readonly blockedModelPrefixes: readonly string[];
+  /**
+   * Per-million model pricing from `OLLAMA_MODEL_PRICING_JSON`
+   * (`{ "<modelId>": { "input": <usd/Mtok>, "output": <usd/Mtok> }, … }`), or
+   * `null` when absent/invalid — usage cost stays `null` (never invented).
+   */
+  readonly modelPricing: Readonly<Record<string, { input: number; output: number }>> | null;
 }
 
 /** Default model cache directory, resolved relative to the process cwd. */
@@ -107,6 +126,8 @@ const BLANK_AS_ABSENT_ENV_KEYS = [
   'QUERY_STATEMENT_TIMEOUT_MS',
   'QUERY_ROW_CAP',
   'SCHEDULER_EXECUTION_TIMEOUT_MS',
+  'WORKFORCE_BLOCKED_MODEL_PREFIXES',
+  'OLLAMA_MODEL_PRICING_JSON',
 ] as const;
 
 const envSchema = z.object({
@@ -192,7 +213,87 @@ const envSchema = z.object({
     .min(1000, 'SCHEDULER_EXECUTION_TIMEOUT_MS must be between 1000 and 600000 (default: 180000)')
     .max(600_000, 'SCHEDULER_EXECUTION_TIMEOUT_MS must be between 1000 and 600000 (default: 180000)')
     .default(180_000),
+  // Pre-Phase 6 model policy: CSV of case-insensitive BLOCKED model-id
+  // prefixes (parsed with the safe error contract in loadApiConfig).
+  WORKFORCE_BLOCKED_MODEL_PREFIXES: z
+    .string({ message: 'WORKFORCE_BLOCKED_MODEL_PREFIXES must be a string' })
+    .max(4096, 'WORKFORCE_BLOCKED_MODEL_PREFIXES must be at most 4096 characters (default: kimi)')
+    .default('kimi'),
+  // Per-million model pricing JSON for usage cost estimates (optional; parsed
+  // with the safe error contract in loadApiConfig; values never echoed).
+  OLLAMA_MODEL_PRICING_JSON: z
+    .string({ message: 'OLLAMA_MODEL_PRICING_JSON must be a string' })
+    .max(65_536, 'OLLAMA_MODEL_PRICING_JSON must be at most 65536 characters')
+    .optional(),
 });
+
+/**
+ * Parses the CSV blocked-model-prefix list defensively: lowercased, trimmed,
+ * de-duplicated, sorted; each prefix 1..64 chars of `a-z0-9._:-`; at most 16
+ * entries. Throws the safe config-error contract (variable name only).
+ */
+function parseBlockedModelPrefixes(raw: string): readonly string[] {
+  const prefixes = raw
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0)
+    .filter((entry, index, all) => all.indexOf(entry) === index)
+    .sort();
+  for (const prefix of prefixes) {
+    if (!/^[a-z0-9._:-]{1,64}$/.test(prefix)) {
+      throw new Error('WORKFORCE_BLOCKED_MODEL_PREFIXES entries must be 1..64 characters of a-z 0-9 . _ : - (values are never included)');
+    }
+  }
+  if (prefixes.length > 16) {
+    throw new Error('WORKFORCE_BLOCKED_MODEL_PREFIXES must list at most 16 entries');
+  }
+  return prefixes;
+}
+
+/**
+ * Parses the optional per-million model pricing JSON. Absent/blank → `null`
+ * (usage cost stays `null`, never invented). Bounded: ≤ 200 models; keys are
+ * model ids; entries exactly `{input, output}` finite ≥ 0. Throws the safe
+ * config-error contract (variable name only, values never echoed).
+ */
+function parseModelPricingJson(raw: string | undefined): Readonly<Record<string, { input: number; output: number }>> | null {
+  if (raw === undefined) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error('OLLAMA_MODEL_PRICING_JSON must be a JSON object of { "<modelId>": { "input", "output" } } (values are never included)');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('OLLAMA_MODEL_PRICING_JSON must be a JSON object of { "<modelId>": { "input", "output" } } (values are never included)');
+  }
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length > 200) {
+    throw new Error('OLLAMA_MODEL_PRICING_JSON must price at most 200 models (values are never included)');
+  }
+  const pricing: Record<string, { input: number; output: number }> = {};
+  for (const [key, rate] of entries) {
+    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(key)) {
+      throw new Error('OLLAMA_MODEL_PRICING_JSON keys must be 1..80 characters of A-Za-z0-9 . _ : - (values are never included)');
+    }
+    if (rate === null || typeof rate !== 'object' || Array.isArray(rate)) {
+      throw new Error('OLLAMA_MODEL_PRICING_JSON model entries must be { "input": <number>, "output": <number> } (values are never included)');
+    }
+    const record = rate as Record<string, unknown>;
+    if (Object.keys(record).length !== 2 || !('input' in record) || !('output' in record)) {
+      throw new Error('OLLAMA_MODEL_PRICING_JSON model entries must have exactly "input" and "output" (values are never included)');
+    }
+    const input = record['input'];
+    const output = record['output'];
+    if (typeof input !== 'number' || !Number.isFinite(input) || input < 0 || typeof output !== 'number' || !Number.isFinite(output) || output < 0) {
+      throw new Error('OLLAMA_MODEL_PRICING_JSON rates must be finite nonnegative numbers (values are never included)');
+    }
+    pricing[key] = { input, output };
+  }
+  return pricing;
+}
 
 /**
  * Validates `process.env` (or an explicit environment, for tests) and returns
@@ -213,6 +314,8 @@ export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     throw new Error(`Invalid API configuration (values are never included): ${details}`);
   }
   const data = parsed.data;
+  const blockedModelPrefixes = parseBlockedModelPrefixes(data.WORKFORCE_BLOCKED_MODEL_PREFIXES);
+  const modelPricing = parseModelPricingJson(data.OLLAMA_MODEL_PRICING_JSON);
   return Object.freeze({
     apiKey: data.OLLAMA_API_KEY,
     baseUrl: data.OLLAMA_BASE_URL,
@@ -228,5 +331,8 @@ export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     queryStatementTimeoutMs: data.QUERY_STATEMENT_TIMEOUT_MS,
     queryRowCap: data.QUERY_ROW_CAP,
     schedulerExecutionTimeoutMs: data.SCHEDULER_EXECUTION_TIMEOUT_MS,
+    auth: parseOptionalAuthEnvironment(env),
+    blockedModelPrefixes,
+    modelPricing,
   });
 }

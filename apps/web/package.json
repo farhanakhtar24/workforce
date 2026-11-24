@@ -16,6 +16,7 @@
   "dependencies": {
     "@ai-sdk/react": "^3.0.336",
     "ai": "^6.0.333",
+    "better-auth": "1.7.27",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.79.0",

@@ -78,6 +78,13 @@ export const workDocSummarySchema = z
 
 export const workDocActorIdSchema = workDocExternalIdSchema;
 
+/**
+ * Platform-user owner id (Better Auth `User.id`, TEXT — NOT a UUID): trimmed,
+ * 1..128 characters. Legacy ownerless rows carry `null`; owner filters match
+ * EXACTLY (an expected owner never matches ownerless rows).
+ */
+export const workDocOwnerIdSchema = workDocExternalIdSchema;
+
 export const workDocLabelSchema = z
   .string()
   .trim()
@@ -98,6 +105,11 @@ export const createWorkDocInputSchema = z.strictObject({
   title: workDocTitleSchema,
   content: workDocContentSchema,
   status: workDocStatusSchema.optional().default('draft'),
+  /**
+   * Optional platform-user owner id (legacy callers omit it; the row is then
+   * ownerless). The authenticated API layer MUST always pass the acting user.
+   */
+  ownerId: workDocOwnerIdSchema.optional(),
 });
 
 /**
@@ -118,6 +130,11 @@ export const updateWorkDocInputSchema = z
     summary: workDocSummarySchema.optional(),
     expectedScope: memoryScopeSchema.optional(),
     expectedChatId: workDocExternalIdSchema.optional(),
+    /**
+     * Owner guard: when set, the document must belong EXACTLY to this user
+     * (ownerless legacy rows never match) or the mutation reads as 404.
+     */
+    expectedOwnerId: workDocOwnerIdSchema.optional(),
   })
   .refine((value) => value.title !== undefined || value.content !== undefined || value.status !== undefined, {
     message: 'update must change at least one of title, content, or status',
@@ -133,6 +150,8 @@ export const rollbackWorkDocInputSchema = z.strictObject({
   summary: workDocSummarySchema.optional(),
   expectedScope: memoryScopeSchema.optional(),
   expectedChatId: workDocExternalIdSchema.optional(),
+  /** Owner guard; see {@link updateWorkDocInputSchema}. */
+  expectedOwnerId: workDocOwnerIdSchema.optional(),
 });
 
 /** Filters + pagination for listing documents. Combined filters are ANDed. */
@@ -141,6 +160,11 @@ export const listWorkDocsInputSchema = z.strictObject({
   chatId: workDocExternalIdSchema.optional(),
   type: workDocTypeSchema.optional(),
   status: workDocStatusSchema.optional(),
+  /**
+   * Owner filter: when set, ONLY that user's rows match — ownerless legacy
+   * rows and other users' rows are never returned.
+   */
+  ownerId: workDocOwnerIdSchema.optional(),
   order: z.enum(['newest', 'oldest']).optional().default('newest'),
   limit: z.number().int().min(1).max(WORK_DOC_LIST_LIMIT_MAX).optional().default(WORK_DOC_LIST_LIMIT_DEFAULT),
 });
@@ -148,6 +172,8 @@ export const listWorkDocsInputSchema = z.strictObject({
 /** Bounded history listings; a page never exceeds the documented maximums. */
 export const listWorkDocVersionsInputSchema = z.strictObject({
   id: workDocIdSchema,
+  /** Owner guard on the document; mismatch reads as 404 (never an oracle). */
+  expectedOwnerId: workDocOwnerIdSchema.optional(),
   order: z.enum(['oldest', 'newest']).optional().default('oldest'),
   limit: z
     .number()
@@ -168,6 +194,16 @@ export const addWorkDocLinkInputSchema = z.strictObject({
   label: workDocLabelSchema.optional(),
   expectedScope: memoryScopeSchema.optional(),
   expectedChatId: workDocExternalIdSchema.optional(),
+  /** Owner guard; see {@link updateWorkDocInputSchema}. */
+  expectedOwnerId: workDocOwnerIdSchema.optional(),
+});
+
+/**
+ * Read options for single-document reads (`get`, `listLinks`): the owner guard
+ * reads a foreign/ownerless document as absent (`null`) — never an oracle.
+ */
+export const workDocGetOptionsSchema = z.strictObject({
+  expectedOwnerId: workDocOwnerIdSchema.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -181,7 +217,10 @@ export type WorkDocListInput = z.input<typeof listWorkDocsInputSchema>;
 export type WorkDocListVersionsInput = z.input<typeof listWorkDocVersionsInputSchema>;
 export type WorkDocListRevisionsInput = z.input<typeof listWorkDocRevisionsInputSchema>;
 export type WorkDocAddLinkInput = z.input<typeof addWorkDocLinkInputSchema>;
-
+// NOTE: the WorkDocGetOptions interface lives in `./store.js` (the store
+// contract); the parsed `workDocGetOptionsSchema` output is structurally
+// assignable to it, so the service parses with the schema and passes it
+// through.
 // Output (parsed) shapes with defaults applied.
 export type ParsedWorkDocCreateInput = z.output<typeof createWorkDocInputSchema>;
 export type ParsedWorkDocUpdateInput = z.output<typeof updateWorkDocInputSchema>;
@@ -190,6 +229,7 @@ export type ParsedWorkDocListInput = z.output<typeof listWorkDocsInputSchema>;
 export type ParsedWorkDocListVersionsInput = z.output<typeof listWorkDocVersionsInputSchema>;
 export type ParsedWorkDocListRevisionsInput = z.output<typeof listWorkDocRevisionsInputSchema>;
 export type ParsedWorkDocAddLinkInput = z.output<typeof addWorkDocLinkInputSchema>;
+export type ParsedWorkDocGetOptions = z.output<typeof workDocGetOptionsSchema>;
 
 /**
  * Parse route/service input against `schema`, converting Zod errors into the

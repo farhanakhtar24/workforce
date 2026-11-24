@@ -22,6 +22,7 @@ import {
   parseSseChunks,
   mockUsage,
   TEST_DELEGATION_SECRET,
+  TEST_OWNER,
 } from './helpers.js';
 import {
   buildHostCapabilities,
@@ -99,7 +100,7 @@ function makeHostDeps(fetchFn: HostCapabilityDeps['fetchFn'], delegationTimeoutM
 }
 
 function capabilityExecutor(name: string, deps: HostCapabilityDeps): (input: unknown) => Promise<unknown> {
-  const ctx: AgentToolContext = { slug: 'orchestrator', chatId: 'parent-x', parentMessageId: 'pm-x', scope: 'default', depth: 0 };
+  const ctx: AgentToolContext = { slug: 'orchestrator', chatId: 'parent-x', parentMessageId: 'pm-x', scope: 'default', ownerId: TEST_OWNER.userId, depth: 0 };
   const capability = buildHostCapabilities(deps, ctx).find((candidate) => candidate.name === name);
   assert.ok(capability !== undefined, `capability ${name} missing`);
   const tool = adaptCapabilityToTool(capability) as { execute?: (input: unknown) => Promise<unknown> };
@@ -323,7 +324,7 @@ function runDepsWith(
 }
 
 function createHeaderFor(parentChatId: string, parentDepth = 0): string {
-  return signer.sign({ kind: 'delegation-create', parentChatId, parentDepth, expiresAt: Date.now() + 120_000 });
+  return signer.sign({ kind: 'delegation-create', parentChatId, parentDepth, ownerId: TEST_OWNER.userId, expiresAt: Date.now() + 120_000 });
 }
 
 async function seedPendingRow(repo: DelegationRepository, parentChatId = 'p-h1'): Promise<CoreDelegation> {
@@ -335,6 +336,7 @@ async function seedPendingRow(repo: DelegationRepository, parentChatId = 'p-h1')
     mode: 'sync',
     task: 'do the thing',
     depth: 1,
+    ownerId: TEST_OWNER.userId,
   });
 }
 
@@ -348,7 +350,7 @@ test('H1: two concurrent claimants reading pending → exactly ONE running claim
   const gatedRepo: DelegationRepository = Object.assign(Object.create(repo), {
     get: async (id: string) => {
       await readGate.promise;
-      return await repo.get(id);
+      return await repo.get(id, { expectedOwnerId: TEST_OWNER.userId });
     },
   });
 
@@ -367,8 +369,8 @@ test('H1: two concurrent claimants reading pending → exactly ONE running claim
   const deps = runDepsWith(gatedRepo, fetchFn);
 
   const header = createHeaderFor('p-h1');
-  const runnerA = runDelegation(deps, header, row.id);
-  const runnerB = runDelegation(deps, header, row.id);
+  const runnerA = runDelegation(deps, header, row.id, TEST_OWNER.userId);
+  const runnerB = runDelegation(deps, header, row.id, TEST_OWNER.userId);
   readGate.resolve();
   await childEntered.promise; // A claimed + entered the child call
   gate.resolve();
@@ -434,7 +436,7 @@ test('H3: stale running row recovers a completed child from its transcript — N
   const inner = new InMemoryDelegationRepository();
   const repo = backdatedRepo(inner, 10_000, 1_000); // budget 1s; running 10s ago → stale
   const row = await seedPendingRow(repo);
-  await repo.updateStatus({ id: row.id, status: 'running' });
+  await repo.updateStatus({ id: row.id, status: 'running', expectedOwnerId: TEST_OWNER.userId });
 
   const posts: string[] = [];
   const deps = runDepsWith(
@@ -456,7 +458,7 @@ test('H3: stale running row recovers a completed child from its transcript — N
     1_000,
   );
   const header = createHeaderFor(row.parentChatId, row.depth - 1);
-  const outcome = await runDelegation(deps, header, row.id);
+  const outcome = await runDelegation(deps, header, row.id, TEST_OWNER.userId);
   assert.equal(outcome.executed, false, 'recovery never starts a child generation');
   assert.equal(outcome.delegation.status, 'completed');
   assert.equal(outcome.delegation.result, 'recovered child text');
@@ -467,7 +469,7 @@ test('H3: stale running row without a transcript lands failed with a fixed safe 
   const inner = new InMemoryDelegationRepository();
   const repo = backdatedRepo(inner, 10_000, 1_000);
   const row = await seedPendingRow(repo);
-  await repo.updateStatus({ id: row.id, status: 'running' });
+  await repo.updateStatus({ id: row.id, status: 'running', expectedOwnerId: TEST_OWNER.userId });
 
   const deps = runDepsWith(
     repo,
@@ -480,7 +482,7 @@ test('H3: stale running row without a transcript lands failed with a fixed safe 
     1_000,
   );
   const header = createHeaderFor(row.parentChatId, row.depth - 1);
-  const outcome = await runDelegation(deps, header, row.id);
+  const outcome = await runDelegation(deps, header, row.id, TEST_OWNER.userId);
   assert.equal(outcome.delegation.status, 'failed');
   assert.equal(outcome.delegation.error, 'The delegated task failed.');
 });
@@ -488,7 +490,7 @@ test('H3: stale running row without a transcript lands failed with a fixed safe 
 test('H3: FRESH running row stays running untouched (owner alive); terminal rows never touch the network', async () => {
   const fresh = new InMemoryDelegationRepository();
   const row = await seedPendingRow(fresh);
-  await fresh.updateStatus({ id: row.id, status: 'running' });
+  await fresh.updateStatus({ id: row.id, status: 'running', expectedOwnerId: TEST_OWNER.userId });
   let fetchCalls = 0;
   const freshDeps = runDepsWith(
     fresh,
@@ -499,14 +501,14 @@ test('H3: FRESH running row stays running untouched (owner alive); terminal rows
     1_000,
   );
   const header = createHeaderFor(row.parentChatId, row.depth - 1);
-  const outcome = await runDelegation(freshDeps, header, row.id);
+  const outcome = await runDelegation(freshDeps, header, row.id, TEST_OWNER.userId);
   assert.equal(outcome.executed, false);
   assert.equal(outcome.delegation.status, 'running');
   assert.equal(fetchCalls, 0, 'no network while the live runner owns the row');
 
   // Terminal: completed rows return as-is; nothing is regenerated.
   await fresh.updateStatus({ id: row.id, status: 'completed', result: 'done earlier' });
-  const terminal = await runDelegation(freshDeps, header, row.id);
+  const terminal = await runDelegation(freshDeps, header, row.id, TEST_OWNER.userId);
   assert.equal(terminal.executed, false);
   assert.equal(terminal.delegation.status, 'completed');
   assert.equal(terminal.delegation.result, 'done earlier');
@@ -533,7 +535,7 @@ test('H3: duplicate child POST (409) recovers the durable transcript instead of 
     120_000,
   );
   const header = createHeaderFor(row.parentChatId);
-  const outcome = await runDelegation(deps, header, row.id);
+  const outcome = await runDelegation(deps, header, row.id, TEST_OWNER.userId);
   assert.equal(outcome.executed, true);
   assert.equal(outcome.delegation.status, 'completed');
   assert.equal(outcome.delegation.result, 'the original answer');
@@ -561,7 +563,7 @@ test('H1 route-level: two concurrent POST /run → one child generation, one cla
 
   const app = await startTestApp({ agents: { wire: true, delegationQueue: recordingQueue }, model: model as never });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-h1r' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-h1r' }, [
       userMessage('claim me', 'pm-h1r'),
     ]);
     const created = await fetch(`http://127.0.0.1:${app.port}/api/agents/orchestrator/delegations`, {
@@ -572,7 +574,8 @@ test('H1 route-level: two concurrent POST /run → one child generation, one cla
           kind: 'delegation-create',
           parentChatId: 'parent-h1r',
           parentDepth: 0,
-          expiresAt: Date.now() + 120_000,
+          ownerId: TEST_OWNER.userId,
+expiresAt: Date.now() + 120_000,
         }),
       },
       body: JSON.stringify({
@@ -591,7 +594,8 @@ test('H1 route-level: two concurrent POST /run → one child generation, one cla
       kind: 'delegation-create',
       parentChatId: row.parentChatId,
       parentDepth: row.depth - 1,
-      expiresAt: Date.now() + 120_000,
+      ownerId: TEST_OWNER.userId,
+expiresAt: Date.now() + 120_000,
     });
     const [first, second] = await Promise.all([
       fetch(`http://127.0.0.1:${app.port}/api/agents/orchestrator/delegations/${row.id}/run`, {
@@ -633,7 +637,8 @@ test('L1: depth-2 child contexts are servable; depth 3+ is 403; depth-2 delegati
       kind: 'delegation-child-chat',
       parentChatId: 'p-d2',
       childChatId: 'child-d2',
-      targetAgent: 'analyst',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'analyst',
       depth: 2,
       expiresAt: Date.now() + 60_000,
       deadline: Date.now() + 60_000,
@@ -649,7 +654,7 @@ test('L1: depth-2 child contexts are servable; depth 3+ is 403; depth-2 delegati
 
     // Without a model the delegation cannot complete, but the route-level
     // depth rules hold: signed parentDepth 1 → child depth 2 row accepted.
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-d2' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-d2' }, [
       userMessage('deeper', 'pm-d2'),
     ]);
     const created = await fetch(`http://127.0.0.1:${app.port}/api/agents/orchestrator/delegations`, {
@@ -660,7 +665,8 @@ test('L1: depth-2 child contexts are servable; depth 3+ is 403; depth-2 delegati
           kind: 'delegation-create',
           parentChatId: 'parent-d2',
           parentDepth: 1,
-          expiresAt: Date.now() + 120_000,
+          ownerId: TEST_OWNER.userId,
+expiresAt: Date.now() + 120_000,
         }),
       },
       body: JSON.stringify({
@@ -688,7 +694,8 @@ test('L1: depth-2 child contexts are servable; depth 3+ is 403; depth-2 delegati
           kind: 'delegation-create',
           parentChatId: 'parent-d2',
           parentDepth: 3,
-          expiresAt: Date.now() + 120_000,
+          ownerId: TEST_OWNER.userId,
+expiresAt: Date.now() + 120_000,
         }),
       },
       body: JSON.stringify({
@@ -713,7 +720,7 @@ test('H3: recovery terminal-write race with the live runner — typed conflict �
   const inner = new InMemoryDelegationRepository();
   const repo = backdatedRepo(inner, 10_000, 1_000);
   const row = await seedPendingRow(repo);
-  await repo.updateStatus({ id: row.id, status: 'running' });
+  await repo.updateStatus({ id: row.id, status: 'running', expectedOwnerId: TEST_OWNER.userId });
 
   // Simulated live-runner write: between our hydration and our terminal
   // update, the row flips to 'failed' — our running→completed write loses the
@@ -722,7 +729,7 @@ test('H3: recovery terminal-write race with the live runner — typed conflict �
   let conflictInjected = false;
   const racingRepo: DelegationRepository = Object.assign(Object.create(repo), {
     get: async (id: string) => {
-      const fresh = await repo.get(id);
+      const fresh = await repo.get(id, { expectedOwnerId: TEST_OWNER.userId });
       if (fresh?.status === 'running') {
         return { ...fresh, updatedAt: new Date(Date.now() - 10_000).toISOString() };
       }
@@ -732,7 +739,7 @@ test('H3: recovery terminal-write race with the live runner — typed conflict �
       if (input.status === 'completed' && !conflictInjected) {
         conflictInjected = true;
         // The live runner flipped the row to failed first.
-        await repo.updateStatus({ id: input.id, status: 'failed', error: 'Live runner wrote here.' });
+        await repo.updateStatus({ id: input.id, status: 'failed', error: 'Live runner wrote here.', expectedOwnerId: TEST_OWNER.userId });
         throw new DelegationConflictError('delegation cannot move from failed to completed');
       }
       return await repo.updateStatus(input);
@@ -756,7 +763,7 @@ test('H3: recovery terminal-write race with the live runner — typed conflict �
     1_000,
   );
   const header = createHeaderFor(row.parentChatId, row.depth - 1);
-  const outcome = await runDelegation(deps, header, row.id);
+  const outcome = await runDelegation(deps, header, row.id, TEST_OWNER.userId);
   assert.equal(conflictInjected, true, 'the race actually happened');
   assert.equal(outcome.executed, false, 'race loser never starts a generation');
   // The FRESH row (live runner's failed write) is returned instead of a 503.

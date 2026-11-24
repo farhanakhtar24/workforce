@@ -182,7 +182,9 @@ export function buildChatSummary(input: {
  * Parses an index member `${slug}:${chatId}` against the agent roster and the
  * safe chat-id alphabet (the SAME validation the chat routes apply). Returns
  * `null` for anything else — hand-planted or foreign keys are skipped
- * deterministically, never parsed loosely.
+ * deterministically, never parsed loosely. The member is owner-independent:
+ * the owner namespaces the whole sorted set (per-owner index key), so two
+ * users with the same slug+chatId never share one member space.
  */
 export function parseChatIndexMember(member: string): { slug: string; chatId: string } | null {
   if (typeof member !== 'string') {
@@ -200,12 +202,21 @@ export function parseChatIndexMember(member: string): { slug: string; chatId: st
   return { slug, chatId };
 }
 
+const CHAT_OWNER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
 /**
- * Parses a Redis messages-list key `${prefix}:chat:{slug}:{chatId}:messages`
- * with exactly the same roster/safe-id discipline as
- * {@link parseChatIndexMember}. Anything else of any shape → `null`.
+ * Parses a Redis messages-list key
+ * `${keyPrefix}:chat:{ownerId}:{slug}:{chatId}:messages` with exactly the
+ * same roster/safe-id discipline as {@link parseChatIndexMember}, plus the
+ * REQUIRED owner segment (Better Auth `User.id` alphabet). Legacy
+ * pre-authentication keys (`${keyPrefix}:chat:{slug}:{chatId}:messages`)
+ * have no owner segment and ALWAYS parse to `null`, so the bounded legacy
+ * discovery can never surface them to an authenticated per-owner list.
  */
-export function parseChatMessagesKey(key: string, keyPrefix: string): { slug: string; chatId: string } | null {
+export function parseOwnerChatMessagesKey(
+  key: string,
+  keyPrefix: string,
+): { ownerId: string; slug: string; chatId: string } | null {
   if (typeof key !== 'string') {
     return null;
   }
@@ -215,10 +226,24 @@ export function parseChatMessagesKey(key: string, keyPrefix: string): { slug: st
     return null;
   }
   const member = key.slice(middlePrefix.length, key.length - suffix.length);
-  return parseChatIndexMember(member);
+  // `{ownerId}:{slug}:{chatId}` — the owner segment never contains a colon
+  // (same safe alphabet as chat ids), so the FIRST colon is its delimiter.
+  const colon = member.indexOf(':');
+  if (colon === -1) {
+    return null;
+  }
+  const ownerId = member.slice(0, colon);
+  if (!CHAT_OWNER_ID_PATTERN.test(ownerId)) {
+    return null;
+  }
+  const rest = parseChatIndexMember(member.slice(colon + 1));
+  if (rest === null) {
+    return null;
+  }
+  return { ownerId, slug: rest.slug, chatId: rest.chatId };
 }
 
-/** Deterministic legacy order key: `${agent}:${chatId}` ascending. */
+/** Deterministic legacy order key: `${agent}:${chatId}` ascending (per owner). */
 export function legacyOrderKey(ref: { slug: string; chatId: string }): string {
   return `${ref.slug}:${ref.chatId}`;
 }
@@ -226,6 +251,19 @@ export function legacyOrderKey(ref: { slug: string; chatId: string }): string {
 /** Index member for a chat ref (identical to the Redis sorted-set member). */
 export function chatIndexMember(ref: { slug: string; chatId: string }): string {
   return `${ref.slug}:${ref.chatId}`;
+}
+
+/**
+ * Per-owner activity index key: each Better Auth user gets an OWN ZSET
+ * (`${prefix}:chat-index:{ownerId}`), so legacy global index keys
+ * (`${prefix}:chat-index`, pre-authentication) are structurally unreachable
+ * from every new read.
+ */
+export function chatIndexKeyFor(keyPrefix: string, ownerId: string): string {
+  if (typeof ownerId !== 'string' || !CHAT_OWNER_ID_PATTERN.test(ownerId)) {
+    throw new Error('chat index key requires a valid owner id');
+  }
+  return `${keyPrefix}:chat-index:${ownerId}`;
 }
 
 /**
@@ -246,4 +284,60 @@ export function compareIndexEntriesDesc(a: { member: string; score: number }, b:
 /** Turns an index score (epoch ms) into an ISO-8601 string. */
 export function scoreToIso(score: number): string {
   return new Date(score).toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Chat mutation helpers (delete/branch/rewind) — operate on RAW entries
+// ---------------------------------------------------------------------------
+
+/**
+ * Finds the index of the LAST stored entry whose parsed `id` equals
+ * `messageId` (ids are unique; newest-last wins by construction), or `null`
+ * when the id is absent. Operates on raw JSON strings WITHOUT
+ * re-serialization — branch/rewind then slice raw bytes directly.
+ */
+export function findMessageIndexById(entries: readonly string[], messageId: string): number | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry === undefined) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(entry);
+    } catch {
+      continue; // corrupt entry: never matches (strict corruption is loadMessages' contract)
+    }
+    if (parsed !== null && typeof parsed === 'object' && (parsed as { id?: unknown }).id === messageId) {
+      return index;
+    }
+  }
+  return null;
+}
+
+/**
+ * The message ids of the USER entries in `entries` (order preserved) —
+ * exactly the set whose message-scoped idempotency keys
+ * (`{keyPrefix}:idempotency:{owner}:{slug}:{chatId}:{chatId}:{messageId}`)
+ * may be deleted on rewind. Corrupt entries contribute nothing.
+ */
+export function userMessageIdsOf(entries: readonly string[]): string[] {
+  const ids: string[] = [];
+  for (const entry of entries) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(entry);
+    } catch {
+      continue;
+    }
+    if (
+      parsed !== null && typeof parsed === 'object' &&
+      (parsed as { role?: unknown }).role === 'user' &&
+      typeof (parsed as { id?: unknown }).id === 'string' &&
+      (parsed as { id: string }).id.length > 0
+    ) {
+      ids.push((parsed as { id: string }).id);
+    }
+  }
+  return ids;
 }

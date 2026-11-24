@@ -15,12 +15,10 @@ import type { LanguageModel } from 'ai';
 import {
   startTestApp,
   FakeSchedulerQueue,
+  schedulerRunHeaders,
   type TestApp,
 } from './helpers.js';
 import { InMemorySchedulerStore } from '@workforce/core/scheduler';
-import { SCHEDULER_WORKER_HEADER } from '../src/scheduler/worker-contract.js';
-
-const WORKER_HEADERS: Record<string, string> = { [SCHEDULER_WORKER_HEADER]: '1' };
 
 /** Model that counts doStream calls and replays pre-built steps. */
 function countedModel(steps: LanguageModelV3StreamPart[][]) {
@@ -276,14 +274,14 @@ test('MANUAL run creates execution, enqueues, worker run completes end-to-end', 
     const noHeader = await callJson(app, 'POST', `/api/scheduler/executions/${String(execution.id)}/run`, {
       attempt: 1,
     });
-    assert.equal(noHeader.status, 400);
+    assert.equal(noHeader.status, 401);
 
     const workerRun = await callJson(
       app,
       'POST',
       `/api/scheduler/executions/${String(execution.id)}/run`,
       { attempt: 1, queueJobId: `execution-${String(execution.id)}` },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ executionId: String(execution.id) }),
     );
     assert.equal(workerRun.status, 200);
     assert.equal(workerRun.body.ok, true);
@@ -314,7 +312,7 @@ test('MANUAL run creates execution, enqueues, worker run completes end-to-end', 
       'POST',
       `/api/scheduler/executions/${String(execution.id)}/run`,
       { attempt: 4 },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ executionId: String(execution.id) }),
     );
     assert.equal(rerun.status, 200);
     assert.equal(rerun.body.ok, true);
@@ -383,7 +381,7 @@ test('retry of a completed execution is a 409', { concurrency: false }, async ()
     const taskId = String((created.body.task as Record<string, unknown>).id);
     const run = await callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run`);
     const executionId = String((run.body.execution as Record<string, unknown>).id);
-    await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/run`, { attempt: 1 }, WORKER_HEADERS);
+    await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/run`, { attempt: 1 }, schedulerRunHeaders({ executionId }));
     const invalidRetry = await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/retry`);
     assert.equal(invalidRetry.status, 409);
     assert.deepEqual(invalidRetry.body, { error: 'Scheduler conflict.' });
@@ -399,7 +397,7 @@ test('execution detail/list filters', { concurrency: false }, async () => {
     const taskId = String((created.body.task as Record<string, unknown>).id);
     const run = await callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run`);
     const executionId = String((run.body.execution as Record<string, unknown>).id);
-    await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/run`, { attempt: 1 }, WORKER_HEADERS);
+    await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/run`, { attempt: 1 }, schedulerRunHeaders({ executionId }));
 
     const detail = await callJson(app, 'GET', `/api/scheduler/executions/${executionId}`);
     assert.equal(detail.status, 200);
@@ -438,7 +436,7 @@ test('scheduled occurrence runs the REAL chat surface once and completes', { con
       'POST',
       `/api/scheduler/tasks/${taskId}/run-scheduled`,
       { scheduledFor, attempt: 1, queueJobId: 'job-1', repeatJobKey: 'rep-1' },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(run.status, 200);
     assert.equal(run.body.ok, true);
@@ -458,7 +456,7 @@ test('scheduled occurrence runs the REAL chat surface once and completes', { con
       'POST',
       `/api/scheduler/tasks/${taskId}/run-scheduled`,
       { scheduledFor, attempt: 1, queueJobId: 'job-1', repeatJobKey: 'rep-1' },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(duplicate.status, 200);
     assert.equal(duplicate.body.ok, true);
@@ -488,7 +486,7 @@ test('paused task occurrences are SKIPPED without a provider call', { concurrenc
       'POST',
       `/api/scheduler/tasks/${taskId}/run-scheduled`,
       { scheduledFor: isoAt(1, 9, 0), attempt: 1 },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(run.status, 200);
     assert.equal(run.body.ok, true);
@@ -503,7 +501,7 @@ test('paused task occurrences are SKIPPED without a provider call', { concurrenc
       'POST',
       `/api/scheduler/tasks/${taskId}/run-scheduled`,
       { scheduledFor: isoAt(1, 9, 0), attempt: 1 },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(again.status, 200);
     assert.equal(again.body.ok, true);
@@ -526,7 +524,7 @@ test('skipDates occurrences are SKIPPED without a provider call', { concurrency:
       'POST',
       `/api/scheduler/tasks/${taskId}/run-scheduled`,
       { scheduledFor: isoAt(1, 9, 0), attempt: 1 },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(run.status, 200);
     assert.equal(run.body.skipped, true);
@@ -539,7 +537,7 @@ test('skipDates occurrences are SKIPPED without a provider call', { concurrency:
       'POST',
       `/api/scheduler/tasks/${taskId}/run-scheduled`,
       { scheduledFor: isoAt(2, 9, 0), attempt: 1 },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(realRun.body.ok, true);
     assert.equal((realRun.body.execution as Record<string, unknown>).status, 'COMPLETED');
@@ -558,8 +556,8 @@ test('concurrent duplicate occurrences claim once — exactly one model call', {
     const scheduledFor = isoAt(1, 9, 0);
 
     const [first, second] = await Promise.all([
-      callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run-scheduled`, { scheduledFor, attempt: 1 }, WORKER_HEADERS),
-      callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run-scheduled`, { scheduledFor, attempt: 1 }, WORKER_HEADERS),
+      callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run-scheduled`, { scheduledFor, attempt: 1 }, schedulerRunHeaders({ taskId })),
+      callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run-scheduled`, { scheduledFor, attempt: 1 }, schedulerRunHeaders({ taskId })),
     ]);
 
     // Exactly one of the two claims drives the single generation; the other
@@ -588,26 +586,40 @@ test('concurrent duplicate occurrences claim once — exactly one model call', {
   }
 });
 
-test('worker route validation: body/attempt/scheduledFor/header are strict', { concurrency: false }, async () => {
+test('worker route validation: header/context/body/attempt/scheduledFor are strict', { concurrency: false }, async () => {
   const app = await startTestApp({ scheduler: {} });
   try {
     const created = await callJson(app, 'POST', '/api/scheduler/tasks', dailyTaskBody());
     const taskId = String((created.body.task as Record<string, unknown>).id);
     const url = `/api/scheduler/tasks/${taskId}/run-scheduled`;
 
+    // Missing worker header: fixed 401 (fail-closed, browser-shaped calls).
     const missingHeader = await callJson(app, 'POST', url, { scheduledFor: isoAt(1, 9, 0), attempt: 1 });
-    assert.equal(missingHeader.status, 400);
+    assert.equal(missingHeader.status, 401);
     assert.deepEqual(missingHeader.body, { error: 'Scheduler worker header required.' });
 
+    // Wrong header VALUE: 401 too.
     const wrongHeader = await callJson(app, 'POST', url, { scheduledFor: isoAt(1, 9, 0), attempt: 1 }, {
-      [SCHEDULER_WORKER_HEADER]: 'other',
+      'X-Workforce-Scheduler-Worker': 'other',
     });
-    assert.equal(wrongHeader.status, 400);
+    assert.equal(wrongHeader.status, 401);
 
-    const badInstant = await callJson(app, 'POST', url, { scheduledFor: '2026-11-21 09:00:00', attempt: 1 }, WORKER_HEADERS);
+    // Literal convention header WITHOUT the signed context: no longer
+    // sufficient — fixed 400 (unforgeable binding required).
+    const unsigned = await callJson(app, 'POST', url, { scheduledFor: isoAt(1, 9, 0), attempt: 1 }, {
+      'X-Workforce-Scheduler-Worker': '1',
+    });
+    assert.equal(unsigned.status, 400);
+    assert.deepEqual(unsigned.body, { error: 'Invalid scheduler run context.' });
+
+    // Signed context bound to a DIFFERENT id: fixed 400.
+    const misbound = await callJson(app, 'POST', url, { scheduledFor: isoAt(1, 9, 0), attempt: 1 }, schedulerRunHeaders({ executionId: '00000000-0000-4000-8000-00000000dead' }));
+    assert.equal(misbound.status, 400);
+
+    const badInstant = await callJson(app, 'POST', url, { scheduledFor: '2026-11-21 09:00:00', attempt: 1 }, schedulerRunHeaders({ taskId }));
     assert.equal(badInstant.status, 400);
 
-    const zeroAttempt = await callJson(app, 'POST', url, { scheduledFor: isoAt(1, 9, 0), attempt: 0 }, WORKER_HEADERS);
+    const zeroAttempt = await callJson(app, 'POST', url, { scheduledFor: isoAt(1, 9, 0), attempt: 0 }, schedulerRunHeaders({ taskId }));
     assert.equal(zeroAttempt.status, 400);
 
     const extraKey = await callJson(
@@ -615,7 +627,7 @@ test('worker route validation: body/attempt/scheduledFor/header are strict', { c
       'POST',
       url,
       { scheduledFor: isoAt(1, 9, 0), attempt: 1, prompt: 'forged' },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId }),
     );
     assert.equal(extraKey.status, 400);
 
@@ -624,7 +636,7 @@ test('worker route validation: body/attempt/scheduledFor/header are strict', { c
       'POST',
       '/api/scheduler/tasks/00000000-0000-4000-8000-00000000dead/run-scheduled',
       { scheduledFor: isoAt(1, 9, 0), attempt: 1 },
-      WORKER_HEADERS,
+      schedulerRunHeaders({ taskId: '00000000-0000-4000-8000-00000000dead' }),
     );
     assert.equal(unknownTask.status, 200);
     assert.equal(unknownTask.body.ok, true);
@@ -642,7 +654,7 @@ test('execution detail after a worker run keeps bounded, honest fields', { concu
     const taskId = String((created.body.task as Record<string, unknown>).id);
     const run = await callJson(app, 'POST', `/api/scheduler/tasks/${taskId}/run`);
     const executionId = String((run.body.execution as Record<string, unknown>).id);
-    await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/run`, { attempt: 1 }, WORKER_HEADERS);
+    await callJson(app, 'POST', `/api/scheduler/executions/${executionId}/run`, { attempt: 1 }, schedulerRunHeaders({ executionId }));
     const detail = await callJson(app, 'GET', `/api/scheduler/executions/${executionId}`);
     const execution = detail.body.execution as Record<string, unknown>;
     assert.equal(execution.status, 'COMPLETED');

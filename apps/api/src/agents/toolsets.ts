@@ -43,8 +43,9 @@ export interface PrepareGenerationInput {
   readonly depth: number;
   readonly chatId: string;
   readonly parentMessageId: string;
+  /** RESOLVED platform owner this generation acts for (never a body field). */
+  readonly ownerId: string;
 }
-
 /**
  * Composes ONCE per generation: registry instances are built around the trusted
  * context closure, then core composition applies mode/depth filters.
@@ -55,6 +56,7 @@ export function prepareGeneration(deps: HostCapabilityDeps, input: PrepareGenera
     chatId: input.chatId,
     parentMessageId: input.parentMessageId,
     scope: 'default',
+    ownerId: input.ownerId,
     depth: input.depth,
   };
   const registry = new MapAgentRegistry(buildHostCapabilities(deps, ctx));

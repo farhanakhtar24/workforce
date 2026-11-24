@@ -1,20 +1,25 @@
 /**
- * The worker-only run-route contract (Phase 5, by CONVENTION — NOT
- * authentication): the two internal run routes
- * (`POST /tasks/:id/run-scheduled`, `POST /executions/:id/run`) require the
- * fixed {@link SCHEDULER_WORKER_HEADER} header exactly
- * `{@link SCHEDULER_WORKER_HEADER_VALUE}`.
+ * The worker-only run-route contract (Phase 5, hardened in pre-Phase 6):
+ * the two internal run routes (`POST /tasks/:id/run-scheduled`,
+ * `POST /executions/:id/run`) require BOTH
+ * - the fixed {@link SCHEDULER_WORKER_HEADER} header exactly
+ *   `{@link SCHEDULER_WORKER_HEADER_VALUE}`, and
+ * - a SIGNED `internal-scheduler-run` HMAC context (see
+ *   `agents/delegation-context.ts`, `X-Workforce-Internal-Scheduler`) bound
+ *   to THIS taskId/executionId with a short TTL, minted by the scheduler
+ *   worker with the shared `DELEGATION_CONTEXT_SECRET`.
  *
- * What this header IS: a tripwire against accidental browser calls so no web
- * client can mint occurrence metadata (`scheduledFor`, `queueJobId`,
+ * What the literal header IS: a tripwire against accidental browser calls so
+ * no web client can mint occurrence metadata (`scheduledFor`, `queueJobId`,
  * `repeatJobKey`, `attempt`) by hitting the routes directly, and a marker
  * that the caller speaks the BullMQ-occurrence contract.
  *
- * What this header is NOT: authentication or an authorization scope. Anyone
- * who constructs the literal header value can call the routes. The routes are
- * safe because their effects are idempotent (unique scheduled execution rows,
- * atomic claims, terminal immutability) — never because the header protects
- * them. No new secret/env is required.
+ * What the SIGNED context adds: real unforgeability. The platform owner is
+ * never carried in the payload — the run route derives it from the DATABASE
+ * row (the row is the authority), binds every internal run to it, and
+ * refuses ownerless pre-auth legacy rows. A forged/expired/misbound context
+ * is a fixed 400; the owner can NEVER be supplied by a body or an unsigned
+ * header.
  */
 
 export const SCHEDULER_WORKER_HEADER = 'X-Workforce-Scheduler-Worker' as const;

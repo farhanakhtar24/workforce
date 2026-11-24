@@ -730,3 +730,33 @@ test('attachLockSessionEventGuards skips injected fakes without .on and never th
   assert.strictEqual(attachLockSessionEventGuards(fake), true);
   assert.deepStrictEqual(attached, ['error', 'end']);
 });
+
+// ---------------------------------------------------------------------------
+// purgeDerivedChatBlocks (pre-Phase 6 derived per-chat memory purge)
+// ---------------------------------------------------------------------------
+
+test('purgeDerivedChatBlocks: one short transaction, scoped DELETE, validated shape', async () => {
+  const setup = makeWorld();
+  setup.prisma.updateRowCount = 3;
+  const deleted = await setup.store.purgeDerivedChatBlocks({ scope: 'user-123', path: 'chats/c-1' });
+  assert.equal(deleted, 3);
+  // Exactly one tx (begin → exec → commit), no lock session involved.
+  assert.equal(setup.prisma.transactionCount, 1);
+  assert.deepEqual(setup.clients, [], 'purge never takes the pg advisory lock');
+  assert.equal(setup.prismaLog.includes('tx:begin'), true);
+  assert.equal(setup.prismaLog.some((entry) => entry.startsWith('exec:')), true);
+  assert.equal(setup.prismaLog.includes('tx:commit'), true);
+
+  // Malformed input fails typed BEFORE any transaction.
+  await assert.rejects(() => setup.store.purgeDerivedChatBlocks({ scope: 'bad/scope', path: 'chats/c-1' }), /MemoryValidationError/);
+  assert.equal(setup.prisma.transactionCount, 1, 'validation never opens a transaction');
+  await assert.rejects(
+    () => setup.store.purgeDerivedChatBlocks({ scope: 'user-123', path: 'chats/c-1', assistantMessageIds: ['bad/slash'] }),
+    /MemoryValidationError/,
+  );
+  await assert.rejects(
+    () => setup.store.purgeDerivedChatBlocks({ scope: 'user-123', path: 'chats/c-1', assistantMessageIds: [] }),
+    /MemoryValidationError/,
+  );
+  assert.equal(setup.prisma.transactionCount, 1);
+});

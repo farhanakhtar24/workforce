@@ -464,7 +464,7 @@ export async function requestMemoryJson(options: {
   fallbackError: string;
   fetchImpl?: MemoryFetch;
 }): Promise<MemoryRequestResult> {
-  const { url, method, body, fallbackError, fetchImpl = fetch } = options;
+  const { url, method, body, fallbackError, fetchImpl = browserApiFetch } = options;
   const init: NonNullable<Parameters<MemoryFetch>[1]> = {
     method,
     cache: 'no-store',
@@ -488,6 +488,8 @@ export async function requestMemoryJson(options: {
       raw = null;
     }
     if (response.ok) return { ok: true, status: response.status ?? 0, body: raw };
+    const authError = requestAuthError(response.status ?? 0);
+    if (authError !== null) return { ok: false, error: authError };
     return {
       ok: false,
       error: extractApiErrorMessage(raw, fallbackError),
@@ -507,6 +509,7 @@ export async function requestMemoryJson(options: {
  */
 const FORBIDDEN_VECTOR_KEYS = ['embedding', 'embeddings', 'vector', 'embeddingVector'] as const;
 
+import { browserApiFetch, requestAuthError } from './api';
 export type MemoryResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

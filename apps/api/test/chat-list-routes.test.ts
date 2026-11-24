@@ -11,6 +11,8 @@ import type { UIMessage } from 'ai';
 
 import {
   TEST_ORIGINAL_ORIGIN,
+  TEST_OWNER,
+  TEST_OWNER_B,
   getJson,
   startTestApp,
   seedMessages,
@@ -25,8 +27,8 @@ import type { ChatRef, ChatSummary, ChatStore } from '../src/store/types.js';
 let CLOCK = 1_000_000;
 const nextNow = (): number => (CLOCK += 1);
 
-function chatRef(slug: string, chatId: string): ChatRef {
-  return { slug, chatId };
+function chatRef(slug: string, chatId: string, ownerId: string = TEST_OWNER.userId): ChatRef {
+  return { ownerId, slug, chatId };
 }
 
 function userText(id: string, text: string): UIMessage {
@@ -249,7 +251,7 @@ test('limit windows: default 20, exact slice of the newest chats', async () => {
     // A legacy chat (seeded WITHOUT the index) still lists last, after every
     // indexed chat, deterministically.
     tieClock.seedLegacyChat(chatRef('general', 'ghost'), [userText('gx', 'ghost')]);
-    const tieList = await tieClock.listRecentChats(20);
+    const tieList = await tieClock.listRecentChats(TEST_OWNER.userId, 20);
     assert.deepEqual(
       tieList.map((chat) => chat.chatId),
       ['tie-c', 'tie-b', 'tie-a', 'ghost'],
@@ -308,7 +310,7 @@ test('memory parity: every indexed chat keeps a real timestamp in every listing'
     ]);
   }
   // Narrow listing: only the top slots, all with real ISO timestamps.
-  const narrow = await store.listRecentChats(5);
+  const narrow = await store.listRecentChats(TEST_OWNER.userId, 5);
   assert.equal(narrow.length, 5);
   for (const chat of narrow) {
     assert.ok(chat.lastActivityAt !== null, 'an indexed chat never degrades to null');
@@ -316,7 +318,17 @@ test('memory parity: every indexed chat keeps a real timestamp in every listing'
   // Wider listing: every chat this store indexed shows its real timestamp —
   // index membership (present in the store's index) always wins over
   // window position, mirroring the Redis zScore verification.
-  const wide = await store.listRecentChats(50);
+  // Owner-scoped: chat B's chats are invisible to owner A's list (the same
+  // slug+chatId under another owner is a DIFFERENT chat).
+  await store.appendMessage({ ownerId: TEST_OWNER_B.userId, slug: 'general', chatId: 'w00' }, {
+    id: 'ub', role: 'user', parts: [{ type: 'text', text: 'other owner chat' }],
+  } as never);
+  const ownerBList = await store.listRecentChats(TEST_OWNER_B.userId, 50);
+  assert.deepEqual(ownerBList.map((chat) => chat.chatId), ['w00']);
+  // Wide listing: every chat this store indexed shows its real timestamp —
+  // index membership (present in the store's index) always wins over
+  // window position, mirroring the Redis zScore verification.
+  const wide = await store.listRecentChats(TEST_OWNER.userId, 50);
   assert.equal(wide.length, 25);
   for (const chat of wide) {
     assert.ok(chat.lastActivityAt !== null, `indexed chat ${chat.chatId} keeps its timestamp`);
@@ -373,14 +385,14 @@ test('memory store index parity: every append re-scores, snapshot untouched', as
   const store = createInMemoryChatStore({ now: nextNow });
   const chat = chatRef('general', 'parity');
   await seedMessages(store, chat, [userText('u1', 'one'), userText('u2', 'two')]);
-  const first = await store.listRecentChats(10);
+  const first = await store.listRecentChats(TEST_OWNER.userId, 10);
   assert.equal(first.length, 1);
   assert.equal(first[0]?.messageCount, 2);
   const scoreBefore = first[0]?.lastActivityAt;
   const before = store.snapshot(chat);
   // A third append re-scores the member (newest activity wins).
   await store.appendMessage(chat, userText('u3', 'three'));
-  const after = await store.listRecentChats(10);
+  const after = await store.listRecentChats(TEST_OWNER.userId, 10);
   assert.equal(after[0]?.messageCount, 3);
   assert.notEqual(after[0]?.lastActivityAt, scoreBefore);
   assert.equal(store.snapshot(chat).messages.length, before.messages.length + 1);
@@ -390,7 +402,7 @@ test('memory store index parity: every append re-scores, snapshot untouched', as
 test('chat summary type contract: no extra fields beyond the summary', async () => {
   const store = createInMemoryChatStore({ now: nextNow });
   await seedMessages(store, chatRef('orchestrator', 'shape'), [userText('u1', 'shape check')]);
-  const chats = await store.listRecentChats(20);
+  const chats = await store.listRecentChats(TEST_OWNER.userId, 20);
   const only: ChatSummary | undefined = chats[0];
   assert.ok(only !== undefined);
   assert.deepEqual(Object.keys(only).sort(), [
@@ -403,4 +415,52 @@ test('chat summary type contract: no extra fields beyond the summary', async () 
   ]);
   assert.equal(only.agent, 'orchestrator');
   assert.equal(only.chatId, 'shape');
+});
+
+test('fail-closed: with ownerMode none every gated route answers the fixed 401', async () => {
+  const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }), ownerMode: 'none' });
+  try {
+    const chats = await getChats(app.port);
+    assert.equal(chats.status, 401);
+    assert.deepEqual(chats.body, { error: 'Authentication required.' });
+    const hydration = await getJson({ port: app.port, path: '/api/agents/general/chat/chat-x' });
+    assert.equal(hydration.status, 401);
+    assert.deepEqual(hydration.body, { error: 'Authentication required.' });
+    const post = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': 'c1:m1' },
+      body: JSON.stringify({ id: 'c1', message: { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] } }),
+    });
+    assert.equal(post.status, 401);
+    assert.deepEqual((await post.json()) as unknown, { error: 'Authentication required.' });
+    // /health stays public without auth deps.
+    const health = await getJson({ port: app.port, path: '/health' });
+    assert.equal(health.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
+test('CORS with credentials: the single web origin gets Allow-Credentials, never a wildcard', async () => {
+  const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
+  try {
+    const cors = await fetch(`http://127.0.0.1:${app.port}/api/chats`, {
+      headers: { Origin: TEST_ORIGINAL_ORIGIN },
+    });
+    assert.equal(cors.headers.get('access-control-allow-origin'), TEST_ORIGINAL_ORIGIN);
+    assert.equal(cors.headers.get('access-control-allow-credentials'), 'true');
+    const preflight = await fetch(`http://127.0.0.1:${app.port}/api/chats`, {
+      method: 'OPTIONS',
+      headers: { Origin: TEST_ORIGINAL_ORIGIN, 'Access-Control-Request-Method': 'GET' },
+    });
+    assert.equal(preflight.headers.get('access-control-allow-origin'), TEST_ORIGINAL_ORIGIN);
+    assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
+    // A foreign origin gets NO CORS identity at all (no wildcard, ever).
+    const foreign = await fetch(`http://127.0.0.1:${app.port}/api/chats`, {
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert.equal(foreign.headers.get('access-control-allow-origin'), null);
+  } finally {
+    await app.close();
+  }
 });

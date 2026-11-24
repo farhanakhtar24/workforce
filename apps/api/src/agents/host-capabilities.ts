@@ -34,7 +34,7 @@ import {
 } from '@workforce/core/work-docs';
 
 import type { DelegationContextPayload, DelegationContextSigner } from './delegation-context.js';
-import { DELEGATION_CONTEXT_HEADER, contextWindow } from './delegation-context.js';
+import { DELEGATION_CONTEXT_HEADER, contextWindow, internalOwnerHeader } from './delegation-context.js';
 
 /** Minimal structural fetch (global fetch satisfies it; tests record calls). */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -49,6 +49,12 @@ export interface AgentToolContext {
   readonly parentMessageId: string;
   /** Single-tenant scope (Phase 4: always `default`). */
   readonly scope: 'default';
+  /**
+   * Pre-Phase 6: the RESOLVED platform owner (Better Auth `User.id`) driving
+   * this generation. Every tool REST call carries it in a SIGNED internal
+   * header; it is never derived from model output or a request body.
+   */
+  readonly ownerId: string;
   /** Verified delegation depth of THIS generation (0 for root chats). */
   readonly depth: number;
 }
@@ -277,20 +283,30 @@ export function delegationRestTimeoutMs(delegationTimeoutMs: number): number {
 }
 
 /**
- * One minter for the internal header the orchestrator's tools attach to their
- * OWN create/run REST calls (`kind: 'delegation-create'`): the routes verify
- * it against the delegation row — the bound fields are the parent chat id +
- * parent depth, never the child chat.
+ * One minter for the internal headers the orchestrator's tools attach to
+ * their OWN REST calls. Two layers:
+ * - `X-Workforce-Internal-Owner` (kind `internal-owner`) — SIGNED owner for
+ *   doc/memory/data calls, so the routes resolve the SAME identity that
+ *   started the generation (never a client field).
+ * - `X-Workforce-Delegation-Context` (kind `delegation-create`) — the
+ *   delegation create/run binding (parent chat + parent depth + owner); the
+ *   delegation routes verify it against the delegation row. Delegation calls
+ *   carry BOTH headers; the owner middleware requires every signed header on
+ *   one request to agree on the SAME owner (a mismatch is a fixed 400).
  */
-function signedInternalHeader(deps: HostCapabilityDeps, ctx: AgentToolContext): Record<string, string> {
+function signedInternalHeaders(deps: HostCapabilityDeps, ctx: AgentToolContext): Record<string, string> {
   const window = contextWindow(deps.delegationTimeoutMs);
-  const payload: DelegationContextPayload = {
+  const delegationPayload: DelegationContextPayload = {
     kind: 'delegation-create',
     parentChatId: ctx.chatId,
     parentDepth: ctx.depth,
+    ownerId: ctx.ownerId,
     expiresAt: window.expiresAt,
   };
-  return { [DELEGATION_CONTEXT_HEADER]: deps.signer.sign(payload) };
+  return {
+    [DELEGATION_CONTEXT_HEADER]: deps.signer.sign(delegationPayload),
+    ...internalOwnerHeader(deps.signer, ctx.ownerId),
+  };
 }
 
 async function delegateExecutor(deps: HostCapabilityDeps, ctx: AgentToolContext, input: unknown): Promise<DelegateToolOutput> {
@@ -307,7 +323,7 @@ async function delegateExecutor(deps: HostCapabilityDeps, ctx: AgentToolContext,
       parentChatId: ctx.chatId,
       parentMessageId: ctx.parentMessageId,
     },
-    signedInternalHeader(deps, ctx),
+    signedInternalHeaders(deps, ctx),
     delegationBudgetMs,
   );
   const delegation = delegationSummary(create.body);
@@ -326,7 +342,7 @@ async function delegateExecutor(deps: HostCapabilityDeps, ctx: AgentToolContext,
     'POST',
     `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/delegations/${encodeURIComponent(delegation.delegationId)}/run`,
     undefined,
-    signedInternalHeader(deps, ctx),
+    signedInternalHeaders(deps, ctx),
     delegationBudgetMs,
   );
   return delegationSummary(run.body);
@@ -367,11 +383,20 @@ export function buildHostCapabilities(deps: HostCapabilityDeps, ctx: AgentToolCo
       (input: unknown) =>
         (async (): Promise<unknown> => {
           const parsed = searchMemoryInputSchema.parse(input);
-          const result = await callRestJson(deps, 'POST', `${deps.baseUrl}/api/memory/search`, {
-            query: parsed.query,
-            ...(parsed.path !== undefined ? { path: parsed.path } : {}),
-            limit: parsed.limit,
-          });
+          // The search reads THROUGH the owner the signed internal header
+          // carries: the route forces scope=userMemoryScope(owner), so this
+          // tool call can never see another user's (or legacy) memory.
+          const result = await callRestJson(
+            deps,
+            'POST',
+            `${deps.baseUrl}/api/memory/search`,
+            {
+              query: parsed.query,
+              ...(parsed.path !== undefined ? { path: parsed.path } : {}),
+              limit: parsed.limit,
+            },
+            internalOwnerHeader(deps.signer, ctx.ownerId),
+          );
           const body = requireObject(result.body);
           const results = body['results'];
           if (!Array.isArray(results)) {
@@ -415,9 +440,15 @@ export function buildHostCapabilities(deps: HostCapabilityDeps, ctx: AgentToolCo
           const parsed = queryDataInputSchema.parse(input);
           // The tool input is `{sql}` (phase contract); the REST route takes
           // `{query, limit?}` — same statement, mapped here at the boundary.
-          const result = await callRestJson(deps, 'POST', `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/data/query`, {
-            query: parsed.sql,
-          });
+          const result = await callRestJson(
+            deps,
+            'POST',
+            `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/data/query`,
+            {
+              query: parsed.sql,
+            },
+            internalOwnerHeader(deps.signer, ctx.ownerId),
+          );
           const body = requireObject(result.body);
           const columns = body['columns'];
           const rows = body['rows'];
@@ -447,31 +478,52 @@ export function buildHostCapabilities(deps: HostCapabilityDeps, ctx: AgentToolCo
       (input: unknown) =>
         (async (): Promise<DocToolOutput> => {
           const parsed = writeDocInputSchema.parse(input);
+          // Doc routes resolve the owner from this SIGNED internal header
+          // (`internal-owner`); a body field can never claim another owner.
+          const ownerHeaders = internalOwnerHeader(deps.signer, ctx.ownerId);
           if (parsed.action === 'create') {
-            const created = await callRestJson(deps, 'POST', `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/work-docs`, {
-              type: parsed.type,
-              title: parsed.title,
-              content: parsed.content,
-              chatId: ctx.chatId,
-            });
+            const created = await callRestJson(
+              deps,
+              'POST',
+              `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/work-docs`,
+              {
+                type: parsed.type,
+                title: parsed.title,
+                content: parsed.content,
+                chatId: ctx.chatId,
+              },
+              ownerHeaders,
+            );
             return docSummary(requireObject(created.body)['document']);
           }
           if (parsed.action === 'update') {
-            const updated = await callRestJson(deps, 'POST', `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/work-docs/${encodeURIComponent(parsed.docId)}/versions`, {
-              chatId: ctx.chatId,
-              expectedVersion: parsed.expectedVersion,
-              content: parsed.content,
-              ...(parsed.title !== undefined ? { title: parsed.title } : {}),
-              ...(parsed.summary !== undefined ? { summary: parsed.summary } : {}),
-            });
+            const updated = await callRestJson(
+              deps,
+              'POST',
+              `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/work-docs/${encodeURIComponent(parsed.docId)}/versions`,
+              {
+                chatId: ctx.chatId,
+                expectedVersion: parsed.expectedVersion,
+                content: parsed.content,
+                ...(parsed.title !== undefined ? { title: parsed.title } : {}),
+                ...(parsed.summary !== undefined ? { summary: parsed.summary } : {}),
+              },
+              ownerHeaders,
+            );
             return docSummary(requireObject(updated.body)['document']);
           }
-          const rolled = await callRestJson(deps, 'POST', `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/work-docs/${encodeURIComponent(parsed.docId)}/rollback`, {
-            chatId: ctx.chatId,
-            expectedVersion: parsed.expectedVersion,
-            toVersion: parsed.version,
-            source: 'agent',
-          });
+          const rolled = await callRestJson(
+            deps,
+            'POST',
+            `${deps.baseUrl}/api/agents/${encodeURIComponent(ctx.slug)}/work-docs/${encodeURIComponent(parsed.docId)}/rollback`,
+            {
+              chatId: ctx.chatId,
+              expectedVersion: parsed.expectedVersion,
+              toVersion: parsed.version,
+              source: 'agent',
+            },
+            ownerHeaders,
+          );
           return docSummary(requireObject(rolled.body)['document']);
         })(),
     ),

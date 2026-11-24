@@ -63,6 +63,13 @@ export const delegationErrorSchema = z
   .min(1, 'error must not be empty when supplied')
   .max(DELEGATION_MAX_ERROR_LENGTH, `error must be at most ${DELEGATION_MAX_ERROR_LENGTH} characters`);
 
+/**
+ * Platform-user owner id (Better Auth `User.id`, TEXT — NOT a UUID): trimmed,
+ * 1..128 characters. Legacy ownerless rows carry `null`; owner filters match
+ * EXACTLY (an expected owner never matches ownerless rows).
+ */
+export const delegationOwnerIdSchema = delegationExternalIdSchema;
+
 /** The CHILD agent's depth: 1 for a root's delegation, 2 for a child's. */
 export const delegationDepthSchema = z
   .number()
@@ -85,6 +92,11 @@ export const createDelegationInputSchema = z.strictObject({
   task: delegationTaskSchema,
   depth: delegationDepthSchema,
   /**
+   * Optional platform-user owner id (legacy callers omit it; the row is then
+   * ownerless). The authenticated API layer MUST always pass the acting user.
+   */
+  ownerId: delegationOwnerIdSchema.optional(),
+  /**
    * Optional creation timestamp override (ISO string or Date) for
    * deterministic tests; defaults to the repository clock. Must be a valid
    * date when supplied.
@@ -94,6 +106,11 @@ export const createDelegationInputSchema = z.strictObject({
 
 export const listDelegationsByParentInputSchema = z.strictObject({
   parentChatId: delegationExternalIdSchema,
+  /**
+   * Owner filter: EXACT match only. When set, ownerless legacy rows and other
+   * users' rows are never returned (prevents unbounded global reads).
+   */
+  ownerId: delegationOwnerIdSchema.optional(),
   order: z.enum(['oldest', 'newest']).optional().default('newest'),
   limit: z
     .number()
@@ -117,6 +134,20 @@ export const updateDelegationStatusInputSchema = z.strictObject({
    * concurrent candidates can claim a delegation.
    */
   expectedFrom: delegationStatusSchema.optional(),
+  /**
+   * Owner guard: when set, the delegation must belong EXACTLY to this user
+   * (ownerless legacy rows never match) — a mismatch reads as 404 BEFORE the
+   * claim/transition logic, so a wrong owner is never a status oracle.
+   */
+  expectedOwnerId: delegationOwnerIdSchema.optional(),
+});
+
+/**
+ * Read options for `get`/`getByChild`: the owner guard reads a foreign or
+ * ownerless delegation as absent (`null`) — never an existence oracle.
+ */
+export const delegationReadOptionsSchema = z.strictObject({
+  expectedOwnerId: delegationOwnerIdSchema.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -126,11 +157,13 @@ export const updateDelegationStatusInputSchema = z.strictObject({
 export type DelegationCreateInput = z.input<typeof createDelegationInputSchema>;
 export type DelegationListByParentInput = z.input<typeof listDelegationsByParentInputSchema>;
 export type DelegationUpdateStatusInput = z.input<typeof updateDelegationStatusInputSchema>;
+export type DelegationReadOptions = z.input<typeof delegationReadOptionsSchema>;
 
 // Output (parsed) shapes with defaults applied.
 export type ParsedDelegationCreateInput = z.output<typeof createDelegationInputSchema>;
 export type ParsedDelegationListByParentInput = z.output<typeof listDelegationsByParentInputSchema>;
 export type ParsedDelegationUpdateStatusInput = z.output<typeof updateDelegationStatusInputSchema>;
+export type ParsedDelegationReadOptions = z.output<typeof delegationReadOptionsSchema>;
 
 /**
  * Parse repository input against `schema`, converting Zod errors into the

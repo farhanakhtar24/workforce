@@ -8,7 +8,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 
-import { startTestApp } from './helpers.js';
+import { startTestApp, TEST_OWNER } from './helpers.js';
+import { userMemoryScope } from '@workforce/core/auth';
 import {
   DataQueryError,
   createDataQueryService,
@@ -17,7 +18,14 @@ import {
   stripSqlComments,
   type QueryClientLike,
   type QueryPoolLike,
+  type DataQueryOwner,
 } from '../src/agents/data-query.js';
+
+/** The owner context the route/tool derive from the RESOLVED identity. */
+const QUERY_OWNER: DataQueryOwner = {
+  ownerId: TEST_OWNER.userId,
+  memoryScope: userMemoryScope(TEST_OWNER.userId),
+};
 
 // ---------------------------------------------------------------------------
 // screenSql (pure)
@@ -145,12 +153,15 @@ async function serviceWith(): Promise<{ service: ReturnType<typeof createDataQue
 
 test('service: BEGIN READ ONLY + SET LOCAL statement_timeout precede the wrapped query, then COMMIT + session reset', async () => {
   const { service, pool } = await serviceWith();
-  const result = await service.query('SELECT id FROM chats', undefined);
+  const result = await service.query('SELECT id FROM chats', undefined, QUERY_OWNER);
   assert.equal(result.truncated, false);
   assert.equal(result.rowCount, 1);
   assert.deepEqual(pool.statements, [
     'BEGIN READ ONLY',
     'SET LOCAL statement_timeout = 2000',
+    `SET LOCAL workforce.user_id = '${TEST_OWNER.userId}'`,
+    `SET LOCAL workforce.memory_scope = '${userMemoryScope(TEST_OWNER.userId)}'`,
+    'SET LOCAL ROLE workforce_query_reader',
     wrapForRowCap('SELECT id FROM chats', 3),
     'COMMIT',
     // L3: guaranteed session reset before the client returns to the pool.
@@ -167,7 +178,7 @@ test('service: over-cap result (cap+1 rows) errors row_cap, never silent truncat
   ]);
   const service = createDataQueryService({ pool, statementTimeoutMs: 100, rowCap: 3 });
   await assert.rejects(
-    () => service.query('SELECT id FROM chats'),
+    () => service.query('SELECT id FROM chats', undefined, QUERY_OWNER),
     (error: DataQueryError) => error.kind === 'row_cap',
   );
 });
@@ -178,24 +189,24 @@ test('service: user limit truncates under the cap and reports truncated', async 
     { cells: { id: '2', content: 'b' } },
   ]);
   const service = createDataQueryService({ pool, statementTimeoutMs: 100, rowCap: 10 });
-  const withLimit = await service.query('SELECT id FROM chats', 1);
+  const withLimit = await service.query('SELECT id FROM chats', 1, QUERY_OWNER);
   assert.equal(withLimit.truncated, true);
   assert.equal(withLimit.rowCount, 1);
-  const withoutLimit = await service.query('SELECT id FROM chats');
+  const withoutLimit = await service.query('SELECT id FROM chats', undefined, QUERY_OWNER);
   assert.equal(withoutLimit.truncated, false);
   assert.equal(withoutLimit.rowCount, 2);
 });
 
 test('service: screening failures raise invalid (never touch the pool)', async () => {
   const { service, pool } = await serviceWith();
-  await assert.rejects(() => service.query('DELETE FROM chats'), (error: DataQueryError) => error.kind === 'invalid');
+  await assert.rejects(() => service.query('DELETE FROM chats', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'invalid');
   assert.equal(pool.statements.length, 0);
 });
 
 test('service: bad limit raises invalid before the db', async () => {
   const { service, pool } = await serviceWith();
-  await assert.rejects(() => service.query('SELECT 1', 0), (error: DataQueryError) => error.kind === 'invalid');
-  await assert.rejects(() => service.query('SELECT 1', 1.5), (error: DataQueryError) => error.kind === 'invalid');
+  await assert.rejects(() => service.query('SELECT 1', 0, QUERY_OWNER), (error: DataQueryError) => error.kind === 'invalid');
+  await assert.rejects(() => service.query('SELECT 1', 1.5, QUERY_OWNER), (error: DataQueryError) => error.kind === 'invalid');
   assert.equal(pool.statements.length, 0);
 });
 
@@ -203,22 +214,22 @@ test('service: pg 57014 → timeout; 25006 → read_only; other → unavailable'
   const timeoutPool = new FakePool([]);
   timeoutPool.errorNext = Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
   const timeoutService = createDataQueryService({ pool: timeoutPool, statementTimeoutMs: 100, rowCap: 3 });
-  await assert.rejects(() => timeoutService.query('SELECT 1'), (error: DataQueryError) => error.kind === 'timeout');
+  await assert.rejects(() => timeoutService.query('SELECT 1', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'timeout');
 
   const readOnlyPool = new FakePool([]);
   readOnlyPool.errorNext = Object.assign(new Error('cannot execute INSERT in a read-only transaction'), { code: '25006' });
   const readOnlyService = createDataQueryService({ pool: readOnlyPool, statementTimeoutMs: 100, rowCap: 3 });
-  await assert.rejects(() => readOnlyService.query('SELECT 1'), (error: DataQueryError) => error.kind === 'read_only');
+  await assert.rejects(() => readOnlyService.query('SELECT 1', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'read_only');
 
   const otherPool = new FakePool([]);
   otherPool.errorNext = new Error('syntax error at or near "from"');
   const otherService = createDataQueryService({ pool: otherPool, statementTimeoutMs: 100, rowCap: 3 });
-  await assert.rejects(() => otherService.query('SELECT 1'), (error: DataQueryError) => error.kind === 'unavailable');
+  await assert.rejects(() => otherService.query('SELECT 1', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'unavailable');
 
   const deadPool = new FakePool([]);
   deadPool.connectFails = true;
   const deadService = createDataQueryService({ pool: deadPool, statementTimeoutMs: 100, rowCap: 3 });
-  await assert.rejects(() => deadService.query('SELECT 1'), (error: DataQueryError) => error.kind === 'unavailable');
+  await assert.rejects(() => deadService.query('SELECT 1', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'unavailable');
 });
 
 // ---------------------------------------------------------------------------
@@ -253,13 +264,13 @@ test('screen: session-state functions (advisory locks, set_config, pg_sleep) are
 test('B1: failed query (syntax error) rolls back, discards, releases — SAME client serves the next query', async () => {
   const { service, pool } = await serviceWith();
   pool.failWhen = (text) => (text.startsWith('SELECT * FROM (') ? new Error('syntax error at or near "fropm"') : null);
-  await assert.rejects(() => service.query('SELECT fropm FROM x'), (error: DataQueryError) => error.kind === 'unavailable');
+  await assert.rejects(() => service.query('SELECT fropm FROM x', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'unavailable');
 
   // Recovery evidence on the very same client: rollback + discard issued…
   assert.ok(pool.statements.includes('ROLLBACK'));
   assert.ok(pool.statements.includes('DISCARD ALL'));
   // …and the NEXT valid query succeeds end-to-end on the SAME client.
-  const followup = await service.query('SELECT id FROM chats');
+  const followup = await service.query('SELECT id FROM chats', undefined, QUERY_OWNER);
   assert.equal(followup.rowCount, 1);
   assert.ok(!pool.statements.slice(-5).includes('ROLLBACK'), 'healthy run does not roll back');
   const last = pool.statements.at(-1);
@@ -269,11 +280,11 @@ test('B1: failed query (syntax error) rolls back, discards, releases — SAME cl
 test('B1: statement timeout aborts mid-transaction — rollback + discard + same client recovery', async () => {
   const { service, pool } = await serviceWith();
   pool.failWhen = (text) => (text.startsWith('SELECT * FROM (') ? Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }) : null);
-  await assert.rejects(() => service.query('SELECT id FROM chats'), (error: DataQueryError) => error.kind === 'timeout');
+  await assert.rejects(() => service.query('SELECT id FROM chats', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'timeout');
   assert.ok(pool.statements.includes('ROLLBACK'), 'aborted transaction rolled back before release');
   assert.ok(pool.statements.includes('DISCARD ALL'));
 
-  const followup = await service.query('SELECT id FROM chats', 1);
+  const followup = await service.query('SELECT id FROM chats', 1, QUERY_OWNER);
   assert.equal(followup.rowCount, 1);
   assert.equal(followup.truncated, false);
 });
@@ -287,7 +298,7 @@ test('B1: row-cap abort rolls back instead of committing the oversized read; sam
   ]);
   const service = createDataQueryService({ pool, statementTimeoutMs: 100, rowCap: 3 });
   const before = pool.statements.length;
-  await assert.rejects(() => service.query('SELECT id FROM chats'), (error: DataQueryError) => error.kind === 'row_cap');
+  await assert.rejects(() => service.query('SELECT id FROM chats', undefined, QUERY_OWNER), (error: DataQueryError) => error.kind === 'row_cap');
   const statements = pool.statements.slice(before);
   assert.ok(statements.includes('ROLLBACK'), 'oversized read is NOT committed — rolled back');
   assert.ok(!statements.includes('COMMIT'));
@@ -296,7 +307,7 @@ test('B1: row-cap abort rolls back instead of committing the oversized read; sam
   // Same client serves the next (under-cap, user-limited) query cleanly: the
   // rows source now yields only 2 rows.
   (pool.client as unknown as { result: FakeRow[] }).result = (pool.client as unknown as { result: FakeRow[] }).result.slice(0, 2);
-  const after = await service.query('SELECT id FROM chats', 1);
+  const after = await service.query('SELECT id FROM chats', 1, QUERY_OWNER);
   assert.equal(after.rowCount, 1);
   assert.equal(after.truncated, true);
   assert.equal(pool.statements.at(-1), 'DISCARD ALL');
@@ -304,7 +315,7 @@ test('B1: row-cap abort rolls back instead of committing the oversized read; sam
 
 test('L3: no leaked session state — every exit path (ok, invalid-sql, timeout) ends with DISCARD ALL', async () => {
   const { service, pool } = await serviceWith();
-  await service.query('SELECT id FROM chats');
+  await service.query('SELECT id FROM chats', undefined, QUERY_OWNER);
   assert.equal(pool.statements.at(-1), 'DISCARD ALL');
   assert.equal(pool.statements.filter((statement) => statement === 'DISCARD ALL').length, pool.statements.filter((statement) => statement === 'BEGIN READ ONLY').length, 'one discard per begin');
 });

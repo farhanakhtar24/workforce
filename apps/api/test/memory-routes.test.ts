@@ -24,7 +24,15 @@ import {
   type MemoryJobQueue,
   type MemoryStore,
 } from '@workforce/core/memory';
-import { startTestApp, type TestApp } from './helpers.js';
+import { startTestApp, TEST_OWNER, type TestApp } from './helpers.js';
+import { userMemoryScope } from '@workforce/core/auth';
+
+/**
+ * The FORCED scope the routes attach for the injected static test owner:
+ * every memory read/write/search/compaction is derived from the RESOLVED
+ * owner (never a client field), so tests must seed and assert against it.
+ */
+const USER_SCOPE = userMemoryScope(TEST_OWNER.userId);
 
 // ---------------------------------------------------------------------------
 // Offline fakes
@@ -100,6 +108,7 @@ function failingStore(): MemoryStore {
     nearestReadyCandidates: async () => fail(),
     listRelationsBySource: async () => fail(),
     listRelationsByTarget: async () => fail(),
+    purgeDerivedChatBlocks: async () => fail(),
     touchAccessed: async () => fail(),
   };
 }
@@ -156,7 +165,9 @@ async function seedBlock(
   input: { scope?: string; path: string; kind?: MemoryBlock['kind']; content?: string },
 ): Promise<MemoryBlock> {
   return service.writeBlock({
-    ...(input.scope !== undefined ? { scope: input.scope } : {}),
+    // Seeds default to the OWNER scope so the forced-scope routes see them;
+    // foreign scopes are explicitly requested by name.
+    scope: input.scope ?? USER_SCOPE,
     path: input.path,
     kind: input.kind ?? 'learning',
     content: input.content ?? 'seeded block content',
@@ -185,7 +196,7 @@ test('POST /api/memory/blocks returns 201 {block} with pending embedding', async
     assert.equal(status, 201);
     const block = body.block as MemoryBlock;
     assert.equal(typeof block.id, 'string');
-    assert.equal(block.scope, 'default');
+    assert.equal(block.scope, USER_SCOPE, 'the forced owner scope replaces the client scope');
     assert.equal(block.path, 'projects/atlas');
     assert.equal(block.kind, 'learning');
     assert.equal(block.content, 'Atlas uses Postgres 16.');
@@ -207,7 +218,7 @@ test('POST /api/memory/blocks applies schema defaults (scope, confidence)', asyn
       body: { path: 'a', kind: 'correction', content: 'x' },
     });
     assert.equal(status, 201);
-    assert.equal(body.block.scope, 'default');
+    assert.equal(body.block.scope, USER_SCOPE);
     assert.equal(body.block.confidence, 0.8);
   } finally {
     await ctx.app.close();
@@ -242,7 +253,7 @@ test('POST /api/memory/blocks rejects superseding a missing target (404) and a s
   const ctx = await buildMemoryApp();
   try {
     const corrected = await seedBlock(ctx.service, { path: 'projects/atlas', kind: 'learning', content: 'old fact' });
-    await ctx.service.writeBlock({ path: 'projects/atlas', kind: 'correction', content: 'new fact', supersedesId: corrected.id });
+    await ctx.service.writeBlock({ scope: USER_SCOPE, path: 'projects/atlas', kind: 'correction', content: 'new fact', supersedesId: corrected.id });
 
     // 404: unknown supersedesId
     const res404 = await callJson(ctx.app.port, {
@@ -291,7 +302,7 @@ test('GET /api/memory/blocks lists newest-first with defaults, hides superseded'
     const first = await seedBlock(ctx.service, { path: 'projects/atlas', content: 'first' });
     const second = await seedBlock(ctx.service, { path: 'projects/atlas', content: 'second' });
     const third = await seedBlock(ctx.service, { path: 'projects/atlas', kind: 'correction', content: 'third' });
-    await ctx.service.writeBlock({ path: 'projects/atlas', kind: 'correction', content: 'replacement', supersedesId: first.id });
+    await ctx.service.writeBlock({ scope: USER_SCOPE, path: 'projects/atlas', kind: 'correction', content: 'replacement', supersedesId: first.id });
 
     const { status, body } = await callJson(ctx.app.port, { method: 'GET', path: '/api/memory/blocks' });
     assert.equal(status, 200);
@@ -339,25 +350,36 @@ test('GET /api/memory/blocks strict limit/includeSuperseded/kind/scope parsing',
   }
 });
 
-test('GET /api/memory/blocks filters by scope, keyword, and includeSuperseded=false default', async () => {
+test('GET /api/memory/blocks: the client scope is IGNORED — the forced owner scope replaces it', async () => {
   const ctx = await buildMemoryApp();
   try {
-    const a1 = await seedBlock(ctx.service, { scope: 'alpha', path: 'a', content: 'unusual-needle' });
-    await seedBlock(ctx.service, { scope: 'beta', path: 'a', content: 'unusual-needle' });
-    await ctx.service.writeBlock({ scope: 'alpha', path: 'a', kind: 'correction', content: 'sup', supersedesId: a1.id });
+    // Own-scope data (forced reads see it) and foreign-scope data (never).
+    const a1 = await seedBlock(ctx.service, { path: 'a', content: 'unusual-needle' });
+    await seedBlock(ctx.service, { path: 'a', content: 'unusual-needle-2' });
+    await seedBlock(ctx.service, { scope: 'alpha', path: 'a', content: 'unusual-needle-alpha' });
+    await seedBlock(ctx.service, { scope: 'beta', path: 'a', content: 'unusual-needle-beta' });
 
-    const scoped = await callJson(ctx.app.port, { method: 'GET', path: '/api/memory/blocks?scope=alpha' });
-    assert.equal(scoped.status, 200);
-    assert.ok((scoped.body.blocks as Array<{ content: string }>)[0] !== undefined);
-    assert.ok((scoped.body.blocks as Array<{ content: string }>).every((block) => block.content === 'sup'));
+    const forced = await callJson(ctx.app.port, { method: 'GET', path: '/api/memory/blocks?scope=alpha&keyword=unusual-needle&limit=100' });
+    assert.equal(forced.status, 200);
+    const forcedBlocks = forced.body.blocks as Array<{ scope: string; content: string }>;
+    assert.equal(forcedBlocks.length, 2, 'only the owner scope matches; ?scope=alpha is ignored');
+    assert.deepEqual(
+      [...forcedBlocks.map((block) => block.content)].sort(),
+      ['unusual-needle', 'unusual-needle-2'],
+    );
+    assert.ok(forcedBlocks.every((block) => block.scope === USER_SCOPE));
 
-    const keyword = await callJson(ctx.app.port, { method: 'GET', path: '/api/memory/blocks?keyword=unusual-needle&scope=beta&limit=100' });
-    assert.equal(keyword.status, 200);
-    assert.ok((keyword.body.blocks as unknown[])[0] !== undefined);
-
-    const hidden = await callJson(ctx.app.port, { method: 'GET', path: '/api/memory/blocks?scope=alpha&keyword=unusual-needle' });
+    // Supersede inside the owner scope: the older block hides by default.
+    await ctx.service.writeBlock({ scope: USER_SCOPE, path: 'a', kind: 'correction', content: 'sup', supersedesId: a1.id });
+    const hidden = await callJson(ctx.app.port, { method: 'GET', path: '/api/memory/blocks?keyword=unusual-needle&limit=100' });
     assert.equal(hidden.status, 200);
-    assert.equal((hidden.body.blocks as unknown[]).length, 0); // superseded hidden by default
+    const hiddenBlocks = hidden.body.blocks as Array<{ content: string }>;
+    assert.equal(hiddenBlocks.length, 1, 'after the supersede only the unmatched-by-keyword second block remains; foreign scopes still invisible');
+    assert.deepEqual(
+      hiddenBlocks.map((block) => block.content),
+      ['unusual-needle-2'],
+    );
+    assert.equal(hiddenBlocks[0]?.content !== 'sup', true);
   } finally {
     await ctx.app.close();
   }
@@ -409,14 +431,24 @@ test('POST /api/memory/search applies defaults and strict validation', async () 
     for (const body of [
       { query: '' },
       { query: 'x'.repeat(501) },
-      { query: 'q', scope: 'has space' },
       { query: 'q', unknown: true },
       { query: 'q', limit: 0 },
+      // Extra keys fail strict validation (only scope itself is stripped).
+      { query: 'q', scope2: 'x' },
     ]) {
       const { status, body: out } = await callJson(ctx.app.port, { method: 'POST', path: '/api/memory/search', body });
       assert.equal(status, 400, JSON.stringify(body));
       assert.equal(out.error, 'Invalid memory request.');
     }
+
+    // A client-supplied scope — even an invalid one — is stripped IN FULL and
+    // never validated: the forced owner scope replaces it (no leak, no 400).
+    const ignoredScope = await callJson(ctx.app.port, {
+      method: 'POST',
+      path: '/api/memory/search',
+      body: { query: 'q', scope: 'has space' },
+    });
+    assert.equal(ignoredScope.status, 200);
   } finally {
     await ctx.app.close();
   }
@@ -459,7 +491,7 @@ test('GET /api/memory/blocks/:id/related returns block + outgoing + incoming', a
   const ctx = await buildMemoryApp();
   try {
     const original = await seedBlock(ctx.service, { path: 'projects/atlas', content: 'original' });
-    const correction = await ctx.service.writeBlock({ path: 'projects/atlas', kind: 'correction', content: 'corrected', supersedesId: original.id });
+    const correction = await ctx.service.writeBlock({ scope: USER_SCOPE, path: 'projects/atlas', kind: 'correction', content: 'corrected', supersedesId: original.id });
 
     const self = await callJson(ctx.app.port, { method: 'GET', path: `/api/memory/blocks/${correction.id}/related` });
     assert.equal(self.status, 200);
@@ -556,7 +588,7 @@ test('POST /api/memory/blocks/:id/retry 503 when queue fails', async () => {
   const embedder = mockEmbedder();
   const seedQueue = workingQueue();
   const seeding = new MemoryService({ store, embeddingProvider: embedder, queue: seedQueue, compactor: mockCompactor() });
-  const block = await seeding.writeBlock({ path: 'a', kind: 'learning', content: 'seed' });
+  const block = await seeding.writeBlock({ scope: USER_SCOPE, path: 'a', kind: 'learning', content: 'seed' });
 
   const throwingQueue = workingQueue();
   (throwingQueue as unknown as { enqueueEmbedding: (id: string) => Promise<void> }).enqueueEmbedding = async () => {
@@ -587,14 +619,15 @@ test('POST /api/memory/compact 202 with queued response', async () => {
     });
     assert.equal(status, 202);
     assert.equal(body.status, 'queued');
-    assert.equal(body.scope, 'alpha');
+    // The client scope is IGNORED: compaction runs on the forced owner scope.
+    assert.equal(body.scope, USER_SCOPE);
     assert.equal(body.path, 'projects/atlas');
     assert.ok(typeof body.triggerBlockId === 'string');
     assert.equal(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.triggerBlockId),
       true,
     );
-    assert.deepEqual(ctx.queue.compacted, [{ scope: 'alpha', path: 'projects/atlas', triggerBlockId: body.triggerBlockId }]);
+    assert.deepEqual(ctx.queue.compacted, [{ scope: USER_SCOPE, path: 'projects/atlas', triggerBlockId: body.triggerBlockId }]);
   } finally {
     await ctx.app.close();
   }
@@ -603,7 +636,7 @@ test('POST /api/memory/compact 202 with queued response', async () => {
 test('POST /api/memory/compact strict validation and 503 queue failure', async () => {
   const ctx = await buildMemoryApp();
   try {
-    for (const body of [{}, { path: 'a' }, { scope: 'a' }, { scope: 12, path: 'a' }, { scope: 'a', path: 'a', extra: 1 }]) {
+    for (const body of [{}, { path: 'a', extra: 1 }]) {
       const { status, body: out } = await callJson(ctx.app.port, { method: 'POST', path: '/api/memory/compact', body });
       assert.equal(status, 400, JSON.stringify(body));
       assert.equal(out.error, 'Invalid memory request.');

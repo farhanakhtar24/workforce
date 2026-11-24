@@ -35,7 +35,22 @@ export const MEMORY_JOB_BACKOFF_BASE_MS = 1000;
 /** Discriminated payload carried by every job on the memory queue. */
 export type MemoryJobData =
   | { kind: 'embed'; blockId: string }
-  | { kind: 'compact'; scope: string; path: string; triggerBlockId: string };
+  | { kind: 'compact'; scope: string; path: string; triggerBlockId: string }
+  /**
+   * Pre-Phase 6 opt-in personal-memory capture: ONE deterministic job per
+   * (scope, chatId, assistantMessageId). The job carries ids ONLY (never
+   * message text) — the worker re-loads the transcript, re-checks the
+   * enablement, and writes at most one derived block per assistant turn.
+   */
+  | {
+      kind: 'capture';
+      ownerId: string;
+      scope: string;
+      chatId: string;
+      slug: string;
+      userMessageId: string;
+      assistantMessageId: string;
+    };
 
 /** Deterministic embed job id: UUID-based, no runtime state. */
 export function memoryEmbedJobId(blockId: string): string {
@@ -48,14 +63,38 @@ export function memoryCompactJobId(scope: string, path: string, triggerBlockId: 
   return `compact-${digest}`;
 }
 
+/** Deterministic capture job id: sha256 over scope/chat/assistant message. */
+export function personalCaptureJobId(scope: string, chatId: string, assistantMessageId: string): string {
+  const digest = createHash('sha256').update(`${scope}|${chatId}|${assistantMessageId}`).digest('hex');
+  return `capture-${digest}`;
+}
+
 /** Job states that mean the job still exists AND must not be re-added. */
 const IN_FLIGHT_STATES = new Set(['active', 'waiting', 'delayed', 'paused']);
+
+/** Safe ids for the capture payload (API id contract, bounded count). */
+const CAPTURE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+function isBoundedId(value: unknown): boolean {
+  return typeof value === 'string' && CAPTURE_ID_PATTERN.test(value);
+}
 
 export function isMemoryJobData(value: unknown): value is MemoryJobData {
   if (value === null || typeof value !== 'object') {
     return false;
   }
-  const data = value as { kind?: unknown; blockId?: unknown; scope?: unknown; path?: unknown; triggerBlockId?: unknown };
+  const data = value as {
+    kind?: unknown;
+    blockId?: unknown;
+    scope?: unknown;
+    path?: unknown;
+    triggerBlockId?: unknown;
+    ownerId?: unknown;
+    chatId?: unknown;
+    slug?: unknown;
+    userMessageId?: unknown;
+    assistantMessageId?: unknown;
+  };
   if (data.kind === 'embed') {
     return typeof data.blockId === 'string' && data.blockId.length > 0;
   }
@@ -64,6 +103,18 @@ export function isMemoryJobData(value: unknown): value is MemoryJobData {
       typeof data.scope === 'string' &&
       typeof data.path === 'string' &&
       typeof data.triggerBlockId === 'string'
+    );
+  }
+  if (data.kind === 'capture') {
+    return (
+      isBoundedId(data.ownerId) &&
+      typeof data.scope === 'string' &&
+      data.scope.length > 0 &&
+      data.scope.length <= 64 &&
+      isBoundedId(data.chatId) &&
+      isBoundedId(data.slug) &&
+      isBoundedId(data.userMessageId) &&
+      isBoundedId(data.assistantMessageId)
     );
   }
   return false;
@@ -216,6 +267,36 @@ export class BullMQMemoryJobQueue implements MemoryJobQueue {
       'embed',
       { kind: 'embed', blockId },
       memoryEmbedJobId(blockId),
+      this.jobOptions,
+    );
+  }
+
+  /**
+   * Deterministic, idempotent personal-memory capture enqueue for ONE
+   * completed assistant turn. Same-id dedupe: waiting/delayed/active/paused
+   * or `completed` jobs are a no-op; a `failed` job is removed and
+   * re-queued under the SAME id (the worker re-checks enablement and the
+   * derived-block metadata before writing, so duplicates can never land).
+   */
+  async enqueueCapture(input: {
+    ownerId: string;
+    scope: string;
+    chatId: string;
+    slug: string;
+    userMessageId: string;
+    assistantMessageId: string;
+  }): Promise<boolean> {
+    if (this.closed) {
+      throw new Error('memory queue is closed');
+    }
+    if (!isMemoryJobData({ ...input, kind: 'capture' })) {
+      throw new Error('invalid capture job payload');
+    }
+    return await enqueueWithId(
+      this.queue,
+      'capture',
+      { kind: 'capture', ...input },
+      personalCaptureJobId(input.scope, input.chatId, input.assistantMessageId),
       this.jobOptions,
     );
   }

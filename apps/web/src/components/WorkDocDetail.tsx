@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { WorkspaceGate } from '@/components/WorkspaceShell';
 import { StatusBadge } from '@/components/StatusBadge';
 import { MarkdownText } from '@/components/MarkdownText';
 import { Badge } from '@/components/ui/badge';
@@ -64,7 +64,7 @@ const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 export function WorkDocDetailView({ apiBaseUrl, workDocId, chatId }: WorkDocDetailProps): React.ReactElement {
   if (!CHAT_ID_PATTERN.test(chatId)) {
     return (
-      <WorkspaceShell
+      <WorkspaceGate
         active="work"
         eyebrow="Workspace output"
         title="Work document"
@@ -76,7 +76,7 @@ export function WorkDocDetailView({ apiBaseUrl, workDocId, chatId }: WorkDocDeta
             chat's Work link or a list entry on <code>/work</code>.
           </p>
         </div>
-      </WorkspaceShell>
+      </WorkspaceGate>
     );
   }
   return <WorkDocDetailLoaded apiBaseUrl={apiBaseUrl} workDocId={workDocId} chatId={chatId} />;
@@ -275,7 +275,7 @@ function WorkDocDetailLoaded({
   };
 
   return (
-    <WorkspaceShell
+    <WorkspaceGate
       active="work"
       eyebrow="Workspace output"
       title={document !== null ? document.title : 'Work document'}
@@ -548,7 +548,7 @@ function WorkDocDetailLoaded({
           Loading document…
         </p>
       )}
-    </WorkspaceShell>
+    </WorkspaceGate>
   );
 }
 

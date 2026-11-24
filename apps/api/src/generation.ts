@@ -77,16 +77,22 @@ interface LanguageModelUsageLike {
 
 /**
  * `messageMetadata` for `toUIMessageStream`: emits `metadata.usage` on finish
- * when the provider reported a parseable usage (Phase 5). Old Phase 2/4
- * streams without usage metadata are unchanged (the chunks simply carry no
- * `messageMetadata`).
+ * when the provider reported a parseable usage (Phase 5), and
+ * `metadata.modelId` when the generation carries its model provenance
+ * (pre-Phase 6). Old Phase 2/4 streams without either are unchanged.
  */
-function chatTurnMessageMetadata({ part }: { part: TextStreamPart<ToolSet> }): { usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } } | undefined {
+function chatTurnMessageMetadata(
+  { part }: { part: TextStreamPart<ToolSet> },
+  modelId: string | undefined,
+): { usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number }; modelId?: string } | undefined {
   if (part.type !== 'finish') {
     return undefined;
   }
   const usage = usageMetadata(part.totalUsage);
-  return usage === null ? undefined : { usage };
+  if (usage === null) {
+    return undefined;
+  }
+  return { usage, ...(modelId !== undefined && modelId !== null ? { modelId } : {}) };
 }
 
 export interface CreateChatTurnStreamOptions {
@@ -102,6 +108,12 @@ export interface CreateChatTurnStreamOptions {
   logger: SafeLogger;
   model: LanguageModel;
   /**
+   * The model id this generation runs on (the chat's stored selection or the
+   * configured default); persisted as `metadata.modelId` on the assistant
+   * finish alongside usage (model provenance). Absent in legacy shapes.
+   */
+  modelId?: string;
+  /**
    * Phase 4: COMPOSED tools for this generation (plan/depth filtered) and the
    * agent's FULL allowed action set used for transcript validation. Both
    * default to the Phase 2 `{calculate}` set — `general` is unchanged.
@@ -111,11 +123,37 @@ export interface CreateChatTurnStreamOptions {
   /** Phase 4: definition system prompt for NEW agents; `null`/absent = none. */
   systemPrompt?: string | null;
   /**
+   * Pre-Phase 6 opt-in personal memory: the BOUNDED untrusted reference
+   * context recalled before this generation (recall module builds it). It is
+   * concatenated AFTER the agent system prompt inside the SDK `system`
+   * option and is treated as data by contract (header frames it).
+   */
+  memoryContext?: string;
+  /**
+   * Pre-Phase 6 opt-in personal capture hook, invoked ON THE ASSISTANT FINISH
+   * after the response message was persisted (with content). The hook
+   * internally checks the enablement + schedules the ONE deterministic
+   * capture job; failures must never break the stream (hook owners catch).
+   */
+  onAssistantFinished?: (finished: AssistantTurnFinished) => void;
+  /**
    * Phase 4: deadline abort signal for INTERNAL delegated child generations
    * only. Ordinary browser disconnects still never abort (no signal from the
    * public route path).
    */
   abortSignal?: AbortSignal;
+}
+
+/** Ids the capture/recall pipeline keys ONE completed assistant turn by. */
+export interface AssistantTurnFinished {
+  /** Chat reference the generation ran in. */
+  readonly chat: CreateChatTurnStreamOptions['chat'];
+  /** The persisted assistant (response) message id. */
+  readonly assistantMessageId: string;
+  /** The newest user message id of the turn. */
+  readonly userMessageId: string;
+  /** False when the generation produced no content (nothing persisted). */
+  readonly hasContent: boolean;
 }
 
 export interface ChatTurn {
@@ -134,9 +172,12 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
     background,
     logger,
     model,
+    modelId = undefined,
     tools = agentTools,
     validationTools = agentTools,
     systemPrompt = null,
+    memoryContext = undefined,
+    onAssistantFinished = undefined,
     abortSignal = undefined,
   } = options;
 
@@ -147,7 +188,13 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
     throw new InvalidStoredChatError();
   }
   // Phase 4: definition system prompt for NEW agents (general stays promptless)
-  // — passed through the SDK `system` option, never as a message.
+  // — passed through the SDK `system` option, never as a message. The
+  // opt-in personal-memory recall (pre-Phase 6) is appended AFTER the
+  // agent prompt as bounded UNTRUSTED reference context (framed as data).
+  const systemParts = [
+    typeof systemPrompt === 'string' && systemPrompt.length > 0 ? systemPrompt : null,
+    typeof memoryContext === 'string' && memoryContext.length > 0 ? memoryContext : null,
+  ].filter((part): part is string => part !== null);
   const generation = {
     model,
     messages: modelMessages,
@@ -156,7 +203,7 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
     // provider work itself. Browser disconnects still never abort (no
     // signal from the public route path).
     ...(abortSignal !== undefined ? { abortSignal } : {}),
-    ...(typeof systemPrompt === 'string' && systemPrompt.length > 0 ? { system: systemPrompt } : {}),
+    ...(systemParts.length > 0 ? { system: systemParts.join('\n\n') } : {}),
   } as const;
 
   const streamId = createStreamId();
@@ -180,7 +227,7 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
           // Provider/stream failures must never ship provider output.
           onError: () => STREAM_ERROR_TEXT,
           // Phase 5: bounded `metadata.usage` on finish (never fabricated).
-          messageMetadata: chatTurnMessageMetadata,
+          messageMetadata: (part) => chatTurnMessageMetadata(part, modelId),
         }),
       );
     },
@@ -197,6 +244,20 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
           await store.appendMessage(ref, responseMessage);
         }
         await store.clearActiveStreamId(ref, streamId);
+        // Opt-in personal capture: scheduled AFTER persistence, never on the
+        // response path (the hook is fire-and-forget; the owner of the hook
+        // catches its own failures).
+        if (onAssistantFinished !== undefined && hasContent) {
+          // The user message may not be the very last entry on HITL-resume
+          // turns; scan backwards for role 'user'.
+          const userMessageId = [...messages].reverse().find((entry) => entry.role === 'user')?.id ?? '';
+          onAssistantFinished({
+            chat: ref,
+            assistantMessageId: responseMessage.id,
+            userMessageId,
+            hasContent,
+          });
+        }
       } catch (error) {
         logger.error(context, error);
       }

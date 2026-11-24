@@ -33,6 +33,7 @@ import {
 import { loadApiConfig } from './config.js';
 import { loadProjectEnvFiles } from './env.js';
 import { consoleLogger, type SafeLogger } from './logging.js';
+import { createDelegationContextSigner } from './agents/delegation-context.js';
 import { createSchedulerRestRunClient } from './scheduler/run-client.js';
 
 /** Bounded budget for the startup PING (matches the API's connect budget). */
@@ -60,6 +61,11 @@ function startupFailureReason(error: unknown): string {
     }
     if (message.startsWith('Invalid API configuration (values are never included)')) {
       return 'Scheduler worker configuration is invalid (check REDIS/PORT settings)';
+    }
+    // Pre-Phase 6 internal trust: the worker cannot mint signed run contexts
+    // without the shared secret. NEVER a fallback to unauthenticated runs.
+    if (message === 'DELEGATION_CONTEXT_SECRET is required to sign scheduler run contexts.') {
+      return 'DELEGATION_CONTEXT_SECRET is missing (required to sign scheduler run contexts)';
     }
   }
   if (typeof name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,40}$/.test(name)) {
@@ -103,10 +109,21 @@ async function main(): Promise<void> {
     probe.disconnect(); // hard close: idempotent, never hangs
   }
 
+  // Pre-Phase 6 internal trust: the worker signs every run call with the
+  // SHARED secret (the API verifies the binding). With no configured secret
+  // the worker must refuse to start — per-boot random secrets would never
+  // verify across the two processes, and an unauthenticated fallback is not
+  // an option.
+  if (config.delegationContextSecret === null) {
+    throw new Error('DELEGATION_CONTEXT_SECRET is required to sign scheduler run contexts.');
+  }
+  const signer = createDelegationContextSigner(Buffer.from(config.delegationContextSecret, 'utf8'));
+
   const runClient = createSchedulerRestRunClient({
     fetchFn: globalThis.fetch,
     baseUrl: config.internalApiBaseUrl,
     executionTimeoutMs: config.schedulerExecutionTimeoutMs,
+    signer,
   });
 
   // SafeLogger and the queue's SchedulerLogger share this exact shape.

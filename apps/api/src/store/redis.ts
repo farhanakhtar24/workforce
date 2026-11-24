@@ -12,37 +12,52 @@
  * - `eval(script, { keys, arguments })` for the atomic compare-and-delete and
  *   the ask_user byte-CAS.
  *
- * Key layout (all namespaced under `workforce:phase2:`):
- * - `workforce:phase2:chat:{slug}:{chatId}:messages`       — Redis LIST, one JSON
- *   UIMessage per entry (RPUSH newest to tail, LRANGE oldest-first, no TTL:
- *   durable). Append-only so concurrent turns can never delete each other's
- *   messages.
- * - `workforce:phase2:chat:{slug}:{chatId}:active-stream`  — active stream ID,
- *   EX 86400 (24h, aligned with the resumable-stream sentinel), cleared on
- *   completion.
- * - `workforce:phase2:idempotency:{slug}:{chatId}:{key}`   — SET NX, EX 900s exactly
- * - `workforce:phase2:chat-index`                          — global ZSET,
- *   member `${slug}:${chatId}` (safe alphabet verified on parse), score =
- *   epoch-ms wall-clock activity of the latest append. Re-scored in the SAME
- *   Lua script as the RPUSH so an index failure can never split a message
- *   write. Pre-index ("legacy") chats are recovered by READ-ONLY bounded
- *   SCAN discovery; the index is never repaired or fabricated by a read.
+ * Key layout (all namespaced under `workforce:phase2:`, pre-Phase 6 auth):
+ * - `workforce:phase2:chat:{ownerId}:{slug}:{chatId}:messages` — Redis LIST,
+ *   one JSON UIMessage per entry (RPUSH newest to tail, LRANGE oldest-first,
+ *   no TTL: durable). Append-only so concurrent turns can never delete each
+ *   other's messages.
+ * - `workforce:phase2:chat:{ownerId}:{slug}:{chatId}:active-stream` — active
+ *   stream ID, EX 86400 (24h, aligned with the resumable-stream sentinel),
+ *   cleared on completion.
+ * - `workforce:phase2:idempotency:{ownerId}:{slug}:{chatId}:{key}` — SET NX,
+ *   EX 900s exactly
+ * - `workforce:phase2:chat-index:{ownerId}` — PER-OWNER ZSET, member
+ *   `${slug}:${chatId}` (safe alphabet verified on parse), score = epoch-ms
+ *   wall-clock activity of the latest append. Re-scored in the SAME Lua
+ *   script as the RPUSH so an index failure can never split a message write.
+ *   Pre-auth ("legacy") global keys (`…:chat:{slug}:{chatId}:*`,
+ *   `…:chat-index` without the owner segment) are structurally unreachable:
+ *   no new read or bounded SCAN uses a key shape without the owner segment.
  */
 import { StoreUnavailableError } from '../errors.js';
 import type { UIMessage } from 'ai';
-import type { AskUserAnswerStatus, ChatRef, ChatStore, ChatSummary } from './types.js';
+import type {
+  AskUserAnswerStatus,
+  ChatBranchResult,
+  ChatDeleteResult,
+  ChatRef,
+  ChatRewindResult,
+  ChatStore,
+  ChatSummary,
+} from './types.js';
+import { CHAT_OWNER_ID_PATTERN } from './types.js';
 import { applyAskUserAnswer } from './ask-user.js';
+import { MODEL_ID_PATTERN } from '../models/catalog.js';
 import {
   PREVIEW_TAIL_WINDOW,
   TITLE_HEAD_WINDOW,
   buildChatSummary,
+  chatIndexKeyFor,
   chatIndexMember,
   clampRecentChatsLimit,
+  findMessageIndexById,
   legacyOrderKey,
   parseChatIndexMember,
-  parseChatMessagesKey,
+  parseOwnerChatMessagesKey,
   parseRawEntriesLeniently,
   scoreToIso,
+  userMessageIdsOf,
 } from './chat-history.js';
 
 export const REDIS_KEY_PREFIX = 'workforce:phase2';
@@ -51,27 +66,68 @@ export const REDIS_KEY_PREFIX = 'workforce:phase2';
 export const ACTIVE_STREAM_TTL_SECONDS = 86_400;
 
 /**
- * Global chat activity index. A single ZSET: member `${slug}:${chatId}`,
- * score = epoch-ms of the chat's latest append. Both user messages and
+ * PER-OWNER chat activity index prefix. One ZSET per Better Auth user:
+ * ``${REDIS_KEY_PREFIX}:chat-index:{ownerId}``. Both user messages and
  * assistant completions go through `appendMessage`, which re-scores the
  * member on every write, so the sidebar ordering is exact for FUTURE writes.
+ * The pre-auth global ZSET (`workforce:phase2:chat-index`) is never read.
  */
-export const CHAT_INDEX_KEY = `${REDIS_KEY_PREFIX}:chat-index`;
+export function chatIndexKey(ownerId: string): string {
+  return chatIndexKeyFor(REDIS_KEY_PREFIX, ownerId);
+}
 
 /**
  * Deterministic bounded legacy-discovery budget (documented behavior):
- * - SCAN with MATCH `${REDIS_KEY_PREFIX}:chat:*:messages`, COUNT hint of
- *   {@link CHAT_SCAN_COUNT_HINT},
+ * - SCAN with MATCH ``{@link chatIndexKeyFor}``-sibling owner-scoped chat
+ *   keys (`${REDIS_KEY_PREFIX}:chat:{ownerId}:*:messages`, COUNT hint of
+ *   {@link CHAT_SCAN_COUNT_HINT}),
  * - at most {@link CHAT_SCAN_MAX_ITERATIONS} round trips and at most
  *   {@link CHAT_DISCOVERY_MAX_KEYS} DISTINCT chat keys collected,
  * - when a budget stops the SCAN before cursor `0`, the legacy chats beyond
  *   it are simply not discovered during this call (SCAN's key order is
  *   bucket order, stable per server state). Discovery is strictly read-only:
  *   no FLUSH, no KEYS, no writes, no deletes.
+ *
+ * "Legacy" here means pre-index chats OF THIS OWNER only: the owner segment
+ * is fixed in the MATCH pattern, so pre-authentication ownerless keys can
+ * never match — discovery cannot even see them.
  */
 export const CHAT_SCAN_COUNT_HINT = 100;
 export const CHAT_SCAN_MAX_ITERATIONS = 25;
 export const CHAT_DISCOVERY_MAX_KEYS = 256;
+
+/**
+ * Bounded idempotency-key cleanup budgets for the destructive chat DELETE
+ * (`{owner}:{slug}:{chatId}:*` SCAN): the keys are message-scoped per chat,
+ * semantically dead once the chat is gone; they may also expire naturally
+ * (TTL), so this cleanup is best-effort and never fails the delete.
+ */
+export const IDEMPOTENCY_SCAN_COUNT = 100;
+export const IDEMPOTENCY_SCAN_MAX_ITERATIONS = 50;
+
+/** CAS retry budget for the destructive REWIND (concurrent-append races). */
+export const REWIND_CAS_ATTEMPTS = 5;
+
+/** Normalizes a mutation-script NUMERIC reply into a stable number code. */
+function toMutationCode(result: unknown): number {
+  if (typeof result === 'number') {
+    return result;
+  }
+  if (typeof result === 'string' && /^-?\d+$/.test(result)) {
+    return Number(result);
+  }
+  if (typeof result === 'object' && result !== null && !Array.isArray(result) && 'ok' in result) {
+    // RESP3 integer replies can surface as {ok: 1} maps? (defensive)
+    const value = (result as { ok?: unknown }).ok;
+    if (typeof value === 'number') {
+      return value;
+    }
+    if (typeof value === 'string' && /^-?\d+$/.test(value)) {
+      return Number(value);
+    }
+  }
+  throw new StoreUnavailableError('Chat state could not be mutated.');
+}
 
 /**
  * Extra index entries read beyond `limit` so that stale members (chats whose
@@ -118,6 +174,151 @@ if current == ARGV[1] then
   return 1
 end
 return 0
+`.trim();
+
+/**
+ * Owner-scoped chat DELETE (atomic): refuses while an active-stream marker
+ * exists (-1: the route answers fixed 409), otherwise removes the chat's
+ * message list, active-stream marker, and per-owner index member, atomically.
+ * Returns 1 when messages existed (deleted), 0 when the chat had no stored
+ * messages (route answers fixed 404). The type checks run BEFORE any write so
+ * a WRONGTYPE index can never leave a half-deleted chat (-3 → 503).
+ */
+export const DELETE_CHAT_LUA = `
+local listType = redis.call('TYPE', KEYS[1])
+if type(listType) == 'table' then listType = listType['ok'] end
+local markerType = redis.call('TYPE', KEYS[2])
+if type(markerType) == 'table' then markerType = markerType['ok'] end
+local indexType = redis.call('TYPE', KEYS[3])
+if type(indexType) == 'table' then indexType = indexType['ok'] end
+local modelType = redis.call('TYPE', KEYS[4])
+if type(modelType) == 'table' then modelType = modelType['ok'] end
+if (listType ~= 'none' and listType ~= 'list')
+   or (markerType ~= 'none' and markerType ~= 'string')
+   or (indexType ~= 'none' and indexType ~= 'zset')
+   or (modelType ~= 'none' and modelType ~= 'string') then
+  return -3
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return -1
+end
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[4])
+redis.call('ZREM', KEYS[3], ARGV[1])
+return 1
+`.trim();
+
+/**
+ * Owner-scoped chat BRANCH (atomic): copies `entries` into a NEW/empty
+ * destination WITHOUT touching the source. Refuses when the destination
+ * messages list already holds entries (-1 → route fixed 409), when the
+ * destination has an active-stream marker (-2 → 409), or on WRONGTYPE keys
+ * (-3 → 503, before any write). Writes all copied raw entries + the
+ * destination's per-owner index member in this ONE script.
+ * ARGV[1] = destination index member, ARGV[2] = score, ARGV[3..] = raw entries.
+ */
+export const BRANCH_CHAT_LUA = `
+local listType = redis.call('TYPE', KEYS[1])
+if type(listType) == 'table' then listType = listType['ok'] end
+local markerType = redis.call('TYPE', KEYS[3])
+if type(markerType) == 'table' then markerType = markerType['ok'] end
+local indexType = redis.call('TYPE', KEYS[2])
+if type(indexType) == 'table' then indexType = indexType['ok'] end
+local srcModelType = redis.call('TYPE', KEYS[4])
+if type(srcModelType) == 'table' then srcModelType = srcModelType['ok'] end
+local destModelType = redis.call('TYPE', KEYS[5])
+if type(destModelType) == 'table' then destModelType = destModelType['ok'] end
+if (listType ~= 'none' and listType ~= 'list')
+   or (markerType ~= 'none' and markerType ~= 'string')
+   or (indexType ~= 'none' and indexType ~= 'zset')
+   or (srcModelType ~= 'none' and srcModelType ~= 'string')
+   or (destModelType ~= 'none' and destModelType ~= 'string') then
+  return -3
+end
+if redis.call('LLEN', KEYS[1]) > 0 then
+  return -1
+end
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  return -2
+end
+local copied = 0
+for i = 3, #ARGV do
+  redis.call('RPUSH', KEYS[1], ARGV[i])
+  copied = copied + 1
+end
+redis.call('ZADD', KEYS[2], tonumber(ARGV[2]), ARGV[1])
+local srcModel = redis.call('GET', KEYS[4])
+if srcModel then
+  redis.call('SET', KEYS[5], srcModel)
+end
+return copied
+`.trim();
+
+/**
+ * Owner-scoped DESTRUCTIVE chat REWIND (atomic, documented append-only
+ * exception): keeps entries [0..keepLast] (inclusive) and removes the tail,
+ * guarded by a byte-exact compare-and-set against concurrent appends
+ * (expected LENGTH + exact tail entry + exact first-removed entry; any
+ * concurrent append changes them → -2, the store retries then reports
+ * 'stale'). Kept bytes are NEVER re-serialized (LTRIM only). Re-scores the
+ * per-owner index member honestly (the chat was just mutated). The
+ * active-stream refusal is decided by the route (409) and the type checks
+ * run before any write (-3 → 503).
+ * ARGV: [1]=expectedTailRaw, [2]=expectedLen, [3]=expectedFirstRemovedRaw,
+ * [4]=keepLastZeroBased, [5]=score, [6]=indexMember.
+ */
+export const REWIND_CHAT_LUA = `
+local listType = redis.call('TYPE', KEYS[1])
+if type(listType) == 'table' then listType = listType['ok'] end
+local indexType = redis.call('TYPE', KEYS[2])
+if type(indexType) == 'table' then indexType = indexType['ok'] end
+if (listType ~= 'none' and listType ~= 'list')
+   or (indexType ~= 'none' and indexType ~= 'zset') then
+  return -3
+end
+local len = redis.call('LLEN', KEYS[1])
+if len ~= tonumber(ARGV[2]) then
+  return -2
+end
+local keepLast = tonumber(ARGV[4])
+if len > 0 then
+  local tail = redis.call('LINDEX', KEYS[1], len - 1)
+  if tail ~= ARGV[1] then
+    return -2
+  end
+end
+local firstRemoved = keepLast + 1
+if firstRemoved <= len - 1 then
+  local first = redis.call('LINDEX', KEYS[1], firstRemoved)
+  if first ~= ARGV[3] then
+    return -2
+  end
+end
+redis.call('LTRIM', KEYS[1], 0, keepLast)
+redis.call('ZADD', KEYS[2], tonumber(ARGV[5]), ARGV[6])
+return len - keepLast - 1
+`.trim();
+
+/**
+ * Owner-scoped chat model: GET the persistent `…:model` setting (none → nil).
+ * Used by BRANCH (copy the model atomically with the transcript) and DELETE.
+ * The model key type is string/none; anything else is a -3 (503).
+ */
+export const CHAT_MODEL_GET_LUA = `
+local t = redis.call('TYPE', KEYS[1])
+if type(t) == 'table' then t = t['ok'] end
+if t ~= 'none' and t ~= 'string' then
+  return -3
+end
+local value = redis.call('GET', KEYS[1])
+if value == false then
+  return ''
+end
+return value
 `.trim();
 
 /**
@@ -177,21 +378,35 @@ export interface RedisLike {
    * Redis SCAN: bounded cursor iteration over the whole keyspace with
    * MATCH/COUNT; node-redis returns `{ cursor, keys }`.
    */
+/** Redis SCAN: bounded cursor iteration over the whole keyspace with
+ * MATCH/COUNT; node-redis returns `{ cursor, keys }`.
+ */
   scan(
     cursor: number | string,
     options?: { MATCH?: string; COUNT?: number },
   ): Promise<{ cursor: string | number; keys: string[] } | unknown>;
   eval(script: string, options?: { keys?: string[]; arguments?: string[] }): Promise<unknown>;
+  del(key: string): Promise<number | unknown>;
+}
+
+function chatRefForKeys(chat: ChatRef): string {
+  if (typeof chat.ownerId !== 'string' || !CHAT_OWNER_ID_PATTERN.test(chat.ownerId)) {
+    throw new StoreUnavailableError('Chat state requires an authenticated owner.');
+  }
+  return chat.ownerId;
 }
 
 function messagesKey(chat: ChatRef): string {
-  return `${REDIS_KEY_PREFIX}:chat:${chat.slug}:${chat.chatId}:messages`;
+  return `${REDIS_KEY_PREFIX}:chat:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:messages`;
 }
 function activeStreamKey(chat: ChatRef): string {
-  return `${REDIS_KEY_PREFIX}:chat:${chat.slug}:${chat.chatId}:active-stream`;
+  return `${REDIS_KEY_PREFIX}:chat:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:active-stream`;
+}
+function modelKey(chat: ChatRef): string {
+  return `${REDIS_KEY_PREFIX}:chat:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:model`;
 }
 function idempotencyKey(chat: ChatRef, key: string): string {
-  return `${REDIS_KEY_PREFIX}:idempotency:${chat.slug}:${chat.chatId}:${key}`;
+  return `${REDIS_KEY_PREFIX}:idempotency:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:${key}`;
 }
 
 export interface RedisChatStoreOptions {
@@ -275,7 +490,7 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
         // (non-zset), and any Redis failure aborts the whole script.
         const score = Math.max(0, Math.floor(now()));
         const result = await client.eval(APPEND_MESSAGE_WITH_INDEX_LUA, {
-          keys: [messagesKey(chat), CHAT_INDEX_KEY],
+          keys: [messagesKey(chat), chatIndexKey(chat.ownerId)],
           arguments: [JSON.stringify(message), String(score), chatIndexMember(chat)],
         });
         if (result === -1 || result === '-1') {
@@ -341,8 +556,7 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
     },
 
     async answerPendingAskUser(chat: ChatRef, assistantMessageId: string, toolCallId: string, answer: string): Promise<AskUserAnswerStatus> {
-      try {
-        return await applyAskUserAnswer(
+      try {        return await applyAskUserAnswer(
           async () => {
             const entries = await client.lRange(messagesKey(chat), 0, -1);
             if (!Array.isArray(entries)) {
@@ -371,15 +585,202 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
       }
     },
 
-    async listRecentChats(limit: number): Promise<ChatSummary[]> {
-      const bounded = clampRecentChatsLimit(limit);
+    async deleteChat(chat: ChatRef): Promise<ChatDeleteResult> {
+      const owner = chatRefForKeys(chat);
       try {
-        // ---- 1. Newest chats from the activity index. BYSCORE REV (args
-        // are max→min for the reversed traversal) + LIMIT keep the read
+        const result = await client.eval(DELETE_CHAT_LUA, {
+          keys: [messagesKey(chat), activeStreamKey(chat), chatIndexKey(owner), modelKey(chat)],
+          arguments: [chatIndexMember(chat)],
+        });
+        const code = toMutationCode(result);
+        if (code === -3) {
+          rethrowAsUnavailable(new StoreUnavailableError('Chat state could not be mutated (key types).'));
+        }
+        if (code === -1) {
+          return { status: 'busy', removedIdempotencyKeys: 0 };
+        }
+        if (code === 0) {
+          return { status: 'not-found', removedIdempotencyKeys: 0 };
+        }
+        // Message-scoped idempotency cleanup AFTER the atomic delete: the
+        // keys are `{owner}:{slug}:{chatId}:{chatId}:{messageId}` — exactly
+        // this chat's keys, and semantically dead once the chat is gone.
+        const removedIdempotencyKeys = await deleteChatIdempotencyKeys(chat);
+        return { status: 'deleted', removedIdempotencyKeys };
+      } catch (error) {
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async branchChat(chat: ChatRef, branch: { readonly messageId: string; readonly newChatId: string }): Promise<ChatBranchResult> {
+      const owner = chatRefForKeys(chat);
+      const destination: ChatRef = { ownerId: chat.ownerId, slug: chat.slug, chatId: branch.newChatId };
+      try {
+        const rawEntries = await (async (): Promise<string[]> => {
+          const entries = await client.lRange(messagesKey(chat), 0, -1);
+          if (!Array.isArray(entries)) {
+            throw new StoreUnavailableError('Chat state could not be read (messages).');
+          }
+          return entries.filter((entry): entry is string => typeof entry === 'string');
+        })();
+        if (rawEntries.length === 0) {
+          return { status: 'chat-not-found', copiedMessages: 0 };
+        }
+        const keepLastRaw = findMessageIndexById(rawEntries, branch.messageId);
+        if (keepLastRaw === null || keepLastRaw < 0) {
+          return { status: 'message-not-found', copiedMessages: 0 };
+        }
+        const copiedRaw = rawEntries.slice(0, keepLastRaw + 1);
+        const result = await client.eval(BRANCH_CHAT_LUA, {
+          keys: [messagesKey(destination), chatIndexKey(owner), activeStreamKey(destination), modelKey(chat), modelKey(destination)],
+          arguments: [chatIndexMember(destination), String(Math.max(0, Math.floor(now()))), ...copiedRaw],
+        });
+        const code = toMutationCode(result);
+        if (code === -3) {
+          rethrowAsUnavailable(new StoreUnavailableError('Chat state could not be mutated (key types).'));
+        }
+        if (code === -1 || code === -2) {
+          return { status: 'destination-conflict', copiedMessages: 0 };
+        }
+        return { status: 'branched', copiedMessages: copiedRaw.length };
+      } catch (error) {
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async rewindChat(chat: ChatRef, messageId: string): Promise<ChatRewindResult> {
+      const owner = chatRefForKeys(chat);
+      const indexKey = chatIndexKey(owner);
+      // Bounded CAS retries: a concurrent append changes the tail bytes; each
+      // retry recomputes from a FRESH read. 'stale' only after real losses.
+      for (let attempt = 0; attempt < REWIND_CAS_ATTEMPTS; attempt += 1) {
+        let rawEntries: string[];
+        try {
+          const entries = await client.lRange(messagesKey(chat), 0, -1);
+          if (!Array.isArray(entries)) {
+            throw new StoreUnavailableError('Chat state could not be read (messages).');
+          }
+          rawEntries = entries.filter((entry): entry is string => typeof entry === 'string');
+        } catch (error) {
+          if (error instanceof StoreUnavailableError) {
+            rethrowAsUnavailable(error);
+          }
+          rethrowAsUnavailable(error);
+        }
+        if (rawEntries.length === 0) {
+          return { status: 'chat-not-found', kept: 0, removed: 0 };
+        }
+        const keepLast = findMessageIndexById(rawEntries, messageId);
+        if (keepLast === null || keepLast < 0) {
+          return { status: 'message-not-found', kept: 0, removed: 0 };
+        }
+        const expectedLen = rawEntries.length;
+        const expectedTail = rawEntries[expectedLen - 1] as string;
+        const firstRemovedIndex = keepLast + 1;
+        const expectedFirstRemoved =
+          firstRemovedIndex <= expectedLen - 1 ? (rawEntries[firstRemovedIndex] as string) : '';
+        const removedUserIds =
+          firstRemovedIndex <= expectedLen - 1
+            ? userMessageIdsOf(rawEntries.slice(firstRemovedIndex))
+            : [];
+        try {
+          const result = await client.eval(REWIND_CHAT_LUA, {
+            keys: [messagesKey(chat), indexKey],
+            arguments: [
+              expectedTail,
+              String(expectedLen),
+              expectedFirstRemoved,
+              String(keepLast),
+              String(Math.max(0, Math.floor(now()))),
+              chatIndexMember(chat),
+            ],
+          });
+          const code = toMutationCode(result);
+          if (code === -3) {
+            rethrowAsUnavailable(new StoreUnavailableError('Chat state could not be mutated (key types).'));
+          }
+          if (code === -2) {
+            continue; // concurrent append: recompute and retry
+          }
+          // Applied (removed >= 0): delete the removed messages' idempotency
+          // keys so a reused prompt regenerates; KEPT keys are never touched.
+          let removedIdempotencyKeys = 0;
+          for (const removedId of removedUserIds) {
+            try {
+              const removed = await client.del(idempotencyKey(chat, `${chat.chatId}:${removedId}`));
+              if (removed === 1 || removed === '1' || removed === true) {
+                removedIdempotencyKeys += 1;
+              }
+            } catch {
+              /* key may expire naturally; never fail the rewind for cleanup */
+            }
+          }
+          return { status: 'applied', kept: keepLast + 1, removed: code };
+        } catch (error) {
+          if (error instanceof StoreUnavailableError) {
+            throw error;
+          }
+          rethrowAsUnavailable(error);
+        }
+      }
+      return { status: 'stale', kept: 0, removed: 0 };
+    },
+
+    async getChatModel(chat: ChatRef): Promise<string | null> {
+      chatRefForKeys(chat);
+      try {
+        const result = await client.eval(CHAT_MODEL_GET_LUA, {
+          keys: [modelKey(chat)],
+        });
+        if (typeof result === 'string' && result.length > 0) {
+          return result;
+        }
+        if (result === -3) {
+          rethrowAsUnavailable(new StoreUnavailableError('Chat state could not be read (model).'));
+        }
+        return null;
+      } catch (error) {
+        if (error instanceof StoreUnavailableError) {
+          throw error;
+        }
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async setChatModel(chat: ChatRef, modelId: string | null): Promise<void> {
+      chatRefForKeys(chat);
+      try {
+        if (modelId === null) {
+          await client.del(modelKey(chat));
+          return;
+        }
+        // Persistent setting: no TTL. The value was validated at the route;
+        // the store is the last line of shape defense.
+        if (typeof modelId !== 'string' || !MODEL_ID_PATTERN.test(modelId)) {
+          throw new StoreUnavailableError('Chat state could not be written (model).');
+        }
+        await client.set(modelKey(chat), modelId);
+      } catch (error) {
+        if (error instanceof StoreUnavailableError) {
+          throw error;
+        }
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async listRecentChats(ownerId: string, limit: number): Promise<ChatSummary[]> {
+      if (typeof ownerId !== 'string' || !CHAT_OWNER_ID_PATTERN.test(ownerId)) {
+        throw new StoreUnavailableError('Chat state requires an authenticated owner.');
+      }
+      const bounded = clampRecentChatsLimit(limit);
+      const ownerIndexKey = chatIndexKey(ownerId);
+      try {
+        // ---- 1. Newest chats from the user's activity index. BYSCORE REV
+        // (args are max→min for the reversed traversal) + LIMIT keep the read
         // bounded; the window carries extra slack so skipped stale members
         // cannot steal slots from live chats. Equal scores come back
         // member-descending (mirrored where the index is sorted in-process).
-        const indexReply = await client.zRangeWithScores(CHAT_INDEX_KEY, '+inf', '-inf', {
+        const indexReply = await client.zRangeWithScores(ownerIndexKey, '+inf', '-inf', {
           BY: 'SCORE',
           REV: true,
           LIMIT: { offset: 0, count: bounded + CHAT_INDEX_READ_SLACK },
@@ -394,7 +795,7 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
           if (ref === null) {
             continue; // foreign/garbage member: deterministic skip
           }
-          const summary = await summarizeChatFromWindow(ref, scoreToIso(score));
+          const summary = await summarizeChatFromWindow({ ...ref, ownerId }, scoreToIso(score));
           if (summary === null) {
             continue; // no stored messages (deleted/stale member): skip
           }
@@ -405,12 +806,14 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
           return summaries.slice(0, bounded);
         }
 
-        // ---- 2. Legacy chats (created before the index existed, or indexed
-        // chats whose member fell outside the bounded read window above):
-        // bounded, strictly read-only SCAN discovery of `…:chat:*:messages`
-        // keys, deterministically ordered ascending, then the remaining
-        // slots are filled in that deterministic order.
-        const legacyRefs = await discoverLegacyChatKeys(indexed);
+        // ---- 2. Legacy chats (created before THIS OWNER's index existed, or
+        // indexed chats whose member fell outside the bounded read window
+        // above): bounded, strictly read-only SCAN discovery of
+        // `${REDIS_KEY_PREFIX}:chat:{ownerId}:*:messages` keys — the owner
+        // segment is part of the pattern, so pre-auth ownerless keys can
+        // never match. Deterministically ordered ascending, then the
+        // remaining slots are filled in that deterministic order.
+        const legacyRefs = await discoverLegacyChatKeys(ownerId, indexed);
         for (const ref of legacyRefs) {
           if (summaries.length >= bounded) {
             break;
@@ -425,7 +828,7 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
           // its REAL activity timestamp, never degrade to a fabricated-legacy
           // `null` merely because too many stale members occupied the window.
           // ONLY truly unindexed (legacy) chats end up with `null`.
-          const score = toIndexScore(await client.zScore(CHAT_INDEX_KEY, chatIndexMember(ref)));
+          const score = toIndexScore(await client.zScore(ownerIndexKey, chatIndexMember(ref)));
           summaries.push(score === null ? summary : { ...summary, lastActivityAt: scoreToIso(score) });
         }
         return summaries;
@@ -465,7 +868,7 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
    * Corrupt stored JSON inside a window is skipped leniently by the shared
    * extraction helpers.
    */
-  async function summarizeChatFromWindow(ref: { slug: string; chatId: string }, lastActivityAt: string | null): Promise<ChatSummary | null> {
+  async function summarizeChatFromWindow(ref: { ownerId: string; slug: string; chatId: string }, lastActivityAt: string | null): Promise<ChatSummary | null> {
     const key = messagesKey(ref);
     const len = await client.lLen(key);
     if (!isLengthReply(len) || len === 0) {
@@ -487,21 +890,69 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
   }
 
   /**
-   * Bounded legacy discovery: SCAN (cursor + MATCH + COUNT hint) over
-   * `${REDIS_KEY_PREFIX}:chat:*:messages`, capped both in round trips and in
-   * distinct chat keys. Everything is filtered through
-   * {@link parseChatMessagesKey} (roster slug + safe id alphabet), already-
-   * indexed members are excluded, and the result is sorted ascending by
-   * `${slug}:${chatId}` so the included subset is deterministic. Never
-   * writes, never deletes, no FLUSH, no KEYS.
+   * Bounded SCAN deleting ONLY this chat's message-scoped idempotency keys
+   * (`{owner}:{slug}:{chatId}:*`). Best-effort: a stale key expiring mid-scan
+   * never fails the destructive delete. Iteration is bounded; a corrupt SCAN
+   * reply is a raw read failure (503).
    */
-  async function discoverLegacyChatKeys(indexed: Set<string>): Promise<Array<{ slug: string; chatId: string }>> {
-    const found = new Map<string, { slug: string; chatId: string }>();
+  async function deleteChatIdempotencyKeys(chat: ChatRef): Promise<number> {
+    const owner = chatRefForKeys(chat);
+    const match = `${REDIS_KEY_PREFIX}:idempotency:${owner}:${chat.slug}:${chat.chatId}:*`;
+    let removed = 0;
+    let cursor: string = '0';
+    let iterations = 0;
+    do {
+      const reply = await client.scan(cursor, { MATCH: match, COUNT: IDEMPOTENCY_SCAN_COUNT });
+      if (reply === null || typeof reply !== 'object' || Array.isArray(reply)) {
+        throw new StoreUnavailableError('Chat state could not be read (idempotency).');
+      }
+      const nextCursor = (reply as { cursor?: unknown }).cursor;
+      const keys = (reply as { keys?: unknown }).keys;
+      if (!Array.isArray(keys) || (typeof nextCursor !== 'string' && typeof nextCursor !== 'number')) {
+        throw new StoreUnavailableError('Chat state could not be read (idempotency).');
+      }
+      cursor = String(nextCursor);
+      for (const key of keys) {
+        if (typeof key !== 'string') {
+          continue;
+        }
+        try {
+          const value = await client.del(key);
+          if (value === 1 || value === '1' || value === true) {
+            removed += 1;
+          }
+        } catch {
+          /* a stale key may expire mid-scan; never fail the delete */
+        }
+      }
+      iterations += 1;
+    } while (cursor !== '0' && iterations < IDEMPOTENCY_SCAN_MAX_ITERATIONS);
+    return removed;
+  }
+
+  /**
+   * Bounded legacy discovery: SCAN (cursor + MATCH + COUNT hint) over
+   * `${REDIS_KEY_PREFIX}:chat:{ownerId}:*:messages`, capped both in round
+   * trips and in distinct chat keys. The owner segment is FIXED inside the
+   * pattern, so pre-authentication ownerless keys
+   * (`…:chat:{slug}:{chatId}:messages`) never match — they are unreachable
+   * from this path for an authenticated list, by construction. Everything is
+   * filtered through {@link parseOwnerChatMessagesKey} (owner alphabet +
+   * roster slug + safe id alphabet), already-indexed members are excluded,
+   * and the result is sorted ascending by `${slug}:${chatId}` so the
+   * included subset is deterministic. Never writes, never deletes, no FLUSH,
+   * no KEYS.
+   */
+  async function discoverLegacyChatKeys(
+    ownerId: string,
+    indexed: Set<string>,
+  ): Promise<Array<{ ownerId: string; slug: string; chatId: string }>> {
+    const found = new Map<string, { ownerId: string; slug: string; chatId: string }>();
     let cursor: string = '0';
     let iterations = 0;
     do {
       const reply = await client.scan(cursor, {
-        MATCH: `${REDIS_KEY_PREFIX}:chat:*:messages`,
+        MATCH: `${REDIS_KEY_PREFIX}:chat:${ownerId}:*:messages`,
         COUNT: CHAT_SCAN_COUNT_HINT,
       });
       if (reply === null || typeof reply !== 'object' || Array.isArray(reply)) {
@@ -514,8 +965,8 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
       }
       cursor = String(nextCursor);
       for (const key of keys) {
-        const ref = parseChatMessagesKey(key, REDIS_KEY_PREFIX);
-        if (ref === null || indexed.has(chatIndexMember(ref))) {
+        const ref = parseOwnerChatMessagesKey(key, REDIS_KEY_PREFIX);
+        if (ref === null || ref.ownerId !== ownerId || indexed.has(chatIndexMember(ref))) {
           continue;
         }
         found.set(legacyOrderKey(ref), ref);

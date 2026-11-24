@@ -6,7 +6,7 @@
  */
 
 import { isAgentSlug, buildChatUrl, type WebAgentSlug } from './agents';
-import { isSafeChatId } from './api';
+import { isSafeChatId, browserApiFetch, requestAuthError } from './api';
 
 /** Window event the chat dispatches when a generation settles, so the shell
  *  history can refresh (same real data — never localStorage). */
@@ -120,17 +120,15 @@ export async function fetchRecentChats(options: {
 }): Promise<RecentChatsResult> {
   const url = recentChatsEndpoint(options.apiBaseUrl, options.limit);
   try {
-    const response = await fetch(url, {
+    const response = await browserApiFetch(url, {
       headers: { Accept: 'application/json' },
       cache: 'no-store',
       signal: options.signal,
     });
-    if (response.status === 400 || response.status === 503) {
-      // Fixed API contract: fixed safe copy, never internals.
-      return { ok: false, error: RECENT_CHATS_MAP_ERROR, status: response.status };
-    }
     if (!response.ok) {
-      return { ok: false, error: RECENT_CHATS_MAP_ERROR, status: response.status };
+      const authError = requestAuthError(response.status ?? 0);
+      if (authError !== null) return { ok: false, error: authError, status: response.status ?? 0 };
+      return { ok: false, error: RECENT_CHATS_MAP_ERROR, status: response.status ?? 0 };
     }
     return mapRecentChats(await response.json());
   } catch {

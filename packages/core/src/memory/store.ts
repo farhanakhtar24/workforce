@@ -67,6 +67,28 @@ export interface MemoryActiveBlockListOptions {
   readonly kind?: MemoryKind;
 }
 
+/**
+ * Selector for purging DERIVED per-chat memory blocks (pre-Phase 6 opt-in
+ * personal memory). Blocks written by the chat-capture pipeline live on the
+ * exact path `chats/{chatId}` of the user's scope, so the purge selector is
+ * always scope + exact path; `assistantMessageIds` narrows it to ONLY the
+ * blocks derived from specific removed assistant messages (the rewind
+ * contract). The purge deletes active AND superseded rows (superseded rows
+ * were derived from the same chat and carry the same privacy).
+ */
+export interface DerivedChatPurgeParams {
+  /** Exact (normalized) memory scope — the derived user scope, never `"default"`. */
+  readonly scope: string;
+  /** Exact (normalized) path, e.g. `chats/<chatId>` (lowercased). */
+  readonly path: string;
+  /**
+   * When present: delete ONLY blocks whose `metadata.assistantMessageId`
+   * is in this bounded set (deduplicated). When absent: delete every block
+   * on the exact path. Bounded to 512 ids per call.
+   */
+  readonly assistantMessageIds?: readonly string[];
+}
+
 /** Raw vector candidate handed to `rankMemoryCandidates`. */
 export interface MemoryVectorCandidate {
   /** Cosmetic distance already converted: `1 - (embedding <=> query)`. */
@@ -179,4 +201,15 @@ export interface MemoryStore extends MemoryStoreTxView {
 
   /** Bump `accessCount`/`lastAccessedAt` for returned search ids. Missing ids are ignored. */
   touchAccessed(ids: readonly string[]): Promise<void>;
+
+  /**
+   * Purge DERIVED per-chat blocks for the scope + exact path (and, when
+   * supplied, ONLY those whose `metadata.assistantMessageId` is in the
+   * bounded set). Deletes active + superseded rows atomically and returns
+   * the deleted count. Both implementations validate shape (typed errors)
+   * so a malformed purge can never run. The chat-capture pipeline is the
+   * only writer at these paths in production, so the deletion is scoped to
+   * the derived personal blocks (never other memory kinds/owners).
+   */
+  purgeDerivedChatBlocks(params: DerivedChatPurgeParams): Promise<number>;
 }

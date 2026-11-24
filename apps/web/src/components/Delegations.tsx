@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { WorkspaceGate } from '@/components/WorkspaceShell';
 import { StatusBadge } from '@/components/StatusBadge';
+import { AgentAvatar } from '@/components/AgentAvatar';
 import { MarkdownText } from '@/components/MarkdownText';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -48,11 +49,11 @@ interface Notice {
 export function DelegationsView({ apiBaseUrl, chatId, agent }: DelegationsProps): React.ReactElement {
   if (!CHAT_ID_PATTERN.test(chatId)) {
     return (
-      <WorkspaceShell
+      <WorkspaceGate
         active="delegations"
         eyebrow="Delegation"
         title="Delegations"
-        description="Runs this chat delegated to worker agents, with their child chats."
+        description="Runs delegated from this chat to specialist sub-agents — quick asks return synchronously (result inline), longer work runs asynchronously in an isolated child chat. Records survive chat deletion."
       >
         <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
           <p className="m-0">
@@ -60,7 +61,7 @@ export function DelegationsView({ apiBaseUrl, chatId, agent }: DelegationsProps)
             link (<code>/delegations?chatId=…</code>).
           </p>
         </div>
-      </WorkspaceShell>
+      </WorkspaceGate>
     );
   }
   return <DelegationsLoaded apiBaseUrl={apiBaseUrl} chatId={chatId} agent={agent} />;
@@ -130,11 +131,11 @@ function DelegationsLoaded({
   }, [pollActive]);
 
   return (
-    <WorkspaceShell
+    <WorkspaceGate
       active="delegations"
       eyebrow="Delegation"
       title="Delegations"
-      description={`Runs delegated to worker agents from this chat (${chatId}), with their isolated child chats.`}
+      description={`Delegated runs from this chat (${chatId}) to specialist worker agents — quick asks return synchronously (result inline), longer work runs asynchronously in an isolated child chat. Records survive chat deletion.`}
       context={
         <a
           className="text-sm font-medium text-primary underline-offset-4 hover:underline"
@@ -176,7 +177,7 @@ function DelegationsLoaded({
           Waiting for pending delegations — this list refreshes itself until each child finishes.
         </p>
       )}
-    </WorkspaceShell>
+    </WorkspaceGate>
   );
 }
 
@@ -192,12 +193,25 @@ function DelegationCard({ row }: { row: Delegation }): React.ReactElement {
       )}
       data-status={row.status}
     >
-      <div className="flex flex-wrap items-baseline gap-2">
-        <Badge variant="secondary" data-kind={row.targetAgent}>
-          → {row.targetAgent}
-        </Badge>
-        <Badge variant="outline">{row.mode}</Badge>
-        <Badge variant="outline">depth {row.depth}</Badge>
+      <p className="m-0 text-[0.68rem] font-semibold tracking-[0.06em] text-muted-foreground uppercase">
+        Specialist sub-agent
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="flex items-center gap-1.5" title="Orchestrator (coordinator)">
+          <AgentAvatar agent="orchestrator" size={18} />
+          <span className="text-[0.82rem] font-medium">Orchestrator</span>
+        </span>
+        <span aria-hidden="true" className="text-muted-foreground">→</span>
+        <span className="flex items-center gap-1.5" title={row.targetAgent}>
+          <AgentAvatar agent={row.targetAgent} size={18} />
+          <span className="text-[0.82rem] font-medium">{row.targetAgent}</span>
+          <Badge variant="outline">{row.mode}</Badge>
+        </span>
+        {row.depth >= 1 && (
+          <Badge variant="outline" className="tabular-nums">
+            depth {row.depth}
+          </Badge>
+        )}
         <StatusBadge status={row.status}>
           {delegationStatusLabel(row.status)}
         </StatusBadge>

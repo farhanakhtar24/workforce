@@ -22,9 +22,11 @@ import {
   type DelegationRepository,
 } from '@workforce/core/delegation';
 
+import type { ChatStore } from '../store/types.js';
 import {
   DELEGATION_CONTEXT_HEADER,
   contextWindow,
+  internalOwnerHeader,
   type DelegationContextSigner,
   type DelegationContextPayload,
 } from './delegation-context.js';
@@ -38,6 +40,13 @@ export interface DelegationRunDeps {
   /** Bounded child-run budget (`DELEGATION_TIMEOUT_MS`); also the header TTL. */
   readonly delegationTimeoutMs: number;
   readonly repo: DelegationRepository;
+  /**
+   * Pre-Phase 6 model inheritance: when wired, the CHILD chat inherits the
+   * PARENT chat's selected model (copied once at claim time, before the child
+   * generation starts; the child generation re-checks the blocked policy).
+   * Absent = child runs the configured default.
+   */
+  readonly chatStore?: ChatStore;
 }
 
 export interface DelegationRunOutcome {
@@ -62,8 +71,12 @@ export const DELEGATION_NOT_FOUND = 'Delegation not found.';
 
 /**
  * Verifies the internal create/run header against one delegation row: kind,
- * expiry, and exact binding of parentChatId + parentDepth. The row's depth is
- * the CHILD's depth, so the expected parent depth is `row.depth - 1`.
+ * expiry, and exact binding of parentChatId + parentDepth + OWNER. The row's
+ * depth is the CHILD's depth, so the expected parent depth is
+ * `row.depth - 1`, and the row is the owner authority: an `ownerless` legacy
+ * row can never satisfy the binding (no ownerId to match) — it is
+ * unreachable for internal runs AND for browser runs (the routes guard the
+ * read with `expectedOwnerId` first).
  */
 export function verifyRunHeader(
   deps: DelegationRunDeps,
@@ -73,10 +86,16 @@ export function verifyRunHeader(
   if (typeof headerValue !== 'string' || headerValue.length === 0) {
     return { ok: false, status: 400 };
   }
+  if (row.ownerId === null || row.ownerId.length === 0) {
+    // Ownerless rows are structurally unreachable for runs: the context has
+    // no owner to bind and the chat would have no owner.
+    return { ok: false, status: 404 };
+  }
   const verified = deps.signer.verify(headerValue, {
     kind: 'delegation-create',
     parentChatId: row.parentChatId,
     parentDepth: row.depth - 1,
+    ownerId: row.ownerId,
   });
   return verified.ok ? { ok: true } : { ok: false, status: 400 };
 }
@@ -127,6 +146,9 @@ export function buildChildChatRequest(
   deps: DelegationRunDeps,
   row: Delegation,
 ): ChildChatRequestPlan {
+  // The child run belongs to the row's owner (ownerless rows are refused by
+  // the header verification before this builder runs).
+  const ownerId = row.ownerId as string;
   // H3: the child user message id is DERIVED from the delegation id (a UUID
   // already inside the API id alphabet), never random — the Idempotency-Key
   // `${childChatId}:${row.id}` is therefore identical on every retry, and a
@@ -138,6 +160,7 @@ export function buildChildChatRequest(
     kind: 'delegation-child-chat',
     parentChatId: row.parentChatId,
     childChatId: row.childChatId,
+    ownerId,
     targetAgent: row.targetAgent,
     depth: row.depth,
     expiresAt: window.expiresAt,
@@ -165,12 +188,42 @@ function safeRunError(outcome: 'failed' | 'timeout'): string {
   return outcome === 'timeout' ? 'The delegated task timed out.' : 'The delegated task failed.';
 }
 
+/**
+ * Copies the PARENT chat's selected model to the child chat (ownership
+ * bound): the child generation then runs on the same model and re-checks the
+ * blocked policy. Copy is best-effort: a missing parent id (legacy) or a
+ * store failure NEVER blocks the run (the child falls back to the default).
+ */
+async function inheritParentChatModel(deps: DelegationRunDeps, running: Delegation): Promise<void> {
+  if (deps.chatStore === undefined || running.ownerId === null || running.ownerId.length === 0) {
+    return;
+  }
+  try {
+    const parentModel = await deps.chatStore.getChatModel({
+      ownerId: running.ownerId,
+      slug: 'orchestrator',
+      chatId: running.parentChatId,
+    });
+    if (parentModel !== null) {
+      await deps.chatStore.setChatModel(
+        { ownerId: running.ownerId, slug: running.targetAgent, chatId: running.childChatId },
+        parentModel,
+      );
+    }
+  } catch {
+    /* parent model inheritance is best-effort; default applies otherwise */
+  }
+}
+
 export async function runDelegation(
   deps: DelegationRunDeps,
   headerValue: string | undefined,
   delegationId: string,
+  ownerId: string,
 ): Promise<DelegationRunOutcome> {
-  const row = await deps.repo.get(delegationId);
+  // Owner guard FIRST: a foreign or ownerless row reads as 404 before the
+  // header is even verified (no existence oracle across tenants).
+  const row = await deps.repo.get(delegationId, { expectedOwnerId: ownerId });
   if (row === null || row === undefined) {
     throw new DelegationRouteError(404, DELEGATION_NOT_FOUND);
   }
@@ -194,20 +247,31 @@ export async function runDelegation(
   // H1: atomic claim — updateStatus with expectedFrom 'pending' compare-and-
   // sets the transition, so two runners reading 'pending' yield EXACTLY ONE
   // claim and one child generation; losers report the fresh row untouched.
+  // The owner CAS additionally binds every write to the row's owner.
   let running: Delegation;
   try {
-    running = await deps.repo.updateStatus({ id: row.id, status: 'running', expectedFrom: 'pending' });
+    running = await deps.repo.updateStatus({
+      id: row.id,
+      status: 'running',
+      expectedFrom: 'pending',
+      expectedOwnerId: ownerId,
+    });
   } catch (error) {
     if (error instanceof DelegationConflictError) {
-      const fresh = await deps.repo.get(row.id);
+      const fresh = await deps.repo.get(row.id, { expectedOwnerId: ownerId });
       return { delegation: fresh ?? row, executed: false };
     }
     throw error; // store outage → route maps to 503
   }
 
-  const result = await executeChildChat(deps, running);
+  const result = await (async (): Promise<ChildExecutionResult> => {
+    // The child inherits the parent's selected model (copied before its first
+    // generation; the parent's own stream is never touched).
+    await inheritParentChatModel(deps, running);
+    return await executeChildChat(deps, running);
+  })();
   if (result.overall === 'completed') {
-    const completed = await deps.repo.updateStatus({ id: running.id, status: 'completed', result: result.text });
+    const completed = await deps.repo.updateStatus({ id: running.id, status: 'completed', result: result.text, expectedOwnerId: ownerId });
     return { delegation: completed, executed: true };
   }
   if (result.overall === 'timeout') {
@@ -215,6 +279,7 @@ export async function runDelegation(
       id: running.id,
       status: 'timeout',
       error: safeRunError('timeout'),
+      expectedOwnerId: ownerId,
     });
     return { delegation: timedOutRow, executed: true };
   }
@@ -222,6 +287,7 @@ export async function runDelegation(
     id: running.id,
     status: 'failed',
     error: safeRunError('failed'),
+    expectedOwnerId: ownerId,
   });
   return { delegation: failedRow, executed: true };
 }
@@ -241,6 +307,7 @@ export async function runDelegation(
  * failure propagates (the route maps store outages to 503).
  */
 async function recoverRunningRow(deps: DelegationRunDeps, row: Delegation): Promise<Delegation> {
+  const ownerId = row.ownerId as string;
   const updatedAtMs = Date.parse(row.updatedAt);
   const staleMs = Number.isFinite(updatedAtMs) ? Date.now() - updatedAtMs : Number.POSITIVE_INFINITY;
   if (staleMs < deps.delegationTimeoutMs) {
@@ -249,22 +316,22 @@ async function recoverRunningRow(deps: DelegationRunDeps, row: Delegation): Prom
   const outcome = await recoverChildResultFromTranscript(deps, row, AbortSignal.timeout(deps.delegationTimeoutMs + TOOL_RUN_MARGIN_MS));
   if (outcome.overall === 'completed') {
     try {
-      return await deps.repo.updateStatus({ id: row.id, status: 'completed', result: outcome.text });
+      return await deps.repo.updateStatus({ id: row.id, status: 'completed', result: outcome.text, expectedOwnerId: ownerId });
     } catch (error) {
       if (error instanceof DelegationConflictError) {
         // Lost the terminal transition to a live runner (e.g. it marked the
         // row failed first): report the fresh row as-is.
-        const fresh = await deps.repo.get(row.id);
+        const fresh = await deps.repo.get(row.id, { expectedOwnerId: ownerId });
         return fresh ?? row;
       }
       throw error;
     }
   }
   try {
-    return await deps.repo.updateStatus({ id: row.id, status: 'failed', error: safeRunError('failed') });
+    return await deps.repo.updateStatus({ id: row.id, status: 'failed', error: safeRunError('failed'), expectedOwnerId: ownerId });
   } catch (error) {
     if (error instanceof DelegationConflictError) {
-      const fresh = await deps.repo.get(row.id);
+      const fresh = await deps.repo.get(row.id, { expectedOwnerId: ownerId });
       return fresh ?? row;
     }
     throw error;
@@ -328,10 +395,16 @@ async function recoverChildResultFromTranscript(
   deps: DelegationRunDeps,
   row: Delegation,
   signal: AbortSignal,
-): Promise<ChildExecutionResult> {  try {
+): Promise<ChildExecutionResult> {
+  // Pre-auth ownerless rows cannot read their child chat through the
+  // (owner-gated) REST surface — the recovery fails honestly.
+  if (row.ownerId === null || row.ownerId.length === 0) {
+    return { overall: 'failed', text: '' };
+  }
+  try {
     const hydration = await deps.fetchFn(
       `${deps.baseUrl}/api/agents/${row.targetAgent}/chat/${encodeURIComponent(row.childChatId)}`,
-      { method: 'GET', signal },
+      { method: 'GET', signal, headers: internalOwnerHeader(deps.signer, row.ownerId) },
     );
     if (!hydration.ok) {
       return { overall: 'failed', text: '' };

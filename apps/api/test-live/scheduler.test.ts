@@ -31,6 +31,8 @@ import { PrismaClient } from '@workforce/core/generated/prisma';
 import { createClient, type RedisClientType } from 'redis';
 import { simulateReadableStream } from 'ai/test';
 import type { LanguageModel, UIMessage } from 'ai';
+import { createDelegationContextSigner } from '../src/agents/delegation-context.js';
+import { TEST_DELEGATION_SECRET } from '../test/helpers.js';
 import type { LanguageModelV3StreamPart } from '@ai-sdk/provider';
 
 import {
@@ -45,6 +47,7 @@ import { createPrismaSchedulerStore } from '@workforce/core/scheduler/postgres';
 import { BullMQSchedulerQueue, createSchedulerWorker, type SchedulerWorkerHandle } from '@workforce/queue/scheduler';
 import { createSchedulerRestRunClient } from '../src/scheduler/run-client.js';
 import { SCHEDULER_WORKER_HEADER } from '../src/scheduler/worker-contract.js';
+import { INTERNAL_SCHEDULER_HEADER, contextWindow } from '../src/agents/delegation-context.js';
 import { createBackgroundTracker } from '../src/background.js';
 import { DEFAULT_DATABASE_URL, loadApiConfig, type ApiConfig } from '../src/config.js';
 import { buildApp } from '../src/app.js';
@@ -58,6 +61,9 @@ const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379';
 const DATABASE_URL = process.env['DATABASE_URL'] ?? DEFAULT_DATABASE_URL;
 const RUN_ID = `${process.pid.toString(36)}-${Date.now().toString(36)}`;
 const TASK_PREFIX = `itest-${RUN_ID}-`;
+/** The test-only owner identity: every scheduler row + the User row (FK). */
+const LIVE_OWNER_ID = `live-owner-${RUN_ID}`;
+const LIVE_OWNER_EMAIL = 'live-owner@example.com';
 const STREAM_KEY_PREFIX = `workforce:phase5:stream-live:${RUN_ID}`;
 const CONNECT_TIMEOUT_MS = 5_000;
 const USAGE_EXPECTED = { inputTokens: 12, outputTokens: 7, totalTokens: 19 };
@@ -247,6 +253,7 @@ async function createSchedulerStack(options: StackOptions): Promise<Stack> {
     streamContext,
     model: options.model,
     background,
+    auth: { staticOwner: { userId: LIVE_OWNER_ID, email: LIVE_OWNER_EMAIL, emailVerified: true } },
     scheduler: {
       service,
       queue,
@@ -256,6 +263,9 @@ async function createSchedulerStack(options: StackOptions): Promise<Stack> {
         executionTimeoutMs,
         metadataTimeoutMs: options.metadataTimeoutMs ?? 5_000,
         staleRunningMs: 30_000,
+        // The API verifies the worker's signed run contexts with the SAME
+        // secret (and signs internal chat calls with row-derived owners).
+        signer: createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8')),
         logger: silentLogger,
       },
       logger: silentLogger,
@@ -277,6 +287,9 @@ async function createSchedulerStack(options: StackOptions): Promise<Stack> {
         fetchFn: agentFetchFn,
         baseUrl: INTERNAL_ORIGIN,
         executionTimeoutMs,
+        // The live worker signs its run contexts with the SAME fixed test
+        // secret the API-side signer uses (internal-trust contract).
+        signer: createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8')),
       }),
       redisUrl: REDIS_URL,
       queueName,
@@ -418,7 +431,23 @@ function createTaskBody(label: string, overrides: Record<string, unknown> = {}):
   };
 }
 
-const WORKER_HEADERS: Record<string, string> = { [SCHEDULER_WORKER_HEADER]: '1' };
+const LIVE_SCHEDULER_SIGNER = createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8'));
+/**
+ * Worker run headers for the live suite: convention marker + SIGNED
+ * `internal-scheduler-run` context bound to the run target (the API route
+ * derives the owner from the row, so the worker never needs the owner id).
+ */
+function workerRunHeaders(target: { taskId?: string; executionId?: string }): Record<string, string> {
+  return {
+    [SCHEDULER_WORKER_HEADER]: '1',
+    [INTERNAL_SCHEDULER_HEADER]: LIVE_SCHEDULER_SIGNER.sign({
+      kind: 'internal-scheduler-run',
+      ...(target.taskId !== undefined ? { taskId: target.taskId } : {}),
+      ...(target.executionId !== undefined ? { executionId: target.executionId } : {}),
+      expiresAt: Date.now() + contextWindow(20_000).expiresAt,
+    }),
+  };
+}
 
 async function createTask(stack: Stack, label: string, overrides: Record<string, unknown> = {}): Promise<AgentTask> {
   const response = await callJson(stack.port, 'POST', '/tasks', createTaskBody(label, overrides));
@@ -505,6 +534,15 @@ before(async () => {
   if (Number(tables[0]?.found ?? 0) !== 2) {
     throw new Error('Phase 5 scheduler tables missing — apply the Phase 5 migration first (root: npm run db:migrate).');
   }
+  // The run owner is a REAL Better Auth row: ownerId FKs (AgentTask/
+  // AgentTaskExecution) target "User", so the test-only owner identity must
+  // exist before any owner-scoped write. Test-only injection (not a
+  // production bypass); deleted once in after().
+  await prisma.user.upsert({
+    where: { id: LIVE_OWNER_ID },
+    create: { id: LIVE_OWNER_ID, email: LIVE_OWNER_EMAIL, name: 'live scheduler owner' },
+    update: {},
+  });
   // Defensive pre-clean (run ids never repeat): orphan rows of THIS run only.
   try {
     await prisma.agentTask.deleteMany({ where: { name: { startsWith: TASK_PREFIX } } });
@@ -516,6 +554,7 @@ before(async () => {
 after(async () => {
   try {
     await prisma.agentTask.deleteMany({ where: { name: { startsWith: TASK_PREFIX } } });
+    await prisma.user.deleteMany({ where: { id: LIVE_OWNER_ID } });
   } catch {
     void 0;
   }
@@ -597,7 +636,7 @@ test('ONCE deterministic delayed job dedupes across syncs and nulls nextRunAt af
       'POST',
       `/tasks/${task.id}/run-scheduled`,
       { scheduledFor: runAt, attempt: 1 },
-      WORKER_HEADERS,
+      workerRunHeaders({ taskId: task.id }),
     );
     assert.equal(occurrence.status, 200, JSON.stringify(occurrence.body));
     assert.equal((occurrence.body.execution as Record<string, unknown>).status, 'COMPLETED');
@@ -702,7 +741,7 @@ test('manual run: real queue → real worker → own REST → real chat COMPLETE
         let cursor = '0';
         const keys: string[] = [];
         do {
-          const scan = await client.scan(cursor, { MATCH: `${REDIS_KEY_PREFIX}:idempotency:general:${executionId}:*`, COUNT: 50 });
+          const scan = await client.scan(cursor, { MATCH: `${REDIS_KEY_PREFIX}:idempotency:*:general:${executionId}:*`, COUNT: 50 });
           cursor = scan.cursor;
           keys.push(...scan.keys);
         } while (cursor !== '0');
@@ -715,7 +754,7 @@ test('manual run: real queue → real worker → own REST → real chat COMPLETE
     assert.ok(String(idemKeys[0]).endsWith(`:${executionId}:${executionId}`), 'key equals {chatId}:{messageId}');
 
     // Terminal re-run (worker route): ok, ZERO extra generation.
-    const rerun = await callJson(stack.port, 'POST', `/executions/${executionId}/run`, { attempt: 4 }, WORKER_HEADERS);
+    const rerun = await callJson(stack.port, 'POST', `/executions/${executionId}/run`, { attempt: 4 }, workerRunHeaders({ executionId }));
     assert.equal(rerun.status, 200);
     assert.equal(rerun.body.ok, true);
     assert.equal(model.callCount(), 1);
@@ -741,8 +780,8 @@ test('duplicate occurrence deliveries: one row, one claim, no duplicate chat', a
     // or reports a transient 409 while the winner streams — NEVER a second
     // row, claim, or model call.
     const [d1, d2] = await Promise.all([
-      callJson(stack.port, 'POST', `/tasks/${task.id}/run-scheduled`, { scheduledFor, attempt: 1, queueJobId: 'dup-job-1', repeatJobKey: 'dup-rep-1' }, WORKER_HEADERS),
-      callJson(stack.port, 'POST', `/tasks/${task.id}/run-scheduled`, { scheduledFor, attempt: 1, queueJobId: 'dup-job-1', repeatJobKey: 'dup-rep-1' }, WORKER_HEADERS),
+      callJson(stack.port, 'POST', `/tasks/${task.id}/run-scheduled`, { scheduledFor, attempt: 1, queueJobId: 'dup-job-1', repeatJobKey: 'dup-rep-1' }, workerRunHeaders({ taskId: task.id })),
+      callJson(stack.port, 'POST', `/tasks/${task.id}/run-scheduled`, { scheduledFor, attempt: 1, queueJobId: 'dup-job-1', repeatJobKey: 'dup-rep-1' }, workerRunHeaders({ taskId: task.id })),
     ]);
     for (const delivery of [d1, d2]) {
       assert.ok(delivery.status === 200 || delivery.status === 409, `delivery outcome ${delivery.status}`);
@@ -769,7 +808,7 @@ test('duplicate occurrence deliveries: one row, one claim, no duplicate chat', a
     assert.equal(messages.length, 2, 'exactly one user + one assistant message');
 
     // A third redelivery AFTER terminal: idempotent, still one chat.
-    const again = await callJson(stack.port, 'POST', `/tasks/${task.id}/run-scheduled`, { scheduledFor, attempt: 1, queueJobId: 'dup-job-1', repeatJobKey: 'dup-rep-1' }, WORKER_HEADERS);
+    const again = await callJson(stack.port, 'POST', `/tasks/${task.id}/run-scheduled`, { scheduledFor, attempt: 1, queueJobId: 'dup-job-1', repeatJobKey: 'dup-rep-1' }, workerRunHeaders({ taskId: task.id }));
     assert.equal(again.status, 200);
     assert.equal((again.body.execution as Record<string, unknown>).id, firstId);
     assert.equal(model.callCount(), 1);
@@ -918,7 +957,7 @@ test('pause and skipDates occurrences are SKIPPED with zero model calls', async 
       'POST',
       `/tasks/${pausedTask.id}/run-scheduled`,
       { scheduledFor: isoFuture(60), attempt: 1 },
-      WORKER_HEADERS,
+      workerRunHeaders({ taskId: pausedTask.id }),
     );
     assert.equal(suspended.status, 200);
     assert.equal(suspended.body.skipped, true);
@@ -932,7 +971,7 @@ test('pause and skipDates occurrences are SKIPPED with zero model calls', async 
       'POST',
       `/tasks/${skipTask.id}/run-scheduled`,
       { scheduledFor: isoFuture(60), attempt: 1 },
-      WORKER_HEADERS,
+      workerRunHeaders({ taskId: skipTask.id }),
     );
     assert.equal(skipped.status, 200);
     assert.equal(skipped.body.skipped, true);
@@ -960,8 +999,8 @@ test('duplicate run POSTs while streaming recover without a second generation', 
     // winner; the loser recovers through durable hydration/resume — never a
     // second chat POST, never a second user message.
     const [a, b] = await Promise.all([
-      callJson(stack.port, 'POST', `/executions/${executionId}/run`, { attempt: 1 }, WORKER_HEADERS),
-      callJson(stack.port, 'POST', `/executions/${executionId}/run`, { attempt: 1 }, WORKER_HEADERS),
+      callJson(stack.port, 'POST', `/executions/${executionId}/run`, { attempt: 1 }, workerRunHeaders({ executionId })),
+      callJson(stack.port, 'POST', `/executions/${executionId}/run`, { attempt: 1 }, workerRunHeaders({ executionId })),
     ]);
     for (const entry of [a, b]) {
       assert.ok(entry.status === 200 || entry.status === 409, `recovery outcome ${entry.status}`);
@@ -1000,6 +1039,9 @@ function workerChildEnv(stack: Stack): NodeJS.ProcessEnv {
     SCHEDULER_QUEUE_NAME: stack.queueName,
     INTERNAL_API_BASE_URL: `http://127.0.0.1:${stack.port}`,
     SCHEDULER_EXECUTION_TIMEOUT_MS: '180000',
+    // The worker signs its run contexts with the shared secret (pre-Phase 6
+    // internal trust: no unsigned/ephemeral fallback across processes).
+    DELEGATION_CONTEXT_SECRET: TEST_DELEGATION_SECRET,
   };
 }
 

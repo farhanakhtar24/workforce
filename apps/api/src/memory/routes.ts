@@ -41,7 +41,9 @@ import {
   type MemorySearchResult,
   type MemoryService,
 } from '@workforce/core/memory';
+import { userMemoryScope } from '@workforce/core/auth';
 import type { SafeLogger } from '../logging.js';
+import { ownerOf } from '../auth/owner.js';
 
 export const INVALID_MEMORY_REQUEST = 'Invalid memory request.';
 export const MEMORY_NOT_FOUND = 'Memory block not found.';
@@ -144,10 +146,48 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
     res.end(JSON.stringify(body));
   };
 
+  /**
+   * Owner-scoped memory: the forced scope is derived from the RESOLVED owner
+   * (`userMemoryScope(owner.userId)` from `@workforce/core/auth`) and every
+   * read/write/search/compaction runs inside it. A client-supplied `scope`
+   * (body or query) is STRIPPED IN FULL before schema parsing — replaced,
+   * never merged — so another user's scope name can never be targeted, no
+   * other user's blocks can ever leak into a response, and a client cannot
+   * even trip validation by naming a foreign scope. Unauthenticated reach
+   * (impossible behind the app-wide owner middleware) is a 401.
+   */
+  const scopeOf = (req: Request, res: Response): string | null => {
+    const owner = ownerOf(res);
+    if (owner === null) {
+      res.status(401);
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.end(JSON.stringify({ error: 'Authentication required.' }));
+      return null;
+    }
+    return userMemoryScope(owner.userId);
+  };
+
+  /** Removes the client-supplied `scope` before schema parsing (ignore). */
+  const withoutClientScope = (value: unknown): unknown => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return value;
+    }
+    const { scope: _ignored, ...rest } = value as Record<string, unknown>;
+    return rest;
+  };
+
   // -- POST /api/memory/blocks -------------------------------------------------
 
   const createBlock: RequestHandler = handler(async (req, res) => {
-    const input = parseMemoryInput(writeBlockInputSchema, req.body);
+    const scope = scopeOf(req, res);
+    if (scope === null) {
+      return;
+    }
+    const input = parseMemoryInput(writeBlockInputSchema, {
+      ...(withoutClientScope(req.body) as Record<string, unknown>),
+      scope,
+    });
     const block = await service.writeBlock(input);
     jsonResponse(res, 201, { block });
   });
@@ -155,7 +195,15 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- GET /api/memory/blocks ---------------------------------------------------
 
   const listBlocks: RequestHandler = handler(async (req, res) => {
-    const input = parseMemoryInput(queryBlocksInputSchema, parseBlocksQuery(req.query as Record<string, unknown>));
+    const scope = scopeOf(req, res);
+    if (scope === null) {
+      return;
+    }
+    const queryWithoutScope = withoutClientScope(req.query as Record<string, unknown>) as Record<string, unknown>;
+    const input = parseMemoryInput(queryBlocksInputSchema, {
+      ...parseBlocksQuery(queryWithoutScope),
+      scope,
+    });
     const blocks = await service.queryBlocks(input);
     jsonResponse(res, 200, { blocks });
   });
@@ -163,7 +211,14 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- POST /api/memory/search --------------------------------------------------
 
   const search: RequestHandler = handler(async (req, res) => {
-    const input = parseMemoryInput(semanticSearchInputSchema, req.body);
+    const scope = scopeOf(req, res);
+    if (scope === null) {
+      return;
+    }
+    const input = parseMemoryInput(semanticSearchInputSchema, {
+      ...(withoutClientScope(req.body) as Record<string, unknown>),
+      scope,
+    });
     const results: readonly MemorySearchResult[] = await service.semanticSearch(input);
     jsonResponse(res, 200, { results });
   });
@@ -171,17 +226,28 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- GET /api/memory/blocks/:id/related ---------------------------------------
 
   const related: RequestHandler = handler(async (req, res) => {
+    const scope = scopeOf(req, res);
+    if (scope === null) {
+      return;
+    }
     const id = parseMemoryInput(memoryIdSchema, req.params['id']);
-    const result: MemoryRelatedResult = await service.exploreRelated(id);
-    jsonResponse(res, 200, { block: result.block, outgoing: result.outgoing, incoming: result.incoming });
+    const result = await requireOwnerBlock(service.exploreRelated(id), scope);
+    const outgoing = result.outgoing.filter((entry) => entry.block.scope === scope);
+    const incoming = result.incoming.filter((entry) => entry.block.scope === scope);
+    jsonResponse(res, 200, { block: result.block, outgoing, incoming });
   });
 
   // -- POST /api/memory/blocks/:id/retry ----------------------------------------
 
   const retryEmbedding: RequestHandler = handler(async (req, res) => {
+    const scope = scopeOf(req, res);
+    if (scope === null) {
+      return;
+    }
     const id = parseMemoryInput(memoryIdSchema, req.params['id']);
-    // Read-only existence check: exploreRelated throws NotFound when missing.
-    const existing = await service.exploreRelated(id);
+    // Read-only ownership check first: a foreign/legacy-scope id reads as the
+    // same fixed 404 and never reveals existence or embedding state.
+    const existing = await requireOwnerBlock(service.exploreRelated(id), scope);
     if (existing.block.embeddingStatus === 'ready') {
       throw new MemoryConflictError('memory block embedding is already ready');
     }
@@ -198,15 +264,41 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- POST /api/memory/compact ---------------------------------------------------
 
   const enqueueCompaction: RequestHandler = handler(async (req, res) => {
-    const input = parseMemoryInput(compactPathInputSchema, req.body);
+    const scope = scopeOf(req, res);
+    if (scope === null) {
+      return;
+    }
+    const input = parseMemoryInput(compactPathInputSchema, {
+      ...(withoutClientScope(req.body) as Record<string, unknown>),
+      scope,
+    });
+    // The client scope is stripped in full: compaction only ever runs on the
+    // forced owner scope.
     const triggerBlockId = randomUUID();
     try {
-      await queue.enqueueCompaction(input.scope, input.path, triggerBlockId);
+      await queue.enqueueCompaction(scope, input.path, triggerBlockId);
     } catch (cause) {
       throw new MemoryQueueError('failed to enqueue compaction job', { cause });
     }
-    jsonResponse(res, 202, { status: 'queued', scope: input.scope, path: input.path, triggerBlockId });
+    jsonResponse(res, 202, { status: 'queued', scope, path: input.path, triggerBlockId });
   });
 
   return { createBlock, listBlocks, search, related, retryEmbedding, enqueueCompaction };
+}
+
+/**
+ * Ownership filter on an unscoped block read (`exploreRelated` is id-only in
+ * the core contract): a block from another scope (another user's private
+ * scope, or any legacy/anonymous scope like `default`) reads as typed 404 —
+ * never an existence oracle, never content exposure.
+ */
+async function requireOwnerBlock(
+  read: Promise<MemoryRelatedResult>,
+  expectedScope: string,
+): Promise<MemoryRelatedResult> {
+  const result = await read;
+  if (result.block.scope !== expectedScope) {
+    throw new MemoryNotFoundError(`memory block not found in the caller's scope`);
+  }
+  return result;
 }

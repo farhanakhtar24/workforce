@@ -60,3 +60,6 @@ coverage/
 
 # Generated
 .generated/
+
+# OpenChamber local test tooling (never product source)
+.openchamber/

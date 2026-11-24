@@ -1,10 +1,16 @@
 import type { UIMessage } from 'ai';
 
 /**
- * A chat addressed by agent slug + client chat ID. Used instead of a bare
- * chatId so Redis key layout can stay slug-scoped.
+ * A chat addressed by agent slug + owner + client chat ID (pre-Phase 6
+ * authentication). `ownerId` is REQUIRED on every ref: messages, the active
+ * stream marker, idempotency keys, and the per-owner chat index are all
+ * namespaced by it, so two users using the same slug+chatId are fully
+ * isolated. Legacy (ownerless) Redis keys are structurally unreachable from
+ * the new key shapes.
  */
 export interface ChatRef {
+  /** Better Auth `User.id` of the chat's owner. */
+  readonly ownerId: string;
   readonly slug: string;
   readonly chatId: string;
 }
@@ -95,14 +101,103 @@ export interface ChatStore {
    * newest activity first for chats tracked by the activity index, and chats
    * created BEFORE the index existed (legacy) deterministically after them
    * with `lastActivityAt: null` (never fabricated). Legacy discovery is
-   * bounded (Redis: bounded SCAN + bounded per-chat reads). Corrupt/garbage
-   * stored entries are skipped leniently here — the strict
+   * bounded (Redis: bounded SCAN + bounded per-chat reads). `ownerId` is
+   * REQUIRED: only that user's index/chats are listed, and pre-auth
+   * (ownerless) legacy keys can never match the owner-scoped discovery.
+   * Corrupt/garbage stored entries are skipped leniently here — the strict
    * `StoreUnavailableError`-on-corruption contract stays on `loadMessages`
    * (generation correctness), not on this read-only summary path.
    * Throws `StoreUnavailableError` when the backing storage fails.
    */
-  listRecentChats(limit: number): Promise<ChatSummary[]>;
+  listRecentChats(ownerId: string, limit: number): Promise<ChatSummary[]>;
+
+  /**
+   * Owner-scoped DESTRUCTIVE delete (pre-Phase 6 chat lifecycle):
+   * atomically removes THAT owner's messages list, active-stream marker, and
+   * the chat's per-owner index member; then (outside the atomic step)
+   * deletes the chat's message-scoped idempotency keys (bounded SCAN) —
+   * they are semantically dead without the chat, but removing them is
+   * preferred so a reused prompt cannot be blocked by a stale key.
+   * Refuses (`'busy'`) while an ACTIVE STREAM marker exists (a generation is
+   * running/resumable) — the marker is the exact contract the chat POST
+   * uses, so no generation can be silently orphaned mid-flight.
+   * `'not-found'` when this owner has no such chat (unknown or other-owner).
+   * Deliberate exclusions: WorkDocs, Delegation audit rows, AgentTask
+   * history, delegated child chats, and every other owner's data are NEVER
+   * touched — they are durable artifacts that outlive their chat.
+   * Throws `StoreUnavailableError` when the backing storage fails.
+   */
+  deleteChat(chat: ChatRef): Promise<ChatDeleteResult>;
+
+  /**
+   * Owner-scoped BRANCH: copies THIS chat's messages UP TO AND INCLUDING the
+   * selected message (index found by message id, searched newest-first) into
+   * a NEW empty destination chat under the SAME owner+slug, preserving the
+   * EXACT raw stored JSON bytes and order (no re-serialization anywhere).
+   * The destination must be non-existent/empty AND marker-free (`'destination-
+   * conflict'` otherwise). The source is never modified (active-stream marker
+   * included). No idempotency keys are copied (the destination is fresh).
+   * The destination's per-owner index member is written atomically with the
+   * copied entries in ONE Redis script.
+   * Throws `StoreUnavailableError` when the backing storage fails.
+   */
+  branchChat(chat: ChatRef, branch: { readonly messageId: string; readonly newChatId: string }): Promise<ChatBranchResult>;
+
+  /**
+   * Owner-scoped DESTRUCTIVE REWIND: keeps messages UP TO AND INCLUDING the
+   * selected message (newest-last search by id) and atomically removes the
+   * LATER messages with a compare-and-set against concurrent appends
+   * (expected list length + byte-exact tail + byte-exact first-removed
+   * entry; a concurrent append changes both) — bounded retries then
+   * `'stale'` (the route answers a fixed 409). The kept entries' raw bytes
+   * are preserved untouched (LTRIM, never cjson). Idempotency keys of REMOVED
+   * user messages are deleted so a reused prompt can regenerate; keys of
+   * KEPT messages are never touched. The per-owner index member is re-scored
+   * honestly (the chat was just mutated). The active-stream refusal stays at
+   * the route layer (fixed 409 while a generation runs) and the caller MUST
+   * have checked the marker; the store never rewinds a live chat (the CAS
+   * plus the marker guarantee it).
+   * DOCUMENTED EXCEPTION to append-only: this is the only store operation
+   * that removes existing message entries, and it removes only a tail.
+   * Throws `StoreUnavailableError` when the backing storage fails.
+   */
+  rewindChat(chat: ChatRef, messageId: string): Promise<ChatRewindResult>;
+
+  /**
+   * The chat's SELECTED model (server-validated id) for one owner+slug+chat,
+   * or `null` when unset (the generation resolves the DEFAULT then). Redis:
+   * persistent `…:model` key, no TTL; in-memory parity. Rewind preserves it;
+   * branch copies it atomically with the transcript; delete removes it.
+   */
+  getChatModel(chat: ChatRef): Promise<string | null>;
+
+  /** Assigns (`modelId`) or clears (`null`) the chat's selected model. */
+  setChatModel(chat: ChatRef, modelId: string | null): Promise<void>;
 }
+
+/** Result of the destructive owner-scoped chat delete. */
+export interface ChatDeleteResult {
+  readonly status: 'deleted' | 'busy' | 'not-found';
+  /** Message-scoped idempotency keys actually removed (best-effort cleanup). */
+  readonly removedIdempotencyKeys: number;
+}
+
+/** Result of the owner-scoped chat branch. */
+export interface ChatBranchResult {
+  readonly status: 'branched' | 'chat-not-found' | 'message-not-found' | 'destination-conflict';
+  /** Messages copied into the destination (through the selected one). */
+  readonly copiedMessages: number;
+}
+
+/** Result of the owner-scoped destructive rewind. */
+export interface ChatRewindResult {
+  readonly status: 'applied' | 'chat-not-found' | 'message-not-found' | 'stale';
+  readonly kept: number;
+  readonly removed: number;
+}
+
+/** Owner id shape for chat-store keys (Better Auth `User.id`, TEXT-safe). */
+export const CHAT_OWNER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 export type AskUserAnswerStatus = 'applied' | 'unchanged' | 'stale';
 

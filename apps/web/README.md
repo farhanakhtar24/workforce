@@ -122,6 +122,101 @@ Notes:
   (agent avatar + title + real count; full metadata stays in the row
   `title`/`aria-label` so accessibility keeps the real timestamp/preview).
 
+/* ------------------------------------------------------------------ */
+/* Auth: same-origin Better Auth client + session-aware shell           */
+/* ------------------------------------------------------------------ */
+
+- **Signed-in workspace** (Better Auth 1.7.27, same version as the API):
+  `src/lib/auth-client.ts` points the official React client at
+  `${API_BASE}/api/auth` with `credentials: 'include'`; every API request in
+  the app sends cookies — a shared `browserApiFetch`/`browserChatFetch`
+  wrapper backs all domain fetchers (memory, workdocs, delegations,
+  scheduler, recent chats, hydration client fetch) and the AI-SDK chat
+  transport (send + resume). Request contracts, idempotency headers and
+  resume semantics are untouched.
+  - Status mapping: 401 → fixed session-expired copy **and** a redirect to
+    `/sign-in?next=<safe local route>`; 403 → fixed "You do not have access
+    to this workspace." — never raw internals (403 also renders the fixed
+    access-denied panel in `AuthGate` and on `/sign-in?error=`).
+  - `AuthGate` (wrapped by `WorkspaceGate` in the shell): a loading
+    skeleton while the session fetch is pending, an unauthenticated redirect
+    with the intended local `?next=` route, then the real workspace with the
+    user identity row (initials, name, email) and working Sign out that
+    never deletes history. No test bypass exists.
+  - `/sign-in` renders the standalone brand card with the value copy and
+    ONLY the providers the API actually configured (public
+    `GET /api/auth/providers` booleans — no fake buttons); buttons use
+    Better Auth's `signIn.social({ provider, callbackURL })` with the
+    callback constrained to the same-origin local route
+    (`safeLocalCallback`: absolute/scheme-relative/backslash/empty values
+    all fall back to `/`). Loading, provider error, and honest offline copy
+    ("reconnect before signing in — nothing resumes automatically") are all
+    fixed text.
+- **Layout controls**: the desktop rail collapses to a ~64px icon rail
+  (labels hidden, icons `title`-labelled, New chat/Sign out still reachable;
+  preference persisted in `localStorage['workforce:sidebar-collapsed']`
+  with corrupt-value fallbacks) and expands back; mobile opens an
+  accessible drawer (`role="dialog"`, `aria-modal`, Esc + labelled backdrop,
+  focus on open) holding nav + history while New chat stays permanently in
+  the top bar. The chat transcript/composer column is widened to
+  `max-w-[52.8rem]` (~10% over the old `max-w-3xl`).
+- **Models** (`src/lib/models.ts` + chat controls): authenticated
+  `GET /api/models` catalog (locked rows disabled with the server's
+  value-free lock reason; `defaultModelId` = `glm-5.3-flash` in config) at
+  the compact chat-controls NativeSelect; per-chat model via
+  `GET/PUT /api/agents/:slug/chat/:id/model` (strict `{modelId}`; PUT first,
+  applies to the NEXT generation, never interrupts a running stream;
+  disabled while busy/HITL/saving; fixed safe 400/404/503/auth copy).
+  Model details lazily fetch `GET /api/models/:modelId/details` on hover AND
+  keyboard focus AND disclosure open (cached per model, request-sequence
+  guarded), showing capabilities / parameter size / context length /
+  modified date only when real, `Not reported` otherwise — no `title`-only
+  essential info, no invented prices.
+- **Usage** (`src/lib/chat-usage.ts`): a Session-usage disclosure by the
+  model controls shows exact input/output/total tokens and per-model
+  buckets (`(unattributed)` labeled honestly) from the authenticated
+  `GET …/usage` route; `Estimated cost: $…` appears ONLY with a real
+  `estimatedCostUsd`, otherwise the honest reason (`Pricing not configured`
+  / `Partial pricing`). Per-assistant-message badges render
+  `metadata.usage`/`metadata.modelId` when valid (accessible disclosure;
+  absent → nothing shown, never fake zeros). Usage refreshes once after a
+  turn settles (not per token), sequence-guarded, failures non-fatal.
+- **Personal memory setting** (`src/lib/settings.ts` + Memory page card):
+  an accessible opt-in checkbox loads `GET /api/settings` and PATCHes strict
+  `{personalMemoryEnabled}` immediately, with saving/saved/error states and
+  the concise explanation + scope note; no settings page added, no fake
+  success, no retro-import claims.
+- **Delegation depiction**: delegate_task cards and `/delegations` now read
+  "Specialist sub-agent", show `Orchestrator → <worker>` with avatars, real
+  `depth` chip (from the list; omitted if absent), real status badge, honest
+  sync/async explanation in the page description; Markdown worker results
+  stay bounded; child chats expose no parent-side relation in current APIs,
+  so no fabricated parent claim is rendered there.
+- New chat sessions default to **Plan mode**: absent/plan-mode URLs keep
+  clean canonical URLs, explicit `?mode=action` links work verbatim, and no
+  API default changed.
+- **Chat mutations** (`src/lib/chat-mutations.ts` + `RecentChats`/`Chat`):
+  real authenticated chat-management controls over the API mutation routes.
+  Recent-chats rows expose a Delete action outside the row link (hover/focus
+  reveal, always reachable on touch) behind an accessible native confirmation
+  dialog naming the chat, its agent and meta, with the "artifacts survive"
+  note, in-dialog error + Retry-in-place, spinner, and no accidental
+  navigation (the row link and the delete button are separate tab stops).
+  Deleting the CURRENT chat refreshes the list and navigates to a fresh
+  Plan chat; deleting a background chat soft-refreshes in place. In Chat,
+  Branch/Undo-style Rewind compact buttons appear per message (hover/focus
+  reveal, always keyboard/touch reachable, disabled while busy or HITL
+  pending): Branch generates a `crypto.randomUUID` destination, POSTs the
+  strict `{messageId, newChatId}` body, and client-navigates to the canonical
+  same-agent/same-mode destination (original preserved); Rewind opens a
+  destructive confirmation quoting a surrogate-safe bounded preview of the
+  selected message plus exact keep/remove semantics ("everything after it is
+  deleted; kept raw bytes intact; cannot be undone"), and on success trims the
+  local `useChat` state to the server's `kept` count (in-place remount of the
+  same chat id — deleted messages are never retained) and refreshes history.
+  Fixed safe copy for 404/409/500 and auth statuses; `workforce:chats-changed`
+  fires after each success; all request bodies are validated before fetch.
+
 ## Scripts
 
 ```sh
@@ -150,7 +245,7 @@ Copy `.env.example` to `.env.local` for non-default values.
 | Route | Purpose |
 |---|---|
 | `/` | Mints a fresh chat id (server-side `crypto.randomUUID`) and redirects to the canonical chat URL, carrying a valid `?agent=`/`?mode=` from "New chat". |
-| `/agents/[slug]/chat/[chatId]` | **Canonical stable chat URL.** `slug` ∈ general/orchestrator/analyst/researcher; `?mode=plan\|action` optional (default `action`). Unknown slug → safe 404; unsafe id → 404; unknown mode → default. Server hydration calls `GET /api/agents/<slug>/chat/:chatId` with `no-store` for the SAME slug. |
+| `/agents/[slug]/chat/[chatId]` | **Canonical stable chat URL.** `slug` ∈ general/orchestrator/analyst/researcher; `?mode=plan\|action` optional (default `plan` — new chats start planning; explicit `?mode=action` still honored). Unknown slug → safe 404; unsafe id → 404; unknown mode → default. Server hydration calls `GET /api/agents/<slug>/chat/:chatId` with `no-store` for the SAME slug. |
 | `/chat/[chatId]` | Legacy Phase 2 URL — redirects to `/agents/general/chat/<chatId>` (a valid `?agent=`/`?mode=` is honored), so pre-Phase-4 links keep their general transcript. |
 | `/memory` | Phase 3 memory workspace (unchanged). |
 | `/work` | Work Docs library: filter by scope/chat id/type/status, list, create (real orchestrator POST route, draft v1, requires a chat context). |
@@ -294,7 +389,7 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 
 ## Tests (offline, pure — node:test)
 
-`npm test` runs 172 tests across:
+`npm test` runs 213 tests across:
 
 - `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
   hydration mapping, safe errors) — unchanged and green.
@@ -302,7 +397,10 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 - `test/memory.test.ts` — Phase 3 memory helpers — unchanged and green.
 - `test/agents.test.ts` — roster/mode parsing, canonical + legacy URL building,
   child-chat URL gating, slug-aware send/hydrate/resume endpoints, `{id,message,mode}`
-  body + unchanged idempotency header, plan/action guidance that names only composed tools.
+  body + unchanged idempotency header, plan/action guidance that names only composed
+  tools — with the web-wide default flipped to `plan`: absent/plan URLs stay clean,
+  explicit `?mode=action` rides the documented body/URL and every pre-existing
+  explicit-mode link keeps working unchanged.
 - `test/tools.test.ts` — lifecycle labels, bounded text/JSON shaping, write_doc /
   delegate_task / query_data / search_memory / ask_user parsing, pending-ask_user
   scan, generic unknown-tool fallback.
@@ -331,8 +429,7 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   OWNING task's agent+mode, DEAD_LETTER-only retry gate, poll predicate
   (PENDING/RUNNING/RETRYING + settle window, never terminal-only), and stub-fetch
   orchestration for the real routes (API error text verbatim, honest 503 status).
-- `test/workspace.test.ts` — UI-refresh shell/empty-state helpers: nav metadata
-  covers every section id once (Chat → Memory → Work docs → Delegations →
+- `test/workspace.test.ts` — UI-refresh shell/empty-state helpers: nav metadata  covers every section id once (Chat → Memory → Work docs → Delegations →
   Schedules) with stable hrefs/prefixes, canonical `/agents/:slug/chat/:id` and
   legacy `/chat/:id` URLs route to the chat section (`/` matches only itself,
   never other roots), detail paths (`/work/:id`) stay in their section, unknown
@@ -340,6 +437,27 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   fallback, and every agent gets 3–4 non-empty unique empty-state suggestions that
   stay honest to each agent toolset (general calculation-only, researcher without
   SQL, orchestrator naming its real memory/query/document/delegation verbs).
+- `test/auth.test.ts` — auth contract helpers: `safeLocalCallback`
+  (same-origin local routes only — absolute/scheme-relative/backslash/empty
+  values fall back to `/`, queries kept, custom fallback honored),
+  401→session-expired vs 403→access-denied fixed mappings (other statuses
+  null), non-browser-safe `requestAuthError`, provider endpoint URL with
+  trailing-slash normalization, strict boolean `mapAuthProviders` (valid
+  rows pass, every malformed shape maps to the fixed safe error, extra
+  fields accepted), and the literal `credentials: 'include'` contract.
+- `test/layout-controls.test.ts` — sidebar collapse persistence through an
+  injected storage (missing/corrupt/throwing storage never breaks callers,
+  explicit true/false round-trips), expanded `md:w-[260px]` vs collapsed
+  `md:w-[64px]` rail widths, and the chat column `max-w-[52.8rem]`
+  (~1.10× the old `max-w-3xl`) as a statically detectable class.
+- `test/chat-mutations.test.ts` — chat mutation contract helpers: canonical
+  DELETE/branch/rewind endpoint URLs (unsafe ids/slugs produce none; trailing
+  slash normalized), strict `{messageId,newChatId}` / `{messageId}` body
+  validation BEFORE fetch, 200/201 response mapping plus the exact fixed
+  404/409/500/auth-status copies (401 → session-expired), mutation gating
+  while busy/HITL, destination href preserving agent+mode, rewind local-state
+  trim (`kept` prefix, never mutating the source), and the bounded surrogate-
+  safe message preview used by the destructive confirmation.
 - `test/recent-chats.test.ts` — recent-chats history contract: endpoint URL
   (default 20, max-50 clamp, invalid limits fall back), structural mapping of
   valid rows (bounded trimmed title/preview, integer counts, ISO timestamps)
@@ -387,3 +505,28 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   revision trail (the route accepts optional `source: 'agent' | 'user'`,
   default `agent`; agent-originated `write_doc` calls stay server-side).
   There is no shadow user-content endpoint.
+
+## Pre-Phase-6 sprint integration note (2026-11-24 final)
+
+Recorded from the orchestrator's live desktop gate (1440×900, explicit
+`Browser Gate` identity via the gitignored `.openchamber/browser-gate-proxy.mts`
+proxy on `127.0.0.1:3002`): real model catalog/details and locked-Kimi
+selection behavior, per-chat model persistence, real calculator turn with
+per-message/session usage (pricing honestly unavailable), the personal-memory
+toggle round-trip (capture took effect for a fresh chat; OFF verified),
+branch/rewind/delete flows (synchronous-`showModal()` rewind dialog,
+kept-prefix rebuild, fresh-Plan redirect on current-chat delete), sidebar
+collapse/expand, Specialist sub-agent depiction for a real async delegation,
+and the final sidebar-viewport + default-Plan + rewind-dialog fixes.
+Offline total for the web workspace: **213/213** (root offline 980 across all
+workspaces; the real-integration suite **54/54** and the production build
+passed before those last three small web fixes — no new build/integration
+rerun is claimed after them). Known limitation: the new mobile drawer was NOT
+live-verified (no reliable mobile-resize viewport in this run; mobile CSS and
+pure helper tests remain). OAuth follow-up: a real user reached Google, but
+the post-auth return landed on the API origin (`http://localhost:3001/…
+Not found`) because a relative `callbackURL` resolves against the AUTH base;
+`SignInView` now sends an absolute same-origin web callback via
+`absoluteWebCallback(window.location.origin, nextPath)` (regression-tested in
+`test/auth.test.ts`). Real Google/GitHub browser confirmation POST-FIX remains
+pending.

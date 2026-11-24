@@ -29,7 +29,20 @@
  * claim, duplicate queue identity, non-equivalent terminal repeat ->
  * SchedulerConflictError (409); malformed input -> SchedulerValidationError
  * (400). No raw Prisma errors escape with content: they attach as `cause`
- * only.
+ * only. A raced P2025 (row deleted between the locked re-read and the write)
+ * maps to the SAME 404 the in-memory store produces for a missing row.
+ *
+ * ## Ownership
+ * `ownerId` is the platform user (Better Auth `User.id`, TEXT) or null for
+ * legacy rows; executions inherit the owning task's owner unless an explicit
+ * owner is supplied (resolved against the authoritative task ROW, never the
+ * caller's argument). Owner guards/filters match EXACTLY — an expected owner
+ * never matches ownerless or other-user rows — and mismatches read as
+ * 404/null: no cross-tenant oracle. `ownedOnly: true` on listTasks selects
+ * ONLY rows with `ownerId != null` (startup reconciliation excludes legacy
+ * ownerless tasks). The authenticated API layer MUST always pass the owner;
+ * CAS claim/mark semantics are untouched (the owner guard runs BEFORE the
+ * CAS).
  */
 
 import { randomUUID } from 'node:crypto';
@@ -39,9 +52,11 @@ import { Prisma, PrismaClient } from '@workforce/core/generated/prisma';
 import { MAX_TASK_ATTEMPTS, AGENT_TASK_TIMEZONE } from '../kinds.js';
 import {
   assertCondition,
+  enforceRowOwner,
   resolveNextRunAtForUpdate,
   sameMarkPayload,
   validateListParams,
+  validateReadOptions,
   validateStoreClaim,
   validateStoreExecutionCreate,
   validateStoreExecutionMark,
@@ -75,6 +90,7 @@ import type {
   SchedulerStoreTaskUpdate,
 } from '../store.js';
 import type { AgentTask, AgentTaskExecution, AgentTaskRecurrenceConfig } from '../types.js';
+import type { SchedulerReadOptions } from '../store.js';
 
 type RowTask = Prisma.AgentTaskGetPayload<object>;
 type RowExecution = Prisma.AgentTaskExecutionGetPayload<object>;
@@ -193,6 +209,8 @@ function mapTask(row: RowTask): AgentTask {
     isActive: row.isActive,
     timezone: timezoneFromDb(row.timezone),
     nextRunAt: row.nextRunAt ? row.nextRunAt.toISOString() : null,
+    // Normalizes absent fields too (fake rows in tests): never `undefined`.
+    ownerId: row.ownerId ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -214,6 +232,8 @@ function mapExecution(row: RowExecution): AgentTaskExecution {
     chatId: chatIdFromDb(row),
     queueJobId: row.queueJobId,
     repeatJobKey: row.repeatJobKey,
+    // Normalizes absent fields too (fake rows in tests): never `undefined`.
+    ownerId: row.ownerId ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     finishedAt: row.finishedAt ? row.finishedAt.toISOString() : null,
@@ -226,6 +246,23 @@ function asConflictOrOriginal(cause: unknown, message: string): unknown {
     return new SchedulerConflictError(message, { cause });
   }
   return cause;
+}
+
+/**
+ * Map a raced P2025 (row vanished between the locked re-read and the write)
+ * into the SAME typed 404 the in-memory store produces for a missing row —
+ * identical semantics across adapters.
+ */
+function asNotFoundOrOriginal(cause: unknown, message: string): unknown {
+  if (cause instanceof Prisma.PrismaClientKnownRequestError && cause.code === 'P2025') {
+    return new SchedulerNotFoundError(message, { cause });
+  }
+  return cause;
+}
+
+/** P2025 first (404), then P2002 (409), then rethrow. */
+function asNotFoundOrConflict(cause: unknown, conflictMessage: string, notFoundMessage: string): unknown {
+  return asNotFoundOrOriginal(asConflictOrOriginal(cause, conflictMessage), notFoundMessage);
 }
 
 export class PrismaSchedulerStore implements SchedulerStore {
@@ -257,6 +294,7 @@ export class PrismaSchedulerStore implements SchedulerStore {
           skipDates: skipDatesToDb(validated.skipDates),
           isActive: true,
           timezone: AGENT_TASK_TIMEZONE,
+          ownerId: validated.ownerId,
           nextRunAt: validated.nextRunAt,
           createdAt: validated.createdAt,
           updatedAt: validated.createdAt,
@@ -273,48 +311,77 @@ export class PrismaSchedulerStore implements SchedulerStore {
 
   async updateTask(data: SchedulerStoreTaskUpdate): Promise<AgentTask> {
     const validated = validateStoreTaskUpdate(data);
-    return this.prisma.$transaction(async (tx) => {
-      // Serialize concurrent same-task writers on the task row.
-      await tx.$queryRaw`SELECT "id" FROM "AgentTask" WHERE "id" = ${validated.id}::uuid FOR UPDATE`;
-      const row = await tx.agentTask.findUnique({ where: { id: validated.id } });
-      if (!row) {
-        throw new SchedulerNotFoundError(`agent task ${validated.id} not found`);
-      }
-      const existing = mapTask(row);
-      const nextRunAt = resolveNextRunAtForUpdate(existing, validated);
-      const updated = await tx.agentTask.update({
-        where: { id: validated.id },
-        data: {
-          // `id` is preserved by construction: never patched.
-          ...(validated.name !== undefined ? { name: validated.name } : {}),
-          ...(validated.prompt !== undefined ? { prompt: validated.prompt } : {}),
-          ...(validated.agentSlug !== undefined ? { agentSlug: validated.agentSlug } : {}),
-          ...(validated.mode !== undefined ? { mode: validated.mode } : {}),
-          ...(validated.scope !== undefined ? { scope: validated.scope } : {}),
-          ...(validated.recurrenceType !== undefined
-            ? { recurrenceType: recurrenceTypeToDb(validated.recurrenceType) }
-            : {}),
-          ...(validated.recurrenceConfig !== undefined
-            ? { recurrenceConfig: recurrenceConfigToDb(validated.recurrenceConfig) }
-            : {}),
-          ...(validated.skipDates !== undefined ? { skipDates: skipDatesToDb(validated.skipDates) } : {}),
-          nextRunAt,
-          updatedAt: validated.now,
-        },
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // Serialize concurrent same-task writers on the task row.
+        await tx.$queryRaw`SELECT "id" FROM "AgentTask" WHERE "id" = ${validated.id}::uuid FOR UPDATE`;
+        const row = await tx.agentTask.findUnique({ where: { id: validated.id } });
+        if (!row) {
+          throw new SchedulerNotFoundError(`agent task ${validated.id} not found`);
+        }
+        // Owner guard FIRST: a wrong owner reads as 404 (no patch oracle);
+        // ownerless legacy tasks never satisfy any expected owner.
+        enforceRowOwner(row, validated.expectedOwnerId);
+        const existing = mapTask(row);
+        const nextRunAt = resolveNextRunAtForUpdate(existing, validated);
+        const updated = await tx.agentTask.update({
+          where: { id: validated.id },
+          data: {
+            // `id` is preserved by construction: never patched.
+            ...(validated.name !== undefined ? { name: validated.name } : {}),
+            ...(validated.prompt !== undefined ? { prompt: validated.prompt } : {}),
+            ...(validated.agentSlug !== undefined ? { agentSlug: validated.agentSlug } : {}),
+            ...(validated.mode !== undefined ? { mode: validated.mode } : {}),
+            ...(validated.scope !== undefined ? { scope: validated.scope } : {}),
+            ...(validated.recurrenceType !== undefined
+              ? { recurrenceType: recurrenceTypeToDb(validated.recurrenceType) }
+              : {}),
+            ...(validated.recurrenceConfig !== undefined
+              ? { recurrenceConfig: recurrenceConfigToDb(validated.recurrenceConfig) }
+              : {}),
+            ...(validated.skipDates !== undefined ? { skipDates: skipDatesToDb(validated.skipDates) } : {}),
+            nextRunAt,
+            updatedAt: validated.now,
+          },
+        });
+        return mapTask(updated);
       });
-      return mapTask(updated);
-    });
+    } catch (cause) {
+      throw asNotFoundOrConflict(
+        cause,
+        `agent task ${validated.id} concurrent update conflict`,
+        `agent task ${validated.id} not found`,
+      );
+    }
   }
 
-  async getTask(id: string): Promise<AgentTask | null> {
+  async getTask(id: string, options?: SchedulerReadOptions): Promise<AgentTask | null> {
     const parsedId = parseSchedulerInput(schedulerIdSchema, id);
+    const parsedOptions = validateReadOptions(options);
     const row = await this.prisma.agentTask.findUnique({ where: { id: parsedId } });
-    return row ? mapTask(row) : null;
+    if (!row) {
+      return null;
+    }
+    // Owner guard: foreign/ownerless rows read as absent — never an oracle.
+    if (parsedOptions.expectedOwnerId !== null && (row.ownerId ?? null) !== parsedOptions.expectedOwnerId) {
+      return null;
+    }
+    return mapTask(row);
   }
 
   async listTasks(params?: SchedulerStoreTaskListParams): Promise<readonly AgentTask[]> {
     const validated = validateListParams(params);
+    // Combine the EXACT owner filter with ownedOnly (`ownerId IS NOT NULL`)
+    // without the spread overwriting one with the other.
+    const ownerWhere =
+      validated.ownerId === null
+        ? (validated.ownedOnly ? { ownerId: { not: null } } : {})
+        : { ownerId: validated.ownedOnly ? { equals: validated.ownerId, not: null } : validated.ownerId };
     const rows = await this.prisma.agentTask.findMany({
+      where: {
+        ...ownerWhere,
+        ...(validated.isActive !== null ? { isActive: validated.isActive } : {}),
+      },
       orderBy: validated.order === 'newest'
         ? [{ createdAt: 'desc' }, { id: 'desc' }]
         : [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -323,22 +390,33 @@ export class PrismaSchedulerStore implements SchedulerStore {
     return rows.map((row) => mapTask(row));
   }
 
-  async setTaskActive(id: string, isActive: boolean): Promise<AgentTask> {
+  async setTaskActive(id: string, isActive: boolean, options?: SchedulerReadOptions): Promise<AgentTask> {
     if (typeof isActive !== 'boolean') {
       throw new SchedulerValidationError('isActive must be a boolean');
     }
-    return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT "id" FROM "AgentTask" WHERE "id" = ${id}::uuid FOR UPDATE`;
-      const row = await tx.agentTask.findUnique({ where: { id } });
-      if (!row) {
-        throw new SchedulerNotFoundError(`agent task ${id} not found`);
-      }
-      const updated = await tx.agentTask.update({
-        where: { id },
-        data: { isActive, updatedAt: new Date() },
+    const parsedOptions = validateReadOptions(options);
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "AgentTask" WHERE "id" = ${id}::uuid FOR UPDATE`;
+        const row = await tx.agentTask.findUnique({ where: { id } });
+        if (!row) {
+          throw new SchedulerNotFoundError(`agent task ${id} not found`);
+        }
+        // Owner guard: a wrong owner reads as 404 (never a row oracle).
+        enforceRowOwner(row, parsedOptions.expectedOwnerId);
+        const updated = await tx.agentTask.update({
+          where: { id },
+          data: { isActive, updatedAt: new Date() },
+        });
+        return mapTask(updated);
       });
-      return mapTask(updated);
-    });
+    } catch (cause) {
+      throw asNotFoundOrConflict(
+        cause,
+        `agent task ${id} concurrent isActive write conflict`,
+        `agent task ${id} not found`,
+      );
+    }
   }
 
   // -- executions ------------------------------------------------------------
@@ -356,13 +434,18 @@ export class PrismaSchedulerStore implements SchedulerStore {
 
     try {
       return await this.prisma.$transaction(async (tx): Promise<SchedulerStoreExecutionCreateResult> => {
-        // Existence + serialization: every createExecution for the same task
-        // queues on this row lock, making the SCHEDULED dedupe below
-        // linearizable (two racing creates always see each other).
-        const taskLock = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "AgentTask" WHERE "id" = ${taskId}::uuid FOR UPDATE`;
+        // Existence + serialization + authoritative owner in ONE probe: every
+        // createExecution for the same task queues on this row lock, making
+        // the SCHEDULED dedupe below linearizable (two racing creates always
+        // see each other), and the locked row (never the caller's argument)
+        // supplies the owner for inheritance.
+        const taskLock = await tx.$queryRaw<Array<{ id: string; ownerId: string | null }>>`SELECT "id", "ownerId" FROM "AgentTask" WHERE "id" = ${taskId}::uuid FOR UPDATE`;
         if (!taskLock || taskLock.length === 0) {
           throw new SchedulerNotFoundError(`agent task ${taskId} not found`);
         }
+        // Owner inheritance (documented): explicit value wins, otherwise the
+        // execution belongs to the task's tenant (ownerless tasks -> null).
+        const executionOwnerId = validated.ownerId ?? (taskLock[0]?.ownerId ?? null);
 
         if (validated.trigger === 'RETRY') {
           const retryOfId = validated.retryOfExecutionId;
@@ -376,6 +459,11 @@ export class PrismaSchedulerStore implements SchedulerStore {
           const source = await tx.agentTaskExecution.findUnique({ where: { id: retryOfId } });
           if (!source) {
             throw new SchedulerNotFoundError(`retry source execution ${retryOfId} not found`);
+          }
+          // Owner binding BEFORE the 409s: a foreign/ownerless source reads
+          // as 404 (no cross-tenant oracle); ownerless tasks stay exempt.
+          if (executionOwnerId !== null && (source.ownerId ?? null) !== executionOwnerId) {
+            throw new SchedulerNotFoundError(`retry source execution ${source.id} not found`);
           }
           const sourceStatus = statusFromDb(source.status);
           if (sourceStatus !== 'DEAD_LETTER') {
@@ -421,6 +509,8 @@ export class PrismaSchedulerStore implements SchedulerStore {
             error: null,
             // chatId IS the execution id: one execution -> one isolated chat.
             chatId: id,
+            // Explicit owner wins; otherwise the task's tenant (see above).
+            ownerId: executionOwnerId,
             queueJobId,
             repeatJobKey,
             // FK scalar set only when present; the column defaults to NULL.
@@ -457,10 +547,18 @@ export class PrismaSchedulerStore implements SchedulerStore {
     }
   }
 
-  async getExecution(id: string): Promise<AgentTaskExecution | null> {
+  async getExecution(id: string, options?: SchedulerReadOptions): Promise<AgentTaskExecution | null> {
     const parsedId = parseSchedulerInput(schedulerIdSchema, id);
+    const parsedOptions = validateReadOptions(options);
     const row = await this.prisma.agentTaskExecution.findUnique({ where: { id: parsedId } });
-    return row ? mapExecution(row) : null;
+    if (!row) {
+      return null;
+    }
+    // Owner guard: foreign/ownerless rows read as absent — never an oracle.
+    if (parsedOptions.expectedOwnerId !== null && (row.ownerId ?? null) !== parsedOptions.expectedOwnerId) {
+      return null;
+    }
+    return mapExecution(row);
   }
 
   async listExecutions(
@@ -473,6 +571,8 @@ export class PrismaSchedulerStore implements SchedulerStore {
       where: {
         ...(taskId !== undefined ? { taskId } : {}),
         ...(status !== undefined ? { status } : {}),
+        // EXACT owner match: ownerless legacy rows never satisfy an owner.
+        ...(validatedList.ownerId !== null ? { ownerId: validatedList.ownerId } : {}),
       },
       orderBy: validatedList.order === 'newest'
         ? [{ createdAt: 'desc' }, { id: 'desc' }]
@@ -494,6 +594,9 @@ export class PrismaSchedulerStore implements SchedulerStore {
         if (!row) {
           throw new SchedulerNotFoundError(`agent task execution ${validated.id} not found`);
         }
+        // Owner guard BEFORE the CAS: a wrong owner reads as 404 (no status
+        // or attempt oracle). Ownerless legacy rows never satisfy any owner.
+        enforceRowOwner(row, validated.expectedOwnerId);
         const execution = mapExecution(row);
         // Atomic compare-and-set: the row lock above serializes concurrent
         // candidates, so exactly one wins and every loser gets this conflict.
@@ -516,7 +619,11 @@ export class PrismaSchedulerStore implements SchedulerStore {
         return mapExecution(updated);
       });
     } catch (cause) {
-      throw asConflictOrOriginal(cause, `agent task execution ${validated.id} concurrent claim conflict`);
+      throw asNotFoundOrConflict(
+        cause,
+        `agent task execution ${validated.id} concurrent claim conflict`,
+        `agent task execution ${validated.id} not found`,
+      );
     }
   }
 
@@ -531,6 +638,10 @@ export class PrismaSchedulerStore implements SchedulerStore {
         if (!row) {
           throw new SchedulerNotFoundError(`agent task execution ${validated.id} not found`);
         }
+        // Owner guard BEFORE the CAS: a wrong owner reads as 404 (no status
+        // oracle, no idempotent-repeat oracle). Ownerless legacy rows never
+        // satisfy any expected owner.
+        enforceRowOwner(row, validated.expectedOwnerId);
         const execution = mapExecution(row);
         const { target } = validated;
 
@@ -577,7 +688,11 @@ export class PrismaSchedulerStore implements SchedulerStore {
         return mapExecution(updated);
       });
     } catch (cause) {
-      throw asConflictOrOriginal(cause, `agent task execution ${validated.id} concurrent mark conflict`);
+      throw asNotFoundOrConflict(
+        cause,
+        `agent task execution ${validated.id} concurrent mark conflict`,
+        `agent task execution ${validated.id} not found`,
+      );
     }
   }
 }

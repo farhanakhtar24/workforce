@@ -1,7 +1,14 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { WorkspaceGate } from '@/components/WorkspaceShell';
+import { Loader2, ShieldCheck } from 'lucide-react';
+import {
+  fetchSettings,
+  patchPersonalMemory,
+  PERSONAL_MEMORY_EXPLANATION,
+  PERSONAL_MEMORY_SCOPE_NOTE,
+} from '@/lib/settings';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -66,12 +73,13 @@ export function Memory(): React.ReactElement {
   const createToken = useRef(0);
 
   return (
-    <WorkspaceShell
+    <WorkspaceGate
       active="memory"
       eyebrow="Knowledge"
       title="Memory"
       description="The blocks agents remember — create, browse, search, relate and compact them. Embeddings run server-side; this page only reads and lists."
     >
+      <PersonalMemorySetting apiBaseUrl={apiBaseUrl} />
       <CreatePanel
         apiBaseUrl={apiBaseUrl}
         onCreated={(block) => {
@@ -82,7 +90,7 @@ export function Memory(): React.ReactElement {
       <BrowsePanel apiBaseUrl={apiBaseUrl} created={created} />
       <SearchPanel apiBaseUrl={apiBaseUrl} />
       <CompactPanel apiBaseUrl={apiBaseUrl} />
-    </WorkspaceShell>
+    </WorkspaceGate>
   );
 }
 
@@ -978,6 +986,97 @@ function CompactPanel({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactElemen
           </p>
         )}
       </Form>
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Personal memory setting (per-user opt-in; API-managed)              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Personal-memory opt-in (Farhan's request C): lives ON the Memory page, not
+ * a new settings page. GET loads the server value (default false is the safe
+ * opt-out); toggling PATCHes immediately with saving → saved/error states.
+ * No retro-import claims: capture applies to completed turns after
+ * enablement, and relevant memories are used as UNTRUSTED context.
+ */
+function PersonalMemorySetting({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactElement {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const seqRef = useRef(0);
+
+  useEffect(() => {
+    const seq = ++seqRef.current;
+    void fetchSettings({ apiBaseUrl }).then((result) => {
+      if (seq !== seqRef.current) return; // superseded
+      if (result.ok) {
+        setEnabled(result.settings.personalMemoryEnabled);
+        setError(null);
+      } else {
+        setError(result.error);
+      }
+    });
+  }, [apiBaseUrl]);
+
+  const toggle = async (): Promise<void> => {
+    if (enabled === null || saving) return;
+    const seq = ++seqRef.current;
+    const next = !enabled;
+    setSaving(true);
+    setSaved(false);
+    setError(null);
+    const result = await patchPersonalMemory({ apiBaseUrl, personalMemoryEnabled: next });
+    if (seq !== seqRef.current) return;
+    setSaving(false);
+    if (result.ok) {
+      setEnabled(result.settings.personalMemoryEnabled);
+      setSaved(true);
+    } else {
+      setError(result.error);
+    }
+  };
+
+  return (
+    <Card aria-labelledby="memory-personal-heading" className="gap-3 px-4 py-4 sm:px-5 sm:py-5">
+      <h2 id="memory-personal-heading" className="m-0 flex items-center gap-2 text-base font-semibold tracking-tight">
+        <ShieldCheck className="size-4 text-primary" aria-hidden="true" />
+        Personal memory
+      </h2>
+      <div className="flex items-start gap-3">
+        <input
+          id="memory-personal-toggle"
+          type="checkbox"
+          className="mt-0.5 size-4 shrink-0 accent-primary"
+          aria-label="Enable personal memory: store durable observations from completed chats and use up to 3 relevant memories as untrusted context"
+          checked={enabled === true}
+          disabled={enabled === null || saving}
+          onChange={(event) => void toggle()}
+        />
+        <div className="min-w-0 text-sm">
+          <Label htmlFor="memory-personal-toggle" className="font-normal">
+            Store observations from completed chats
+          </Label>
+          <p className="m-0 text-[0.82rem] leading-snug text-muted-foreground">{PERSONAL_MEMORY_EXPLANATION}</p>
+          <p className="m-0 text-xs leading-snug text-muted-foreground">{PERSONAL_MEMORY_SCOPE_NOTE}</p>
+        </div>
+      </div>
+      <div className="flex min-h-5 flex-wrap items-center gap-2" role="status" aria-live="polite">
+        {saving && (
+          <p className="m-0 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+            Saving…
+          </p>
+        )}
+        {!saving && saved && <p className="m-0 text-xs text-emerald-700 dark:text-emerald-300">Saved.</p>}
+        {error !== null && (
+          <p role="alert" className="m-0 text-xs text-red-800 dark:text-red-200">
+            {error}
+          </p>
+        )}
+      </div>
     </Card>
   );
 }

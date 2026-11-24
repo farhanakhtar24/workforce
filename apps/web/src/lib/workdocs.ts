@@ -32,7 +32,7 @@ import {
   UUID_PATTERN,
   truncateMemoryText,
 } from './memory';
-import { isSafeChatId } from './api';
+import { isSafeChatId, browserApiFetch, requestAuthError } from './api';
 
 /** The UI always talks to the doc-owning agent's route namespace. */
 export const WORK_DOC_SLUG = 'orchestrator';
@@ -601,7 +601,7 @@ export async function requestWorkJson(options: {
   fallbackError: string;
   fetchImpl?: WorkFetch;
 }): Promise<WorkRequestResult> {
-  const { url, method, body, fallbackError, fetchImpl = fetch } = options;
+  const { url, method, body, fallbackError, fetchImpl = browserApiFetch } = options;
   const init: NonNullable<Parameters<WorkFetch>[1]> = {
     method,
     cache: 'no-store',
@@ -625,6 +625,8 @@ export async function requestWorkJson(options: {
       raw = null;
     }
     if (response.ok) return { ok: true, status: response.status ?? 0, body: raw };
+    const authError = requestAuthError(response.status ?? 0);
+    if (authError !== null) return { ok: false, error: authError };
     return { ok: false, error: extractApiErrorMessage(raw, fallbackError) };
   } catch {
     return { ok: false, error: fallbackError };

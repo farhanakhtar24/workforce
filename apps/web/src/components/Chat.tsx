@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { Loader2, Send, Sparkles, WifiOff } from 'lucide-react';
+import { GitBranch, Loader2, Send, Sparkles, Undo2, WifiOff } from 'lucide-react';
 import {
   buildReconnectRequest,
   buildSendRequest,
@@ -25,6 +25,7 @@ import {
   type WebAgentMode,
   type WebAgentSlug,
 } from '@/lib/agents';
+import { browserChatFetch } from '@/lib/api';
 import {
   isWorkDocId,
   workDocPagePath,
@@ -52,7 +53,7 @@ import {
 } from '@/lib/parts';
 import { createSubmissionGate } from '@/lib/submitgate';
 import { AgentAvatar } from '@/components/AgentAvatar';
-import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { WorkspaceGate } from '@/components/WorkspaceShell';
 import { MarkdownText } from '@/components/MarkdownText';
 import { agentLabel, chatSuggestions } from '@/lib/workspace';
 import {
@@ -66,6 +67,39 @@ import {
   progressLabel,
 } from '@/lib/chat-progress';
 import { CHATS_CHANGED_EVENT } from '@/lib/recent-chats';
+import {
+  fetchChatModel,
+  fetchModelCatalog,
+  fetchModelDetails,
+  formatModelDetailLines,
+  MODEL_CATALOG_UNAVAILABLE,
+  MODEL_SELECTION_ERROR,
+  MODEL_FIELD_UNKNOWN,
+  putChatModel,
+  type ModelCatalogResult,
+  type ModelDetailsInfo,
+  type ModelInfo,
+} from '@/lib/models';
+import {
+  fetchChatUsage,
+  formatUsageBucket,
+  formatUsageCost,
+  formatUsageTotals,
+  usageFromMetadata,
+  type UsageSummary,
+} from '@/lib/chat-usage';
+import {
+  branchChat,
+  branchDestinationHref,
+  canTriggerChatMutations,
+  CHAT_REWIND_ACTIVE,
+  CHAT_REWIND_ERROR,
+  CHAT_REWIND_NOT_FOUND,
+  messagePreviewText,
+  notifyChatsChanged,
+  rewindChat,
+  rewindLocalSlice,
+} from '@/lib/chat-mutations';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { NativeSelect } from '@/components/ui/native-select';
@@ -123,6 +157,9 @@ export function Chat({
     () =>
       new DefaultChatTransport<WorkforceUIMessage>({
         api: `${apiBaseUrl}/api/agents/${agent}/chat`,
+        // Session cookies on every send + resume request (the API is
+        // session-authenticated; CORS is credentials-safe).
+        fetch: browserChatFetch,
         prepareSendMessagesRequest: ({ id, messages }) => {
           // Documented body: exactly `{ id, message, mode }` with only the
           // newest user UIMessage, plus the exact idempotency header (API
@@ -147,7 +184,7 @@ export function Chat({
     [apiBaseUrl, agent, mode],
   );
 
-  const { messages, sendMessage, status, error, clearError } = useChat({
+  const { messages, sendMessage, setMessages, status, error, clearError } = useChat({
     id: chatId,
     messages: initialMessages,
     transport,
@@ -332,6 +369,34 @@ export function Chat({
   const stageLine =
     busy && progress !== null ? progressLabel(progress) : statusText;
 
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const usageSeqRef = useRef(0);
+  const usageLoadingRef = useRef(false);
+
+  const loadUsage = useCallback(async (): Promise<void> => {
+    if (usageLoadingRef.current) return; // sequence guard: never overlap
+    usageLoadingRef.current = true;
+    const seq = ++usageSeqRef.current;
+    const result = await fetchChatUsage({ apiBaseUrl, slug: agent, chatId });
+    if (seq !== usageSeqRef.current) {
+      usageLoadingRef.current = false;
+      return;
+    }
+    usageLoadingRef.current = false;
+    if (result.ok) {
+      setUsage(result.summary);
+      setUsageError(null);
+    } else {
+      // Non-fatal and honest: the panel shows the fixed safe reason.
+      setUsageError(result.error);
+    }
+  }, [apiBaseUrl, agent, chatId]);
+
+  useEffect(() => {
+    void loadUsage();
+  }, [loadUsage]);
+
   // One real-data refresh per settled generation: the history region
   // (RecentChats) listens for this event. Fired once for ready/error settles
   // that left messages — never per token, never on a quiet mount.
@@ -345,8 +410,218 @@ export function Chat({
     hadBusyRef.current = false;
     if (messages.length > 0) {
       window.dispatchEvent(new CustomEvent(CHATS_CHANGED_EVENT));
+      // Usage refreshes once per settled turn (never per token).
+      void loadUsage();
     }
   }, [busy, messages]);
+
+  /* ------------------------------------------------------------------ */
+  /* Message mutations (branch / rewind)                                  */
+  /* ------------------------------------------------------------------ */
+
+  // Mutations are disabled while busy or HITL-pending (pure helper, tested).
+  const mutationsAllowed = canTriggerChatMutations({ busy, pendingAsk: pendingAsk !== null });
+  const [mutating, setMutating] = useState(false);
+  // The destructive rewind always confirms: who is selected, what stays and
+  // what goes, and that raw bytes of kept messages are untouched.
+  const [rewindTarget, setRewindTarget] = useState<{ messageIndex: number } | null>(null);
+  const rewindDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  const openRewind = useCallback((messageIndex: number): void => {
+    setRewindTarget({ messageIndex });
+    // The dialog is always mounted, so showModal() is safe synchronously —
+    // same as the working RecentChats pattern (rAF was unreliable in the
+    // real browser and never opened the confirmation).
+    rewindDialogRef.current?.showModal();
+  }, []);
+
+  const closeRewind = useCallback((): void => {
+    if (mutating) return;
+    rewindDialogRef.current?.close();
+    setRewindTarget(null);
+  }, [mutating]);
+
+  const startBranch = useCallback(
+    async (messageIndex: number): Promise<void> => {
+      if (!mutationsAllowed || mutating) return;
+      const target = messages[messageIndex];
+      if (target === undefined) return;
+      setMutating(true);
+      try {
+        // Cryptographically random destination id; the API rejects a
+        // destination collision with a fixed 409 copy if it ever collides.
+        const newChatId = crypto.randomUUID();
+        const result = await branchChat({
+          apiBaseUrl,
+          slug: agent,
+          chatId,
+          messageId: target.id,
+          newChatId,
+        });
+        if (result.ok) {
+          notifyChatsChanged();
+          // Canonical same-agent/same-mode destination; client-side
+          // navigation mounts a fresh useChat there (new transcript).
+          void router.push(branchDestinationHref(result.destinationChatId, agent, mode));
+          return;
+        }
+        // Fixed mutation error surfaced through the existing chat error chip.
+        setMutationError(result.error);
+      } finally {
+        setMutating(false);
+      }
+    },
+    [mutationsAllowed, mutating, messages, apiBaseUrl, agent, chatId, mode, router],
+  );
+
+  const confirmRewind = useCallback(async (): Promise<void> => {
+    if (rewindTarget === null || mutating) return;
+    const target = messages[rewindTarget.messageIndex];
+    if (target === undefined) return;
+    setMutating(true);
+    try {
+      const result = await rewindChat({
+        apiBaseUrl,
+        slug: agent,
+        chatId,
+        messageId: target.id,
+      });
+      if (result.ok) {
+        rewindDialogRef.current?.close();
+        setRewindTarget(null);
+        // Clean local rebuild: `kept` counts the exact server-side remainder,
+        // so trimming local state to the same prefix guarantees useChat never
+        // retains deleted messages (raw bytes intact server-side). This is
+        // the in-place remount of the SAME chat id — no extra request needed.
+        setMessages(rewindLocalSlice(messages, result.kept));
+        // The history row's preview/count changed for this chat.
+        notifyChatsChanged();
+        return;
+      }
+      setMutationError(result.error);
+      if (result.error === CHAT_REWIND_ACTIVE || result.error === CHAT_REWIND_NOT_FOUND || result.error === CHAT_REWIND_ERROR) {
+        rewindDialogRef.current?.close();
+        setRewindTarget(null);
+      }
+    } finally {
+      setMutating(false);
+    }
+  }, [rewindTarget, mutating, messages, apiBaseUrl, agent, chatId]);
+
+  const [mutationError, setMutationError] = useState<string | null>(null);
+
+  /* ------------------------------------------------------------------ */
+  /* Model catalog + per-chat model selection                            */
+  /* ------------------------------------------------------------------ */
+
+  const [catalog, setCatalog] = useState<ModelCatalogResult | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const currentModelRef = useRef(0);
+  const [currentModel, setCurrentModel] = useState<string | null>(null);
+  const [modelSaving, setModelSaving] = useState(false);
+  const detailsCacheRef = useRef(new Map<string, ModelDetailsInfo>());
+  const detailsSeqRef = useRef(0);
+  const [detailModelId, setDetailModelId] = useState<string | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+
+  const loadCatalog = useCallback(async (): Promise<void> => {
+    const seq = ++currentModelRef.current;
+    setCatalogLoading(true);
+    const result = await fetchModelCatalog({ apiBaseUrl });
+    if (seq !== currentModelRef.current) return;
+    setCatalogLoading(false);
+    setCatalog(result.ok ? result : { ok: false, error: result.error, status: result.status });
+  }, [apiBaseUrl]);
+
+  const loadCurrentModel = useCallback(async (): Promise<void> => {
+    const result = await fetchChatModel({ apiBaseUrl, slug: agent, chatId });
+    if (result.ok) setCurrentModel(result.modelId);
+  }, [apiBaseUrl, agent, chatId]);
+
+  useEffect(() => {
+    void loadCatalog();
+    void loadCurrentModel();
+  }, [loadCatalog, loadCurrentModel]);
+
+  const applyModel = useCallback(
+    async (modelId: string): Promise<void> => {
+      if (modelSaving) return;
+      setModelSaving(true);
+      try {
+        const result = await putChatModel({ apiBaseUrl, slug: agent, chatId, modelId });
+        if (result.ok) {
+          setCurrentModel(result.modelId);
+          loadCurrentModel();
+          setModelSaving(false);
+          return;
+        }
+        setMutationError(result.error);
+        setCurrentModel(null);
+        setModelSaving(false);
+        void loadCurrentModel();
+      } catch {
+        setMutationError(MODEL_SELECTION_ERROR);
+        setModelSaving(false);
+      }
+    },
+    [modelSaving, apiBaseUrl, agent, chatId, loadCurrentModel],
+  );
+
+  // Lazy details: fetched on hover AND keyboard focus of the model select or
+  // the details affordance, cached per model id, request-sequence guarded.
+  const ensureModelDetails = useCallback(
+    (modelId: string): void => {
+      if (detailsCacheRef.current.has(modelId)) {
+        setDetailModelId(modelId);
+        setDetailsLoading(false);
+        return;
+      }
+      const seq = ++detailsSeqRef.current;
+      setDetailModelId(modelId);
+      setDetailsLoading(true);
+      void fetchModelDetails({ apiBaseUrl, modelId }).then((result) => {
+        if (seq !== detailsSeqRef.current) return; // superseded
+        if (result.ok) {
+          detailsCacheRef.current.set(modelId, result.details);
+        } else {
+          detailsCacheRef.current.set(modelId, {
+            modelId,
+            contextLength: null,
+            capabilities: null,
+            parameterSize: null,
+            thinking: null,
+            pricing: null,
+          });
+        }
+        setDetailsLoading(false);
+      });
+    },
+    [apiBaseUrl],
+  );
+
+  const activeDetails = detailModelId !== null ? (detailsCacheRef.current.get(detailModelId) ?? null) : null;
+  const activeModelInfo: ModelInfo | null =
+    detailModelId !== null
+      ? (catalog?.ok
+          ? (catalog.models.find((m) => m.id === detailModelId) ?? null)
+          : null)
+      : null;
+  const detailLines = formatModelDetailLines({
+    modelId: detailModelId ?? '',
+    details: activeDetails,
+    locked: activeModelInfo?.locked,
+    lockReason: activeModelInfo?.lockReason ?? null,
+    modifiedAt: activeModelInfo?.modifiedAt ?? null,
+  });
+
+  /* ------------------------------------------------------------------ */
+  /* Session usage (exact totals, honest cost)                           */
+  /* ------------------------------------------------------------------ */
+
+
+  const rewindTargetMessage = rewindTarget !== null ? messages[rewindTarget.messageIndex] : undefined;
+  const rewindPreview = rewindTargetMessage !== undefined ? messagePreviewText(rewindTargetMessage.parts) : '';
+
 
   // THE single composer instance (ids/aria/handlers unchanged): rendered
   // centered inside the greeting block on an empty transcript, and pinned in
@@ -405,7 +680,7 @@ export function Chat({
   );
 
   return (
-    <WorkspaceShell
+    <WorkspaceGate
       variant="chat"
       active="chat"
       eyebrow="Agent workspace"
@@ -478,6 +753,135 @@ export function Chat({
             ))}
           </div>
         </fieldset>
+        {/* Compact, accessible model picker (per-chat model; applies to the
+            NEXT generation only — running streams keep their started model).
+            Disabled while busy/HITL/saving; locked catalog rows are disabled
+            with the server's value-free lock reason on the row. */}
+        <div className="inline-flex min-w-0 items-center gap-1.5">
+          <NativeSelect
+            id="chat-model"
+            name="chat-model"
+            size="sm"
+            className="w-auto max-w-56 rounded-full"
+            aria-label="Model for the next reply"
+            title="Model for the next reply"
+            value={catalog?.ok && currentModel !== null && catalog.models.some((m) => m.id === currentModel) ? currentModel : (currentModel ?? '')}
+            disabled={busy || pendingAsk !== null || modelSaving || !catalog?.ok}
+            onMouseEnter={() => {
+              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
+            }}
+            onFocus={() => {
+              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
+            }}
+            onChange={(event) => {
+              const next = event.target.value;
+              if (next !== '' && next !== currentModel) void applyModel(next);
+            }}
+          >
+            {!catalog?.ok && catalogLoading === false && !modelSaving ? (
+              <option value="">{catalog?.ok === false ? catalog.error : ''}</option>
+            ) : catalogLoading ? (
+              <option value="">Loading models…</option>
+            ) : (
+              <>
+                <option value="" disabled>
+                  Model for the next reply…
+                </option>
+                {catalog?.ok &&
+                  catalog.models.map((model) => (
+                    <option
+                      key={model.id}
+                      value={model.id}
+                      disabled={model.locked}
+                      title={model.locked ? model.lockReason ?? undefined : undefined}
+                    >
+                      {model.name}
+                      {model.locked ? ' (locked)' : ''}
+                    </option>
+                  ))}
+              </>
+            )}
+          </NativeSelect>
+          {modelSaving && <span className="text-[0.7rem] text-muted-foreground">Saving…</span>}
+        </div>
+        <details
+          className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground"
+          onToggle={(event) => {
+            const open = (event.currentTarget as HTMLDetailsElement).open;
+            if (open && currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
+          }}
+        >
+          <summary
+            className="cursor-pointer list-none font-medium whitespace-nowrap"
+            onMouseEnter={() => {
+              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
+            }}
+            onFocus={() => {
+              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
+            }}
+          >
+            Model details
+          </summary>
+          <div className="mt-2 min-w-[20rem] max-w-[24rem] border-t pt-2 text-left text-[0.8rem]">
+            {detailsLoading && <p className="m-0">Loading model details…</p>}
+            {!detailsLoading && (
+              <>
+                <p className="m-0 mb-1 font-medium text-foreground">{detailModelId ?? ''}</p>
+                {activeModelInfo?.locked === true && (
+                  <p className="m-0 mb-1 text-xs text-destructive">{detailLines.lockReason ?? ''}</p>
+                )}
+                <ul className="m-0 list-none p-0" aria-label="Model details">
+                  <li className="m-0 py-0.5">{detailLines.parameterSize}</li>
+                  <li className="m-0 py-0.5">{detailLines.contextLength}</li>
+                  <li className="m-0 py-0.5">{detailLines.capabilities}</li>
+                  {detailLines.modifiedAt !== null && (
+                    <li className="m-0 py-0.5">Modified: {detailLines.modifiedAt}</li>
+                  )}
+                  {detailLines.thinkingText !== null && <li className="m-0 py-0.5">{detailLines.thinkingText}</li>}
+                </ul>
+                <p className="m-0 pb-1">{MODEL_FIELD_UNKNOWN} means the model does not report that statistic.</p>
+              </>
+            )}
+          </div>
+        </details>
+        <details
+          className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground"
+          onToggle={(event) => {
+            const open = (event.currentTarget as HTMLDetailsElement).open;
+            if (open) void loadUsage();
+          }}
+        >
+          <summary className="cursor-pointer list-none font-medium whitespace-nowrap">Session usage</summary>
+          <div className="mt-2 min-w-[20rem] max-w-[24rem] border-t pt-2 text-left text-[0.8rem]">
+            {usage !== null ? (
+              <>
+                <p className="m-0 py-0.5" aria-label="Exact token totals">
+                  {formatUsageTotals(usage)}
+                </p>
+                {usage.models.length > 0 && (
+                  <ul className="m-0 list-none p-0">
+                    {usage.models.map((bucket) => (
+                      <li key={bucket.modelId} className="m-0 py-0.5">
+                        {formatUsageBucket(bucket)}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="m-0 py-0.5">
+                  {(() => {
+                    const cost = formatUsageCost(usage);
+                    if (cost.kind === 'estimated') return cost.value;
+                    return cost.text;
+                  })()}
+                </p>
+              </>
+            ) : (
+              <p role="status" aria-live="polite" className="m-0 py-0.5">
+                {usageError !== null ? `${usageError} Retry by reopening.` : 'Loading usage…'}
+              </p>
+            )}
+          </div>
+        </details>
         <details className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground">
           <summary className="cursor-pointer list-none font-medium whitespace-nowrap">
             What {agentLabel(agent)} can do
@@ -551,13 +955,14 @@ export function Chat({
             </p>
           </div>
         ) : (
+          <>
           <ol className="m-0 flex list-none flex-col gap-5 p-0">
             {messages.map((message, messageIndex) => (
               <li
                 key={message.id}
                 className={cn(
-                  'min-w-0',
-                  message.role === 'user' && 'flex flex-col items-end',
+                  'group/msg min-w-0 flex flex-col',
+                  message.role === 'user' && 'items-end',
                 )}
               >
                 {message.role === 'assistant' ? (
@@ -566,6 +971,31 @@ export function Chat({
                     <span className="text-[0.7rem] font-semibold tracking-[0.06em] text-muted-foreground uppercase">
                       Assistant
                     </span>
+                    {(() => {
+                      const usage = usageFromMetadata(message.metadata);
+                      if (usage === null) return null;
+                      return (
+                        <details className="ml-auto">
+                          <summary
+                            className="cursor-pointer list-none rounded-full border px-2 py-0.5 text-[0.62rem] text-muted-foreground"
+                            title="Per-message token usage and model"
+                          >
+                            {usage.modelId !== null ? `${usage.modelId} · ` : ''}
+                            {usage.inputTokens.toLocaleString('en-US')} / {usage.outputTokens.toLocaleString('en-US')}
+                            {usage.totalTokens !== null ? ` · ${usage.totalTokens.toLocaleString('en-US')}` : ''}
+                          </summary>
+                          <div className="mt-1 rounded-md border bg-card px-2.5 py-1.5 text-[0.72rem] text-muted-foreground">
+                            <p className="m-0">Input: {usage.inputTokens.toLocaleString('en-US')}</p>
+                            <p className="m-0">Output: {usage.outputTokens.toLocaleString('en-US')}</p>
+                            {usage.totalTokens !== null && (
+                              <p className="m-0">Total: {usage.totalTokens.toLocaleString('en-US')}</p>
+                            )}
+                            {usage.modelId !== null && <p className="m-0">Model: {usage.modelId}</p>}
+                            {usage.modelId === null && <p className="m-0">Model not reported</p>}
+                          </div>
+                        </details>
+                      );
+                    })()}
                   </div>
                 ) : (
                   <span className="mb-1 text-[0.7rem] font-semibold tracking-[0.06em] text-muted-foreground uppercase">
@@ -599,9 +1029,48 @@ export function Chat({
                     </div>
                   )}
                 </div>
+                {/* Compact mutation actions: hover/focus reveal on pointer
+                    devices, always reachable (focusable) on touch. Branch is
+                    non-destructive; rewind appears on USER messages and is
+                    confirmed before destroying anything. */}
+                <div
+                  className={cn(
+                    'mt-1 flex items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-focus-within/msg:opacity-100 sm:group-hover/msg:opacity-100',
+                    message.role === 'user' ? 'justify-end' : 'justify-start',
+                  )}
+                >
+                  <button
+                    type="button"
+                    className="inline-flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    aria-label="Branch from here — copies this message and everything before it into a new chat; this chat stays intact."
+                    title="Branch from here — new chat, original stays intact"
+                    disabled={!mutationsAllowed || mutating}
+                    onClick={() => void startBranch(messageIndex)}
+                  >
+                    <GitBranch size={13} aria-hidden="true" />
+                  </button>
+                  {message.role === 'user' && (
+                    <button
+                      type="button"
+                      className="inline-flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+                      aria-label="Rewind here — keeps this message, deletes everything after it. Asking for confirmation."
+                      title="Rewind here — deletes everything after this message"
+                      disabled={!mutationsAllowed || mutating}
+                      onClick={() => openRewind(messageIndex)}
+                    >
+                      <Undo2 size={13} aria-hidden="true" />
+                    </button>
+                  )}
+                </div>
               </li>
             ))}
           </ol>
+          {/* Helper copy for the message-level controls (kept to one line). */}
+          <p className="m-0 text-[0.7rem] text-muted-foreground">
+            Hover a message for Branch / Rewind — branching copies the transcript into a new chat and
+            keeps this one intact; to replace an answer, rewind to its question and send an edited resend.
+          </p>
+          </>
         )}
         {busy && progress !== null && (
           <div
@@ -721,7 +1190,78 @@ export function Chat({
 
         {messages.length > 0 && composerForm}
       </div>
-    </WorkspaceShell>
+
+      {mutationError !== null && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-start justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+        >
+          <p className="m-0">{mutationError}</p>
+          <button
+            type="button"
+            className="shrink-0 rounded-md border border-amber-400 px-2 py-0.5 text-xs font-medium hover:bg-amber-100 dark:hover:bg-amber-900/50"
+            onClick={() => setMutationError(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Accessible native rewind confirmation: names the selected message,
+          states keep/remove semantics and the raw-bytes guarantee. */}
+      <dialog
+        ref={rewindDialogRef}
+        aria-labelledby="rewind-title"
+        className="m-auto w-[30rem] max-w-[92vw] rounded-xl border border-border bg-card p-5 text-card-foreground shadow-lg backdrop:bg-black/40"
+        onClick={(event) => {
+          if (event.target === rewindDialogRef.current) closeRewind();
+        }}
+        onCancel={(event) => {
+          event.preventDefault();
+          closeRewind();
+        }}
+      >
+        {rewindTarget !== null && rewindTargetMessage !== undefined && (
+          <>
+            <h2 id="rewind-title" className="m-0 flex items-center gap-2 text-[1rem] font-semibold">
+              <Undo2 className="size-4 text-destructive" aria-hidden="true" />
+              Rewind the transcript to here?
+            </h2>
+            <p className="mt-2 mb-0 text-sm leading-snug">
+              Selected message ({rewindTargetMessage.role === 'user' ? 'your message' : 'assistant reply'}):
+            </p>
+            <p className="mt-1 rounded-md border bg-muted px-2.5 py-1.5 text-sm">
+              {rewindPreview !== '' ? rewindPreview : '(this message has no visible text)'}
+            </p>
+            <p className="mt-3 mb-0 text-[0.85rem] leading-snug">
+              Keeps this message and everything before it — <strong>everything after it is deleted</strong>.
+              Kept messages keep their exact raw content (raw bytes intact). This cannot be undone;
+              artifacts like documents, delegations and memory are not affected. To replace a disliked
+              answer: rewind at its question, then send an edited resend.
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                className="inline-flex h-8 items-center rounded-md border border-input px-3 text-[0.8rem] font-medium hover:bg-accent"
+                onClick={closeRewind}
+                disabled={mutating}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-destructive px-3 text-[0.8rem] font-semibold text-destructive-foreground transition-opacity disabled:opacity-60"
+                onClick={() => void confirmRewind()}
+                disabled={mutating}
+              >
+                {mutating && <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />}
+                Rewind here
+              </button>
+            </div>
+          </>
+        )}
+      </dialog>
+    </WorkspaceGate>
   );
 }
 
@@ -920,11 +1460,16 @@ function DelegatePartView({ part }: { part: DelegateTaskToolPart }): React.React
   const outputView = part.state === 'output-available' ? parseDelegateOutput(part.output, target) : null;
   return (
     <div className="chat-tool" data-state={part.state}>
-      <span className="chat-tool-name">delegate_task</span>
+      <span className="chat-tool-name">Specialist sub-agent · delegate_task</span>
       {inputView.ok ? (
         <>
-          <p className="chat-tool-line">
-            {inputView.view.mode !== null ? `${inputView.view.mode} → ${inputView.view.targetAgent ?? '?'}` : inputView.view.targetAgent ?? '?'}
+          <p className="chat-tool-line flex items-center gap-1.5">
+            <span className="font-medium">Orchestrator</span>
+            <span aria-hidden="true">→</span>
+            <span className="font-medium">{inputView.view.targetAgent ?? '?'}</span>
+            {inputView.view.mode !== null && (
+              <span className="text-muted-foreground">({inputView.view.mode})</span>
+            )}
           </p>
           <p className="chat-tool-detail">{inputView.view.taskPreview}</p>
         </>

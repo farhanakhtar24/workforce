@@ -205,6 +205,27 @@ export const compactPathInputSchema = z.strictObject({
   path: memoryPathSchema,
 });
 
+/**
+ * Input for `MemoryService.purgeDerivedChatMemory`: exact scope + exact path,
+ * with the optional bounded `assistantMessageIds` narrowing (removed-message
+ * purge). Ids follow the API message-id contract (`[A-Za-z0-9_-]`, 1..64).
+ */
+export const purgeDerivedChatInputSchema = z.strictObject({
+  scope: memoryScopeSchema,
+  path: memoryPathSchema,
+  assistantMessageIds: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(64)
+        .regex(/^[A-Za-z0-9_-]{1,64}$/, 'assistantMessageIds entries must be 1..64 characters of A-Z a-z 0-9 _ -'),
+    )
+    .min(1)
+    .max(512)
+    .optional(),
+});
+
 // ---------------------------------------------------------------------------
 // Parsed (post-normalization) input types
 // ---------------------------------------------------------------------------
@@ -213,6 +234,8 @@ export type MemoryWriteBlockInput = z.input<typeof writeBlockInputSchema>;
 export type MemoryQueryBlocksInput = z.input<typeof queryBlocksInputSchema>;
 export type MemorySemanticSearchInput = z.input<typeof semanticSearchInputSchema>;
 export type MemoryCompactPathInput = z.input<typeof compactPathInputSchema>;
+export type MemoryPurgeDerivedInput = z.input<typeof purgeDerivedChatInputSchema>;
+export type ParsedPurgeDerivedInput = z.output<typeof purgeDerivedChatInputSchema>;
 
 // Output (parsed) shapes with defaults applied.
 export type ParsedWriteBlockInput = z.output<typeof writeBlockInputSchema>;

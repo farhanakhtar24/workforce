@@ -41,6 +41,7 @@ export {
 export {
   workDocIdSchema,
   workDocExternalIdSchema,
+  workDocOwnerIdSchema,
   workDocTypeSchema,
   workDocStatusSchema,
   workDocRevisionSourceSchema,
@@ -58,6 +59,7 @@ export {
   listWorkDocVersionsInputSchema,
   listWorkDocRevisionsInputSchema,
   addWorkDocLinkInputSchema,
+  workDocGetOptionsSchema,
   parseWorkDocInput,
   workDocIdentityChecks,
   type WorkDocCreateInput,
@@ -74,6 +76,7 @@ export {
   type ParsedWorkDocListVersionsInput,
   type ParsedWorkDocListRevisionsInput,
   type ParsedWorkDocAddLinkInput,
+  type ParsedWorkDocGetOptions,
 } from './schemas.js';
 
 export type {
@@ -89,6 +92,7 @@ export type {
   WorkDocStoreUpdate,
   WorkDocStoreRollback,
   WorkDocListParams,
+  WorkDocGetOptions,
   WorkDocHistoryListOptions,
   WorkDocLinkInsert,
 } from './store.js';

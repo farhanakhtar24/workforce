@@ -11,6 +11,7 @@ import { simulateReadableStream } from 'ai/test';
 import type { LanguageModelV3StreamPart } from '@ai-sdk/provider';
 
 import {
+  TEST_OWNER,
   createMockModel,
   mockUsage,
   postChat,
@@ -30,6 +31,7 @@ import {
   contextWindow,
 } from '../src/agents/delegation-context.js';
 import type { HostCapabilityDeps } from '../src/agents/host-capabilities.js';
+import type { AgentToolContext } from '../src/agents/host-capabilities.js';
 
 const signer = createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8'));
 
@@ -41,8 +43,12 @@ function emptyHostDeps(): HostCapabilityDeps {
   return { fetchFn: async () => new Response('{}'), baseUrl: 'http://workforce-test-internal', signer, delegationTimeoutMs: 120_000 };
 }
 
+function toolCtx(): AgentToolContext {
+  return { slug: 'orchestrator', chatId: 'c', parentMessageId: 'm', scope: 'default', ownerId: TEST_OWNER.userId, depth: 0 };
+}
+
 function toolNamesFor(slug: 'general' | 'orchestrator' | 'analyst' | 'researcher', mode: 'plan' | 'action', depth: number): string[] {
-  return prepareGeneration(emptyHostDeps(), { slug, mode, depth, chatId: 'c', parentMessageId: 'm' }).toolNames as string[];
+  return prepareGeneration(emptyHostDeps(), { slug, mode, depth, chatId: 'c', parentMessageId: 'm', ownerId: TEST_OWNER.userId }).toolNames as string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +102,7 @@ test('composition: validation toolset stays the FULL action set for plan/depth c
     depth: 2,
     chatId: 'c',
     parentMessageId: 'm',
+    ownerId: TEST_OWNER.userId,
   });
   assert.deepEqual(Object.keys(prepared.validationTools).sort(), ['ask_user', 'calculate', 'delegate_task', 'query_data', 'search_memory', 'write_doc']);
   // The generation toolset remains the composed (plan-filtered) one.
@@ -104,9 +111,9 @@ test('composition: validation toolset stays the FULL action set for plan/depth c
 });
 
 test('composition: system prompts come from the definitions; general stays promptless', () => {
-  const generalPrepared = prepareGeneration(emptyHostDeps(), { slug: 'general', mode: 'action', depth: 0, chatId: 'c', parentMessageId: 'm' });
+  const generalPrepared = prepareGeneration(emptyHostDeps(), { slug: 'general', mode: 'action', depth: 0, chatId: 'c', parentMessageId: 'm', ownerId: TEST_OWNER.userId });
   assert.equal(generalPrepared.systemPrompt, null);
-  const orchestratorPrepared = prepareGeneration(emptyHostDeps(), { slug: 'orchestrator', mode: 'action', depth: 0, chatId: 'c', parentMessageId: 'm' });
+  const orchestratorPrepared = prepareGeneration(emptyHostDeps(), { slug: 'orchestrator', mode: 'action', depth: 0, chatId: 'c', parentMessageId: 'm', ownerId: TEST_OWNER.userId });
   assert.equal(typeof orchestratorPrepared.systemPrompt, 'string');
   assert.ok((orchestratorPrepared.systemPrompt as string).includes('orchestrator'));
 });
@@ -256,7 +263,8 @@ test('invalid delegation header on a child chat is a fixed 400; impossible depth
       kind: 'delegation-child-chat',
       parentChatId: 'p',
       childChatId: 'c-hdr-1',
-      targetAgent: 'analyst',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'analyst',
       depth: 1,
       expiresAt: Date.now() + 60_000,
       deadline: Date.now() + 60_000,
@@ -276,7 +284,8 @@ test('invalid delegation header on a child chat is a fixed 400; impossible depth
       kind: 'delegation-child-chat',
       parentChatId: 'p',
       childChatId: 'c-hdr-2',
-      targetAgent: 'analyst',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'analyst',
       depth: 1,
       expiresAt: Date.now() - 1_000,
       deadline: Date.now() + 60_000,
@@ -294,7 +303,8 @@ test('invalid delegation header on a child chat is a fixed 400; impossible depth
       kind: 'delegation-child-chat',
       parentChatId: 'p',
       childChatId: 'c-hdr-3',
-      targetAgent: 'analyst',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'analyst',
       depth: 3,
       expiresAt: Date.now() + 60_000,
       deadline: Date.now() + 60_000,
@@ -312,7 +322,8 @@ test('invalid delegation header on a child chat is a fixed 400; impossible depth
       kind: 'delegation-child-chat',
       parentChatId: 'p',
       childChatId: 'c-hdr-4',
-      targetAgent: 'analyst',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'analyst',
       depth: 1,
       ...contextWindow(60_000),
     });
@@ -341,7 +352,8 @@ test('a verified child context composes the child agent at that depth (no delega
       kind: 'delegation-child-chat',
       parentChatId: 'parent-chat',
       childChatId: 'child-a1',
-      targetAgent: 'analyst',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'analyst',
       depth: 1,
       ...contextWindow(60_000),
     });

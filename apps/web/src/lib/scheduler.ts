@@ -33,7 +33,7 @@
  * clock; the API rejects any offset and this client never sends one).
  */
 import { extractApiErrorMessage, formatDateTime, truncateMemoryText, UUID_PATTERN } from './memory';
-import { isSafeChatId } from './api';
+import { browserApiFetch, isSafeChatId, requestAuthError } from './api';
 import {
   isAgentMode,
   isAgentSlug,
@@ -851,7 +851,7 @@ export async function requestSchedulerJson(options: {
   fallbackError: string;
   fetchImpl?: SchedulerFetch;
 }): Promise<SchedulerRequestResult> {
-  const { url, method, body, fallbackError, fetchImpl = fetch } = options;
+  const { url, method, body, fallbackError, fetchImpl = browserApiFetch } = options;
   const init: NonNullable<Parameters<SchedulerFetch>[1]> = {
     method,
     cache: 'no-store',
@@ -874,6 +874,8 @@ export async function requestSchedulerJson(options: {
       raw = null;
     }
     if (response.ok) return { ok: true, status: response.status ?? 0, body: raw };
+    const authError = requestAuthError(response.status ?? 0);
+    if (authError !== null) return { ok: false, status: response.status ?? 0, error: authError };
     return { ok: false, status: response.status ?? 0, error: extractApiErrorMessage(raw, fallbackError) };
   } catch {
     return { ok: false, status: 0, error: fallbackError };

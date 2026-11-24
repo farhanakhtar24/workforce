@@ -15,8 +15,10 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  enforceOwner,
   enforceOwnership,
   validateDocumentId,
+  validateGetOptions,
   validateHistoryOptions,
   validateLinkInsert,
   validateListParams,
@@ -27,6 +29,7 @@ import {
 } from '../validate.js';
 import { WorkDocConflictError, WorkDocNotFoundError } from '../errors.js';
 import type {
+  WorkDocGetOptions,
   WorkDocHistoryListOptions,
   WorkDocLinkInsert,
   WorkDocListParams,
@@ -89,6 +92,7 @@ export class InMemoryWorkDocStore implements WorkDocStore {
       content: validated.content,
       status: validated.status,
       version: 1,
+      ownerId: validated.ownerId,
       createdAt: createdAtIso,
       updatedAt: createdAtIso,
     };
@@ -118,10 +122,18 @@ export class InMemoryWorkDocStore implements WorkDocStore {
     return clone(document);
   }
 
-  async get(id: string): Promise<WorkDoc | null> {
+  async get(id: string, options?: WorkDocGetOptions): Promise<WorkDoc | null> {
     validateDocumentId(id);
+    const validatedOptions = validateGetOptions(options);
     const document = this.documents.get(id);
-    return document ? clone(document) : null;
+    if (!document) {
+      return null;
+    }
+    // Owner guard reads foreign/ownerless rows as absent — never an oracle.
+    if (validatedOptions.expectedOwnerId !== null && document.ownerId !== validatedOptions.expectedOwnerId) {
+      return null;
+    }
+    return clone(document);
   }
 
   async list(params: WorkDocListParams): Promise<readonly WorkDoc[]> {
@@ -138,6 +150,9 @@ export class InMemoryWorkDocStore implements WorkDocStore {
           return false;
         }
         if (validated.status !== null && document.status !== validated.status) {
+          return false;
+        }
+        if (validated.ownerId !== null && document.ownerId !== validated.ownerId) {
           return false;
         }
         return true;
@@ -160,7 +175,7 @@ export class InMemoryWorkDocStore implements WorkDocStore {
     if (!document) {
       throw new WorkDocNotFoundError(`work doc ${validated.id} not found`);
     }
-    enforceOwnership(document, validated.expectedScope, validated.expectedChatId);
+    enforceOwnership(document, validated.expectedScope, validated.expectedChatId, validated.expectedOwnerId);
     if (document.version !== validated.expectedVersion) {
       throw new WorkDocConflictError(
         `work doc ${validated.id} version is ${document.version}; expectedVersion ${validated.expectedVersion} is stale`,
@@ -220,7 +235,7 @@ export class InMemoryWorkDocStore implements WorkDocStore {
         `work doc ${validated.id} version is ${document.version}; expectedVersion ${validated.expectedVersion} is stale`,
       );
     }
-    enforceOwnership(document, validated.expectedScope, validated.expectedChatId);
+    enforceOwnership(document, validated.expectedScope, validated.expectedChatId, validated.expectedOwnerId);
     validateRollbackTarget(validated.toVersion, document.version);
 
     const history = this.versions.get(validated.id) ?? [];
@@ -270,9 +285,12 @@ export class InMemoryWorkDocStore implements WorkDocStore {
 
   async listVersions(documentId: string, options: WorkDocHistoryListOptions): Promise<readonly WorkDocVersion[]> {
     const validated = validateHistoryOptions(documentId, options);
-    if (!this.documents.has(documentId)) {
+    const document = this.documents.get(documentId);
+    if (!document) {
       throw new WorkDocNotFoundError(`work doc ${documentId} not found`);
     }
+    // Owner guard: foreign/ownerless documents read as 404 (no oracle).
+    enforceOwner(document, validated.expectedOwnerId);
     const rows = (this.versions.get(documentId) ?? []).slice();
     rows.sort((a, b) => (validated.order === 'newest' ? b.version - a.version : a.version - b.version));
     return rows.slice(0, validated.limit).map((row) => clone(row));
@@ -280,9 +298,11 @@ export class InMemoryWorkDocStore implements WorkDocStore {
 
   async listRevisions(documentId: string, options: WorkDocHistoryListOptions): Promise<readonly WorkDocRevision[]> {
     const validated = validateHistoryOptions(documentId, options);
-    if (!this.documents.has(documentId)) {
+    const document = this.documents.get(documentId);
+    if (!document) {
       throw new WorkDocNotFoundError(`work doc ${documentId} not found`);
     }
+    enforceOwner(document, validated.expectedOwnerId);
     const rows = (this.revisions.get(documentId) ?? []).slice();
     rows.sort((a, b) => {
       const delta = validated.order === 'newest' ? b.toVersion - a.toVersion : a.toVersion - b.toVersion;
@@ -306,7 +326,7 @@ export class InMemoryWorkDocStore implements WorkDocStore {
     if (!document) {
       throw new WorkDocNotFoundError(`work doc ${validated.documentId} not found`);
     }
-    enforceOwnership(document, validated.expectedScope, validated.expectedChatId);
+    enforceOwnership(document, validated.expectedScope, validated.expectedChatId, validated.expectedOwnerId);
 
     const key = `${validated.documentId}\u0000${validated.targetType}\u0000${validated.targetId}`;
     const existing = this.links.get(key);
@@ -327,11 +347,14 @@ export class InMemoryWorkDocStore implements WorkDocStore {
     return clone(link);
   }
 
-  async listLinks(documentId: string): Promise<readonly WorkDocLink[]> {
+  async listLinks(documentId: string, options?: WorkDocGetOptions): Promise<readonly WorkDocLink[]> {
     validateDocumentId(documentId);
-    if (!this.documents.has(documentId)) {
+    const validatedOptions = validateGetOptions(options);
+    const document = this.documents.get(documentId);
+    if (!document) {
       throw new WorkDocNotFoundError(`work doc ${documentId} not found`);
     }
+    enforceOwner(document, validatedOptions.expectedOwnerId);
     const rows = [...this.links.values()]
       .filter((link) => link.documentId === documentId)
       .sort((a, b) => {

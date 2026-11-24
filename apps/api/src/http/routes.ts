@@ -12,6 +12,7 @@
  */
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { UI_MESSAGE_STREAM_HEADERS, type UIMessage } from 'ai';
+import { z } from 'zod';
 import {
   ASK_USER_NO_ANSWER,
   IDEMPOTENCY_KEY_TTL_SECONDS,
@@ -25,11 +26,15 @@ import type { CreateChatTurnStreamOptions } from '../generation.js';
 import { createChatTurnStream, InvalidStoredChatError } from '../generation.js';
 import { agentTools, validateAndConvertMessages } from '../messages.js';
 import { sendJsonError, sendWebResponse } from '../http/adapter.js';
+import { AUTH_401_MESSAGE, ownerOf, type AuthOwner } from '../auth/owner.js';
+import { isBlockedModelId, isModelId, MODEL_LOCK_REASON, ModelCatalogUnavailableError, type ModelCatalogLike } from '../models/catalog.js';
+import { summarizeChatUsage } from '../usage/usage.js';
 import {
   chatRequestSchema,
   clientIdSchema,
   idempotencyKeySchema,
   isKnownSlug,
+  messageIdSchema,
   toUIMessageInput,
   type ChatMode,
 } from '../validation.js';
@@ -38,19 +43,35 @@ import {
   type DelegationContextSigner,
 } from '../agents/delegation-context.js';
 import { MAX_DELEGATION_DEPTH } from '@workforce/core';
+import type { MemoryService } from '@workforce/core/memory';
+import { userMemoryScope } from '@workforce/core/auth';
 import type { HostCapabilityDeps } from '../agents/host-capabilities.js';
 import { prepareGeneration } from '../agents/toolsets.js';
+import type { SettingsServiceLike } from '../settings/settings.js';
+import type { PersonalCaptureEnqueuer } from '../memory/personal-capture.js';
+import { personalChatPath } from '../memory/personal-capture.js';
+import { recallPersonalMemory, type PersonalRecallDeps } from '../memory/personal-recall.js';
 
 const IDEMPOTENCY_HEADER = 'Idempotency-Key';
 
 export interface ChatRoutesDeps {
-  config: Pick<ApiConfig, 'webOrigin'>;
+  config: Pick<ApiConfig, 'webOrigin' | 'blockedModelPrefixes' | 'modelPricing' | 'model'>;
   store: ChatStore;
   streamContext: StreamContext;
   /** Injected model (real Ollama-compatible model in `server.ts`, mock in tests). */
   model: CreateChatTurnStreamOptions['model'];
   background: CreateChatTurnStreamOptions['background'];
   logger: CreateChatTurnStreamOptions['logger'];
+  /**
+   * Pre-Phase 6 model composition. When absent, `deps.model` is used for every
+   * chat (exact legacy behavior; mock-model tests unchanged) and the
+   * `/api/models*` + per-chat `/model` routes are absent.
+   */
+  models?: {
+    readonly catalog: ModelCatalogLike;
+    readonly modelFor: (modelId: string) => CreateChatTurnStreamOptions['model'];
+    readonly defaultModelId: string;
+  };
   /**
    * Phase 4 agent runtime. When absent, only `general` is servable and every
    * other slug stays 404 (byte-compatible legacy surface for old callers).
@@ -61,7 +82,31 @@ export interface ChatRoutesDeps {
     /** Verifier for the internal delegation context header (mint happens in-process). */
     signer: DelegationContextSigner;
   };
+  /**
+   * Pre-Phase 6 opt-in personal memory. When absent: ZERO capture, ZERO
+   * recall, ZERO purge (exact legacy chat behavior). When present, all three
+   * are gated per owner by the explicit `personalMemoryEnabled` setting.
+   */
+  personal?: {
+    /** Settings read (per-owner opt-in gate). */
+    readonly settings: SettingsServiceLike;
+    /** Memory service read/write surfaces used by recall/purge. */
+    readonly memory: MemoryService;
+    /** Deterministic capture-job enqueuer (checked enablement → 1 job). */
+    readonly capture: PersonalCaptureEnqueuer;
+  };
 }
+
+/** The single model-id contract (server-side; catalog + routes share it). */
+const modelIdPatternSchema = z.string().regex(/^[A-Za-z0-9._:-]{1,80}$/, 'modelId must be 1-80 characters of A-Z a-z 0-9 . _ : -');
+
+/** POST /model body: strict { modelId } (exactly one field). */
+const modelBodySchema = z.strictObject({ modelId: modelIdPatternSchema });
+
+/** POST /branch body: strict { messageId, newChatId }. */
+const branchBodySchema = z.strictObject({ messageId: messageIdSchema, newChatId: clientIdSchema });
+/** POST /rewind body: strict { messageId }. */
+const rewindBodySchema = z.strictObject({ messageId: messageIdSchema });
 
 /** Runs an async handler, forwarding rejections to Express' error handling. */
 function asyncRoute(handler: (req: Request, res: Response, next: NextFunction) => Promise<void>): RequestHandler {
@@ -72,8 +117,18 @@ function asyncRoute(handler: (req: Request, res: Response, next: NextFunction) =
 
 const NO_STORE_HEADERS: Record<string, string> = { 'Cache-Control': 'no-store' };
 
-function chatRefFromRequest(slug: string, clientChatId: string): ChatRef {
-  return { slug, chatId: clientChatId };
+function chatRefFromRequest(ownerId: string, slug: string, clientChatId: string): ChatRef {
+  return { ownerId, slug, chatId: clientChatId };
+}
+
+/** Fixed 401 guard inside every chat handler (defense in depth vs middleware). */
+function ownerOr401(res: Response): AuthOwner | null {
+  const owner = ownerOf(res);
+  if (owner === null) {
+    sendJsonError(res, 401, AUTH_401_MESSAGE);
+    return null;
+  }
+  return owner;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,14 +203,19 @@ type DelegationContextCheck =
 /**
  * Verifies the internal delegation context header. Absent header = depth 0
  * (root chat). A PRESENT but invalid/expired/forged/misbound header is a
- * fixed 400 — depth can never enter through client body fields. A VALID
- * signature claiming an impossible depth (> MAX_DELEGATION_DEPTH) is a 403.
+ * fixed 400 — depth can never enter through client body fields — and the
+ * same strictness now binds the context's `ownerId`: the payload must name
+ * the RESOLVED owner (browser session or the signed internal context the
+ * requireOwner middleware accepted), so one user's delegation header can
+ * never drive another user's chat. A VALID signature claiming an impossible
+ * depth (> MAX_DELEGATION_DEPTH) is a 403.
  */
 function resolveDelegationChatContext(
   deps: ChatRoutesDeps,
   headerValue: string | undefined,
   slug: string,
   chatId: string,
+  ownerId: string,
 ): DelegationContextCheck {
   if (headerValue === undefined || headerValue.length === 0) {
     return { ok: true, context: null };
@@ -173,6 +233,7 @@ function resolveDelegationChatContext(
     kind: 'delegation-child-chat',
     childChatId: chatId,
     targetAgent: expectedTarget,
+    ownerId,
   });
   if (!verified.ok) {
     return { ok: false, status: 400 };
@@ -199,11 +260,37 @@ function toUIMessages(values: readonly unknown[]): UIMessage[] {
   return values as UIMessage[];
 }
 
+/**
+ * Resolves the chat's effective model id: the STORED selection when present,
+ * else the configured DEFAULT. The legacy single-model path (no model
+ * composition wired) still resolves the configured default id for metadata.
+ */
+function resolveDefaultModelId(deps: ChatRoutesDeps): string {
+  return deps.models?.defaultModelId ?? deps.config.model;
+}
+
+/** Picks the generation model: factory by chat id, or the injected single model (tests). */
+function resolveGenerationModel(deps: ChatRoutesDeps, chatModelId: string): CreateChatTurnStreamOptions['model'] {
+  return deps.models !== undefined ? deps.models.modelFor(chatModelId) : deps.model;
+}
+
 export interface ChatRouteHandlers {
   health: RequestHandler;
   hydration: RequestHandler;
   postChat: RequestHandler;
   resumeStream: RequestHandler;
+  /** DELETE the whole owner-scoped chat (destructive). */
+  deleteChat: RequestHandler;
+  /** POST a branch through a selected message into a NEW chat. */
+  branchChat: RequestHandler;
+  /** POST a destructive rewind: keep messages through the selection, drop the tail. */
+  rewindChat: RequestHandler;
+  /** GET the chat's selected (or default) model id. */
+  getModel: RequestHandler;
+  /** PUT a validated model selection (blocked/absent → fixed 400). */
+  setModel: RequestHandler;
+  /** GET bounded per-chat token/cost usage (this owner's transcript only). */
+  usage: RequestHandler;
 }
 
 export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
@@ -229,7 +316,284 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     res.end(JSON.stringify({ status: 'ok' }));
   };
 
+  // ---------------------------------------------------------------------------
+  // Chat mutations (pre-Phase 6 lifecycle): owner-scoped delete / branch /
+  // destructive rewind. Fixed safe errors; ids ONLY from the path (and the
+  // strict body for branch/rewind); the owner is ONLY the resolved identity.
+  // ---------------------------------------------------------------------------
+
+  /** Shared slug+chatId validation for the mutation routes. */
+  function parseMutationTarget(req: Request, res: Response): { ownerId: string; slug: string; clientChatId: string } | null {
+    const owner = ownerOf(res);
+    if (owner === null) {
+      sendJsonError(res, 401, AUTH_401_MESSAGE);
+      return null;
+    }
+    const slug = req.params['slug'] ?? '';
+    if (!isKnownSlug(slug)) {
+      sendJsonError(res, 404, 'Unknown agent slug.');
+      return null;
+    }
+    const clientChatId = req.params['clientChatId'] ?? '';
+    const idCheck = clientIdSchema.safeParse(clientChatId);
+    if (!idCheck.success) {
+      sendJsonError(res, 400, 'clientChatId must be 1-64 characters of A-Z a-z 0-9 _ -');
+      return null;
+    }
+    return { ownerId: owner.userId, slug, clientChatId };
+  }
+
+  /** DELETE /api/agents/:slug/chat/:clientChatId — owner-scoped destructive delete. */
+  const deleteChat = asyncRoute(async (req: Request, res: Response) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    // Busy precheck BEFORE any derived-memory work: an active generation must
+    // cost ZERO purge (the Lua busy check stays authoritative for races).
+    let activeStreamId: string | null = null;
+    try {
+      activeStreamId = await store.getActiveStreamId(chat);
+    } catch (error) {
+      logger.error('chat-delete-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    if (activeStreamId !== null) {
+      sendJsonError(res, 409, 'Chat has an active generation. Resume or wait.');
+      return;
+    }
+    // FORGOTTEN CHATS: the derived personal memory is purged BEFORE the
+    // destructive Redis delete (explicit post-mutation-independence: a purge
+    // failure aborts the delete with the transcript still intact, so the
+    // response NEVER claims a deletion it did not perform). The purge is
+    // strictly owner-scoped (scope + exact chats/{chatId} path) and touches
+    // no other chat's memory.
+    let purgedPersonalMemoryBlocks = 0;
+    if (deps.personal !== undefined) {
+      try {
+        purgedPersonalMemoryBlocks = await deps.personal.memory.purgeDerivedChatMemory({
+          scope: userMemoryScope(target.ownerId),
+          path: personalChatPath(target.clientChatId),
+        });
+      } catch (error) {
+        logger.error('personal-memory-purge-delete', error);
+        sendJsonError(res, 503, 'Personal memory cleanup failed. Retry the delete.');
+        return;
+      }
+    }
+    // Artifacts survive by contract: WorkDocs, delegation audit rows,
+    // AgentTask/execution history, delegated child chats, and every other
+    // owner's data are never deleted here (see `store.deleteChat` docs).
+    let result;
+    try {
+      result = await store.deleteChat(chat);
+    } catch (error) {
+      logger.error('chat-delete-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    if (result.status === 'busy') {
+      sendJsonError(res, 409, 'Chat has an active generation. Resume or wait.');
+      return;
+    }
+    if (result.status === 'not-found') {
+      sendJsonError(res, 404, 'Chat not found.');
+      return;
+    }
+    res.status(200);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(JSON.stringify({ deleted: true, purgedPersonalMemoryBlocks }));
+  });
+
+  /** POST /branch body: strict { messageId, newChatId }. */
+  const branchChat = asyncRoute(async (req: Request, res: Response) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    if (!req.is('application/json')) {
+      sendJsonError(res, 415, 'Content-Type must be application/json.');
+      return;
+    }
+    const body = branchBodySchema.safeParse(req.body);
+    if (!body.success) {
+      sendJsonError(res, 400, 'Branch must be exactly { messageId, newChatId }.');
+      return;
+    }
+    const source = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    let result;
+    try {
+      // No provider call, no source mutation (active-stream marker included);
+      // the destination index is written atomically with the copied entries.
+      result = await store.branchChat(source, { messageId: body.data.messageId, newChatId: body.data.newChatId });
+    } catch (error) {
+      logger.error('chat-branch-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    if (result.status === 'chat-not-found') {
+      sendJsonError(res, 404, 'Chat not found.');
+      return;
+    }
+    if (result.status === 'message-not-found') {
+      sendJsonError(res, 404, 'Message not found.');
+      return;
+    }
+    if (result.status === 'destination-conflict') {
+      sendJsonError(res, 409, 'Destination chat already exists.');
+      return;
+    }
+    res.status(201);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(
+      JSON.stringify({
+        branched: true,
+        destinationChatId: body.data.newChatId,
+        copiedMessages: result.copiedMessages,
+      }),
+    );
+  });
+
+  /** POST /rewind body: strict { messageId }. */
+  const rewindChat = asyncRoute(async (req: Request, res: Response) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    if (!req.is('application/json')) {
+      sendJsonError(res, 415, 'Content-Type must be application/json.');
+      return;
+    }
+    const body = rewindBodySchema.safeParse(req.body);
+    if (!body.success) {
+      sendJsonError(res, 400, 'Rewind must be exactly { messageId }.');
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    // Generations must not be rewound mid-flight: the marker is the exact
+    // contract, and the destructive trim only ever runs without it.
+    let activeStreamId: string | null = null;
+    try {
+      activeStreamId = await store.getActiveStreamId(chat);
+    } catch (error) {
+      logger.error('chat-rewind-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    if (activeStreamId !== null) {
+      sendJsonError(res, 409, 'Chat has an active generation. Resume or wait.');
+      return;
+    }
+    // The removed tail (for the derived-memory purge) is exactly the load
+    // BEFORE the trim sliced after the CAS-kept count — the same contract
+    // the rewind CAS verifies (any concurrent change stale-fails the rewind).
+    // The messageId is pre-checked so an unknown id still answers the fixed
+    // 404 WITHOUT any purge.
+    let preRewindStored: unknown[] | null = null;
+    try {
+      preRewindStored = await store.loadMessages(chat);
+    } catch (error) {
+      logger.error('chat-rewind-preload', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    const messageIdExists =
+      preRewindStored.some(
+        (entry) =>
+          entry !== null &&
+          typeof entry === 'object' &&
+          (entry as { id?: unknown }).id === body.data.messageId,
+      );
+    if (messageIdExists === false) {
+      sendJsonError(res, 404, 'Message not found.');
+      return;
+    }
+    // FORGOTTEN CONTENT: derived personal memory tied to the REMOVED
+    // assistant messages is purged BEFORE the destructive trim (explicit
+    // post-mutation-independence: a purge failure aborts the rewind with the
+    // transcript still intact, so a 200 NEVER claims a rewind whose memory
+    // purge failed). The removed tail is everything AFTER the requested
+    // message; if the CAS later stale-fails, the removed ids change on the
+    // retry and a purge on then-kept ids is the privacy-safe direction
+    // (derived memory is always re-derivable on the next completed turn).
+    // The purge is strictly owner-scoped.
+    let purgedPersonalMemoryBlocks = 0;
+    if (deps.personal !== undefined) {
+      try {
+        const messageIdIndex = preRewindStored.findIndex(
+          (entry) =>
+            entry !== null &&
+            typeof entry === 'object' &&
+            (entry as { id?: unknown }).id === body.data.messageId,
+        );
+        const removedAssistantMessageIds = preRewindStored
+          .slice(messageIdIndex + 1)
+          .filter(
+            (entry) =>
+              entry !== null &&
+              typeof entry === 'object' &&
+              (entry as { role?: unknown }).role === 'assistant' &&
+              typeof (entry as { id?: unknown }).id === 'string',
+          )
+          .map((entry) => String((entry as { id?: unknown }).id))
+          .slice(0, 512);
+        if (removedAssistantMessageIds.length > 0) {
+          purgedPersonalMemoryBlocks = await deps.personal.memory.purgeDerivedChatMemory({
+            scope: userMemoryScope(target.ownerId),
+            path: personalChatPath(target.clientChatId),
+            assistantMessageIds: removedAssistantMessageIds,
+          });
+        }
+      } catch (error) {
+        logger.error('personal-memory-purge-rewind', error);
+        sendJsonError(res, 503, 'Personal memory cleanup failed. Retry the rewind.');
+        return;
+      }
+    }
+    let result;
+    try {
+      result = await store.rewindChat(chat, body.data.messageId);
+    } catch (error) {
+      logger.error('chat-rewind-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    if (result.status === 'chat-not-found') {
+      sendJsonError(res, 404, 'Chat not found.');
+      return;
+    }
+    if (result.status === 'message-not-found') {
+      sendJsonError(res, 404, 'Message not found.');
+      return;
+    }
+    if (result.status === 'stale') {
+      sendJsonError(res, 409, 'Chat changed during rewind. Retry.');
+      return;
+    }
+    // Branch does NOT copy derived memories by contract (nothing to do).
+    res.status(200);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(
+      JSON.stringify({
+        rewound: true,
+        kept: result.kept,
+        removed: result.removed,
+        hasActiveStream: false,
+        purgedPersonalMemoryBlocks,
+      }),
+    );
+  });
+
   const hydration = asyncRoute(async (req: Request, res: Response) => {
+    const owner = ownerOr401(res);
+    if (owner === null) {
+      return;
+    }
     const slug = req.params['slug'] ?? '';
     const clientChatId = req.params['clientChatId'] ?? '';
     if (!isKnownSlug(slug)) {
@@ -241,7 +605,19 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       sendJsonError(res, 400, 'clientChatId must be 1-64 characters of A-Z a-z 0-9 _ -');
       return;
     }
-    const chat = chatRefFromRequest(slug, clientChatId);
+    const chat = chatRefFromRequest(owner.userId, slug, clientChatId);
+    // Additive hydration field (model composition wired): the chat's selected
+    // model, or the configured default when unset.
+    let chatModelField: string | null = null;
+    if (deps.models !== undefined) {
+      try {
+        chatModelField = (await store.getChatModel(chat)) ?? deps.models.defaultModelId;
+      } catch (error) {
+        logger.error('hydration-model', error);
+        sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+        return;
+      }
+    }
     let rawMessages: unknown[];
     let activeStreamId: string | null;
     try {
@@ -259,12 +635,18 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       JSON.stringify({
         messages: rawMessages,
         hasActiveStream: activeStreamId !== null,
+        ...(chatModelField !== null ? { modelId: chatModelField } : {}),
       }),
     );
   });
 
 
   const postChat = asyncRoute(async (req: Request, res: Response) => {
+    const resolved = ownerOr401(res);
+    if (resolved === null) {
+      return;
+    }
+    const ownerUserId = resolved.userId;
     const slug = req.params['slug'] ?? '';
     const phase4Agent = isKnownSlug(slug) && slug !== 'general';
     if (!isKnownSlug(slug)) {
@@ -292,9 +674,12 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     // Phase 4 modes: optional in the body; default action. NEVER depth.
     const requestedMode: ChatMode = bodyCheck.data.mode ?? 'action';
 
-    // Trusted depth comes ONLY from the verified internal header.
+    // Trusted depth comes ONLY from the verified internal header, which now
+    // also binds the RESOLVED owner (browser session or signed internal
+    // context): one user's delegation header can never drive another user's
+    // chat (fixed 400 on any mismatch).
     const delegationHeader = req.get(DELEGATION_CONTEXT_HEADER);
-    const delegationCheck = resolveDelegationChatContext(deps, delegationHeader ?? undefined, slug, chatId);
+    const delegationCheck = resolveDelegationChatContext(deps, delegationHeader ?? undefined, slug, chatId, ownerUserId);
     if (!delegationCheck.ok) {
       sendJsonError(res, delegationCheck.status, 'Invalid internal delegation context.');
       return;
@@ -313,7 +698,24 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       return;
     }
 
-    const chat = chatRefFromRequest(slug, chatId);
+    const chat = chatRefFromRequest(ownerUserId, slug, chatId);
+
+    // ---- Model resolution + policy revalidation (BEFORE any durable work) --
+    // The chat's selected model (or the configured DEFAULT) drives this
+    // generation; a model that became BLOCKED after selection is rejected
+    // here with the fixed safe 400 (selection revalidation happened at PUT).
+    let chatModelId: string;
+    try {
+      chatModelId = (await store.getChatModel(chat)) ?? resolveDefaultModelId(deps);
+    } catch (error) {
+      logger.error('chat-model-read', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    if (isBlockedModelId(chatModelId, deps.config.blockedModelPrefixes)) {
+      sendJsonError(res, 400, 'Model is not allowed.');
+      return;
+    }
 
     // ---- Redis-backed pre-stream setup; any failure releases what it acquired.
     let stored: unknown[];
@@ -348,6 +750,7 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
             depth: delegationCheck.context?.depth ?? 0,
             chatId,
             parentMessageId: message.id,
+            ownerId: ownerUserId,
           })
         : null;
     const generationTools = prepared !== null ? prepared.tools : agentTools;
@@ -455,6 +858,41 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
 
     // Hand off to generation. From here on the key is never released: once the
     // stream has started, retries go through resume instead (ADR-005).
+    // Opt-in personal memory RECALL first (never blocks the turn): bounded
+    // untrusted reference context, or plain none on any failure/disabling.
+    const personalRecallDeps: PersonalRecallDeps | null =
+      deps.personal !== undefined
+        ? { memory: deps.personal.memory, settings: deps.personal.settings, logger }
+        : null;
+    let memoryContext: string | undefined;
+    if (personalRecallDeps !== null) {
+      memoryContext = (await recallPersonalMemory(personalRecallDeps, { ownerId: ownerUserId, newestUserText: answerText })) ?? undefined;
+    }
+    // Opt-in personal CAPTURE: one deterministic job per completed assistant
+    // turn, gated again at finish and (defense in depth) in the worker.
+    const onAssistantFinished: CreateChatTurnStreamOptions['onAssistantFinished'] | undefined =
+      deps.personal !== undefined
+        ? (finished) => {
+            background.track(
+              (async () => {
+                const gate = await deps.personal?.settings.get(ownerUserId);
+                if (gate?.personalMemoryEnabled !== true) {
+                  return;
+                }
+                await deps.personal?.capture.enqueueCapture({
+                  ownerId: ownerUserId,
+                  scope: userMemoryScope(ownerUserId),
+                  chatId,
+                  slug,
+                  userMessageId: finished.userMessageId,
+                  assistantMessageId: finished.assistantMessageId,
+                });
+              })().catch((error: unknown) => {
+                logger.error('personal-capture-enqueue', error);
+              }),
+            );
+          }
+        : undefined;
     let turn;
     try {
       turn = await createChatTurnStream({
@@ -464,10 +902,13 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
         streamContext,
         background,
         logger,
-        model,
+        model: resolveGenerationModel(deps, chatModelId),
+        modelId: chatModelId,
         tools: generationTools,
         validationTools,
         systemPrompt,
+        memoryContext,
+        onAssistantFinished,
         // Deadline abort for INTERNAL delegated children only: the verified
         // context carries the run deadline. Browser disconnects still never
         // abort generation (no signal is passed for ordinary chats).
@@ -515,6 +956,10 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
   });
 
   const resumeStream = asyncRoute(async (req: Request, res: Response) => {
+    const resolved = ownerOr401(res);
+    if (resolved === null) {
+      return;
+    }
     const slug = req.params['slug'] ?? '';
     const clientChatId = req.params['clientChatId'] ?? '';
     if (!isKnownSlug(slug)) {
@@ -526,7 +971,7 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       sendJsonError(res, 400, 'clientChatId must be 1-64 characters of A-Z a-z 0-9 _ -');
       return;
     }
-    const chat = chatRefFromRequest(slug, clientChatId);
+    const chat = chatRefFromRequest(resolved.userId, slug, clientChatId);
 
     let activeStreamId: string | null;
     try {
@@ -575,5 +1020,125 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     sendWebResponse(sseResponse, res);
   });
 
-  return { health, hydration, postChat, resumeStream };
+  // ---------------------------------------------------------------------------
+  // Per-chat MODEL selection + USAGE (pre-Phase 6 model composition)
+  // ---------------------------------------------------------------------------
+
+  /** GET /model: the stored selection or the configured default. */
+  const getModel: RequestHandler = async (req, res) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    if (deps.models === undefined) {
+      sendJsonError(res, 404, 'Unknown route.');
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    let modelId: string;
+    try {
+      modelId = (await store.getChatModel(chat)) ?? deps.models.defaultModelId;
+    } catch (error) {
+      logger.error('chat-model-read', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    res.status(200);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(JSON.stringify({ modelId }));
+  };
+
+  /** PUT /model: strict {modelId}; validates pattern, blocked policy, and
+   * catalog presence (cached/fresh); applies to the NEXT generation only.
+   */
+  const setModel = asyncRoute(async (req: Request, res: Response) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    if (deps.models === undefined) {
+      sendJsonError(res, 404, 'Unknown route.');
+      return;
+    }
+    if (!req.is('application/json')) {
+      sendJsonError(res, 415, 'Content-Type must be application/json.');
+      return;
+    }
+    const body = modelBodySchema.safeParse(req.body);
+    if (!body.success) {
+      sendJsonError(res, 400, 'modelId must be 1-80 characters of A-Z a-z 0-9 . _ : -');
+      return;
+    }
+    const modelId = body.data.modelId;
+    if (isBlockedModelId(modelId, deps.config.blockedModelPrefixes)) {
+      sendJsonError(res, 400, MODEL_LOCK_REASON);
+      return;
+    }
+    let available: boolean;
+    try {
+      const catalog = await deps.models.catalog.list();
+      available = catalog.models.some((entry) => entry.id === modelId);
+    } catch (error) {
+      if (error instanceof ModelCatalogUnavailableError) {
+        sendJsonError(res, 503, 'Model catalog is temporarily unavailable.');
+      } else {
+        logger.error('chat-model-catalog', error);
+        sendJsonError(res, 503, 'Model catalog is temporarily unavailable.');
+      }
+      return;
+    }
+    if (!available) {
+      sendJsonError(res, 400, 'Model is not available.');
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    try {
+      // Applies to the NEXT generation: current/running streams keep their
+      // started model by contract.
+      await store.setChatModel(chat, modelId);
+    } catch (error) {
+      logger.error('chat-model-write', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    res.status(200);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(JSON.stringify({ modelId }));
+  });
+
+  /** GET /usage: exact token sums + per-model buckets + honest cost. */
+  const chatUsage: RequestHandler = async (req, res) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    let stored: unknown[];
+    try {
+      stored = await store.loadMessages(chat);
+    } catch (error) {
+      logger.error('chat-usage-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    res.status(200);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(JSON.stringify(summarizeChatUsage(stored, deps.config.modelPricing)));
+  };
+
+  return {
+    health,
+    hydration,
+    postChat,
+    resumeStream,
+    deleteChat,
+    branchChat,
+    rewindChat,
+    getModel,
+    setModel,
+    usage: chatUsage,
+  };
 }

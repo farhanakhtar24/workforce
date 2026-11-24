@@ -29,7 +29,15 @@
  * Missing document/version -> WorkDocNotFoundError (404); stale expectedVersion
  * -> WorkDocConflictError (409); malformed input -> WorkDocValidationError
  * (400). No raw errors with content escape: Prisma internals are attached as
- * `cause` only.
+ * `cause` only. A raced P2025 (row deleted between the locked re-read and the
+ * write) maps to the SAME 404 the in-memory store produces for a missing row.
+ *
+ * ## Ownership
+ * `ownerId` is the platform user (Better Auth `User.id`, TEXT) or null for
+ * legacy rows. Owner guards/filters match EXACTLY — an expected owner never
+ * matches ownerless or other-user rows, and a mismatch reads as 404/null:
+ * no cross-tenant oracle. The authenticated API layer MUST always pass the
+ * owner on create and on every owner-scoped read/list/mutation.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -37,7 +45,9 @@ import { randomUUID } from 'node:crypto';
 import { Prisma, PrismaClient } from '@workforce/core/generated/prisma';
 
 import {
+  enforceOwner,
   enforceOwnership,
+  validateGetOptions,
   validateHistoryOptions,
   validateLinkInsert,
   validateListParams,
@@ -49,6 +59,7 @@ import {
 } from '../validate.js';
 import { WorkDocConflictError, WorkDocNotFoundError, WorkDocValidationError } from '../errors.js';
 import type {
+  WorkDocGetOptions,
   WorkDocHistoryListOptions,
   WorkDocLinkInsert,
   WorkDocListParams,
@@ -74,6 +85,8 @@ function mapDoc(row: RowDoc): WorkDoc {
     content: row.content,
     status: row.status,
     version: row.version,
+    // Normalizes absent fields too (fake rows in tests): never `undefined`.
+    ownerId: row.ownerId ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -123,6 +136,30 @@ function asConflictOrOriginal(cause: unknown, message: string): WorkDocConflictE
   return cause;
 }
 
+/**
+ * Map a raced P2025 (row vanished between the locked re-read and the write)
+ * into the SAME typed 404 the in-memory store produces for a missing row —
+ * identical semantics across adapters.
+ */
+function asNotFoundOrOriginal(cause: unknown, message: string): WorkDocNotFoundError | unknown {
+  if (cause instanceof Prisma.PrismaClientKnownRequestError && cause.code === 'P2025') {
+    return new WorkDocNotFoundError(message, { cause });
+  }
+  return cause;
+}
+
+/**
+ * Typed mapping for CAS writes that already re-read the row under lock:
+ * P2002 -> conflict, P2025 (row vanished between the lock and the write) ->
+ * the SAME typed 404 the in-memory store produces, everything else rethrown.
+ */
+function asNotFoundOrConflict(cause: unknown, conflictMessage: string, notFoundMessage: string): unknown {
+  if (cause instanceof Prisma.PrismaClientKnownRequestError && cause.code === 'P2025') {
+    return new WorkDocNotFoundError(notFoundMessage, { cause });
+  }
+  return asConflictOrOriginal(cause, conflictMessage);
+}
+
 export class PrismaWorkDocStore implements WorkDocStore {
   private readonly prisma: PrismaClient;
 
@@ -152,6 +189,7 @@ export class PrismaWorkDocStore implements WorkDocStore {
             title: validated.title,
             content: validated.content,
             status: validated.status,
+            ownerId: validated.ownerId,
             version: 1,
             createdAt,
             updatedAt: createdAt,
@@ -190,10 +228,18 @@ export class PrismaWorkDocStore implements WorkDocStore {
     }
   }
 
-  async get(id: string): Promise<WorkDoc | null> {
+  async get(id: string, options?: WorkDocGetOptions): Promise<WorkDoc | null> {
     validateDocumentId(id);
+    const validatedOptions = validateGetOptions(options);
     const row = await this.prisma.workDoc.findUnique({ where: { id } });
-    return row ? mapDoc(row) : null;
+    if (!row) {
+      return null;
+    }
+    // Owner guard reads foreign/ownerless rows as absent — never an oracle.
+    if (validatedOptions.expectedOwnerId !== null && (row.ownerId ?? null) !== validatedOptions.expectedOwnerId) {
+      return null;
+    }
+    return mapDoc(row);
   }
 
   async list(params: WorkDocListParams): Promise<readonly WorkDoc[]> {
@@ -204,6 +250,7 @@ export class PrismaWorkDocStore implements WorkDocStore {
         ...(validated.chatId !== null ? { chatId: validated.chatId } : {}),
         ...(validated.type !== null ? { type: validated.type } : {}),
         ...(validated.status !== null ? { status: validated.status } : {}),
+        ...(validated.ownerId !== null ? { ownerId: validated.ownerId } : {}),
       },
       orderBy: validated.order === 'newest'
         ? [{ createdAt: 'desc' }, { id: 'desc' }]
@@ -225,7 +272,7 @@ export class PrismaWorkDocStore implements WorkDocStore {
         if (!document) {
           throw new WorkDocNotFoundError(`work doc ${validated.id} not found`);
         }
-        enforceOwnership(document, validated.expectedScope, validated.expectedChatId);
+        enforceOwnership(document, validated.expectedScope, validated.expectedChatId, validated.expectedOwnerId);
         if (document.version !== validated.expectedVersion) {
           throw new WorkDocConflictError(
             `work doc ${validated.id} version is ${document.version}; expectedVersion ${validated.expectedVersion} is stale`,
@@ -268,7 +315,11 @@ export class PrismaWorkDocStore implements WorkDocStore {
         return mapDoc(updated);
       });
     } catch (cause) {
-      throw asConflictOrOriginal(cause, `work doc ${validated.id} concurrent write conflict`);
+      throw asNotFoundOrConflict(
+        cause,
+        `work doc ${validated.id} concurrent write conflict`,
+        `work doc ${validated.id} not found`,
+      );
     }
   }
 
@@ -281,7 +332,7 @@ export class PrismaWorkDocStore implements WorkDocStore {
         if (!document) {
           throw new WorkDocNotFoundError(`work doc ${validated.id} not found`);
         }
-        enforceOwnership(document, validated.expectedScope, validated.expectedChatId);
+        enforceOwnership(document, validated.expectedScope, validated.expectedChatId, validated.expectedOwnerId);
         if (document.version !== validated.expectedVersion) {
           throw new WorkDocConflictError(
             `work doc ${validated.id} version is ${document.version}; expectedVersion ${validated.expectedVersion} is stale`,
@@ -335,7 +386,11 @@ export class PrismaWorkDocStore implements WorkDocStore {
         return mapDoc(updated);
       });
     } catch (cause) {
-      throw asConflictOrOriginal(cause, `work doc ${validated.id} concurrent rollback conflict`);
+      throw asNotFoundOrConflict(
+        cause,
+        `work doc ${validated.id} concurrent rollback conflict`,
+        `work doc ${validated.id} not found`,
+      );
     }
   }
 
@@ -347,6 +402,8 @@ export class PrismaWorkDocStore implements WorkDocStore {
     if (!document) {
       throw new WorkDocNotFoundError(`work doc ${documentId} not found`);
     }
+    // Owner guard: foreign/ownerless documents read as 404 (no oracle).
+    enforceOwner(document, validated.expectedOwnerId);
     const rows = await this.prisma.workDocVersion.findMany({
       where: { documentId },
       orderBy: { version: validated.order === 'newest' ? 'desc' : 'asc' },
@@ -361,6 +418,7 @@ export class PrismaWorkDocStore implements WorkDocStore {
     if (!document) {
       throw new WorkDocNotFoundError(`work doc ${documentId} not found`);
     }
+    enforceOwner(document, validated.expectedOwnerId);
     const rows = await this.prisma.workDocRevision.findMany({
       where: { documentId },
       orderBy: validated.order === 'newest'
@@ -381,7 +439,7 @@ export class PrismaWorkDocStore implements WorkDocStore {
         if (!document) {
           throw new WorkDocNotFoundError(`work doc ${validated.documentId} not found`);
         }
-        enforceOwnership(document, validated.expectedScope, validated.expectedChatId);
+        enforceOwnership(document, validated.expectedScope, validated.expectedChatId, validated.expectedOwnerId);
         const existing = await tx.workDocLink.findUnique({
           where: {
             documentId_targetType_targetId: {
@@ -442,12 +500,14 @@ export class PrismaWorkDocStore implements WorkDocStore {
     }
   }
 
-  async listLinks(documentId: string): Promise<readonly WorkDocLink[]> {
+  async listLinks(documentId: string, options?: WorkDocGetOptions): Promise<readonly WorkDocLink[]> {
     validateDocumentId(documentId);
+    const validatedOptions = validateGetOptions(options);
     const document = await this.prisma.workDoc.findUnique({ where: { id: documentId } });
     if (!document) {
       throw new WorkDocNotFoundError(`work doc ${documentId} not found`);
     }
+    enforceOwner(document, validatedOptions.expectedOwnerId);
     const rows = await this.prisma.workDocLink.findMany({
       where: { documentId },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],

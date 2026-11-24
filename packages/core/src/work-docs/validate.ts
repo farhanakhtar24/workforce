@@ -105,6 +105,7 @@ export interface ValidatedStoreCreate {
   readonly title: string;
   readonly content: string;
   readonly status: WorkDocStatus;
+  readonly ownerId: string | null;
   readonly createdAt: Date | null;
 }
 
@@ -123,6 +124,10 @@ export function validateStoreCreate(data: WorkDocStoreCreate): ValidatedStoreCre
   if (!isWorkDocStatus(status)) {
     throw new WorkDocValidationError('work doc status must be one of draft, active, archived');
   }
+  const ownerId =
+    data.ownerId !== undefined && data.ownerId !== null
+      ? validateExternalId(data.ownerId, 'ownerId')
+      : null;
   let createdAt: Date | null = null;
   if (data.createdAt !== undefined) {
     const asDate = data.createdAt instanceof Date ? data.createdAt : new Date(data.createdAt);
@@ -131,7 +136,7 @@ export function validateStoreCreate(data: WorkDocStoreCreate): ValidatedStoreCre
     }
     createdAt = asDate;
   }
-  return { id: data.id ?? null, scope, chatId, type: data.type, title, content, status, createdAt };
+  return { id: data.id ?? null, scope, chatId, type: data.type, title, content, status, ownerId, createdAt };
 }
 
 export interface ValidatedStoreUpdate {
@@ -145,16 +150,22 @@ export interface ValidatedStoreUpdate {
   readonly summary: string | null;
   readonly expectedScope: string | null;
   readonly expectedChatId: string | null;
+  readonly expectedOwnerId: string | null;
 }
 
 function validateOwnershipGuards(
   expectedScope: string | null | undefined,
   expectedChatId: string | null | undefined,
-): { expectedScope: string | null; expectedChatId: string | null } {
+  expectedOwnerId: string | null | undefined,
+): { expectedScope: string | null; expectedChatId: string | null; expectedOwnerId: string | null } {
   return {
     expectedScope: expectedScope !== undefined && expectedScope !== null ? normalizeScope(expectedScope) : null,
     expectedChatId:
       expectedChatId !== undefined && expectedChatId !== null ? validateExternalId(expectedChatId, 'expectedChatId') : null,
+    expectedOwnerId:
+      expectedOwnerId !== undefined && expectedOwnerId !== null
+        ? validateExternalId(expectedOwnerId, 'expectedOwnerId')
+        : null,
   };
 }
 
@@ -170,7 +181,7 @@ export function validateStoreUpdate(data: WorkDocStoreUpdate): ValidatedStoreUpd
   const source = validateSource(data.source);
   const actorId = validateOptionalActor(data.actorId) ?? null;
   const summary = validateOptionalSummary(data.summary) ?? null;
-  const ownership = validateOwnershipGuards(data.expectedScope, data.expectedChatId);
+  const ownership = validateOwnershipGuards(data.expectedScope, data.expectedChatId, data.expectedOwnerId);
   return { id, expectedVersion, title, content, status, source, actorId, summary, ...ownership };
 }
 
@@ -183,6 +194,7 @@ export interface ValidatedStoreRollback {
   readonly summary: string | null;
   readonly expectedScope: string | null;
   readonly expectedChatId: string | null;
+  readonly expectedOwnerId: string | null;
 }
 
 export function validateStoreRollback(data: WorkDocStoreRollback): ValidatedStoreRollback {
@@ -192,7 +204,7 @@ export function validateStoreRollback(data: WorkDocStoreRollback): ValidatedStor
   const source = validateSource(data.source);
   const actorId = validateOptionalActor(data.actorId) ?? null;
   const summary = validateOptionalSummary(data.summary) ?? null;
-  const ownership = validateOwnershipGuards(data.expectedScope, data.expectedChatId);
+  const ownership = validateOwnershipGuards(data.expectedScope, data.expectedChatId, data.expectedOwnerId);
   return { id, expectedVersion, toVersion, source, actorId, summary, ...ownership };
 }
 
@@ -215,6 +227,7 @@ export interface ValidatedLinkInsert {
   readonly label: string | null;
   readonly expectedScope: string | null;
   readonly expectedChatId: string | null;
+  readonly expectedOwnerId: string | null;
 }
 
 export function validateLinkInsert(data: WorkDocLinkInsert): ValidatedLinkInsert {
@@ -226,7 +239,7 @@ export function validateLinkInsert(data: WorkDocLinkInsert): ValidatedLinkInsert
   const label = data.label !== undefined && data.label !== null
     ? validateBounded(data.label, WORK_DOC_MAX_LABEL_LENGTH, 'link label')
     : null;
-  const ownership = validateOwnershipGuards(data.expectedScope, data.expectedChatId);
+  const ownership = validateOwnershipGuards(data.expectedScope, data.expectedChatId, data.expectedOwnerId);
   return { documentId, targetType: data.targetType, targetId, label, ...ownership };
 }
 
@@ -235,6 +248,7 @@ export interface ValidatedListParams {
   readonly chatId: string | null;
   readonly type: WorkDocType | null;
   readonly status: WorkDocStatus | null;
+  readonly ownerId: string | null;
   readonly order: 'newest' | 'oldest';
   readonly limit: number;
 }
@@ -252,34 +266,52 @@ export function validateListParams(params: WorkDocListParams): ValidatedListPara
   if (status !== null && !isWorkDocStatus(status)) {
     throw new WorkDocValidationError('work doc status filter must be one of draft, active, archived');
   }
+  const ownerId = params.ownerId !== undefined && params.ownerId !== null
+    ? validateExternalId(params.ownerId, 'ownerId')
+    : null;
   if (params.order !== 'newest' && params.order !== 'oldest') {
     throw new WorkDocValidationError('work doc list order must be newest or oldest');
   }
   if (typeof params.limit !== 'number' || !Number.isInteger(params.limit) || params.limit < 1 || params.limit > WORK_DOC_LIST_LIMIT_MAX) {
     throw new WorkDocValidationError(`work doc list limit must be an integer between 1 and ${WORK_DOC_LIST_LIMIT_MAX}`);
   }
-  return { scope, chatId, type, status, order: params.order, limit: params.limit };
+  return { scope, chatId, type, status, ownerId, order: params.order, limit: params.limit };
 }
 
 export interface ValidatedHistoryOptions {
   readonly order: 'oldest' | 'newest';
   readonly limit: number;
+  readonly expectedOwnerId: string | null;
 }
 
 /**
- * Enforce scope/chat ownership on a mutation. A mismatch MUST read as
- * not-found: existence is never confirmed for a foreign scope/chat.
+ * Enforce scope/chat/owner ownership on a mutation. A mismatch MUST read as
+ * not-found: existence is never confirmed for a foreign scope/chat/owner.
+ * The owner guard matches EXACTLY — ownerless legacy rows never satisfy any
+ * expected owner.
  */
 export function enforceOwnership(
-  document: { readonly id: string; readonly scope: string; readonly chatId: string },
+  document: { readonly id: string; readonly scope: string; readonly chatId: string; readonly ownerId: string | null },
   expectedScope: string | null,
   expectedChatId: string | null,
+  expectedOwnerId: string | null = null,
 ): void {
   if (expectedScope !== null && document.scope !== expectedScope) {
     throw new WorkDocNotFoundError(`work doc ${document.id} not found in scope ${expectedScope}`);
   }
   if (expectedChatId !== null && document.chatId !== expectedChatId) {
     throw new WorkDocNotFoundError(`work doc ${document.id} not found for chat ${expectedChatId}`);
+  }
+  enforceOwner(document, expectedOwnerId);
+}
+
+/** Owner-only guard for read paths; mismatch reads as not-found (no oracle). */
+export function enforceOwner(
+  document: { readonly id: string; readonly ownerId: string | null },
+  expectedOwnerId: string | null,
+): void {
+  if (expectedOwnerId !== null && document.ownerId !== expectedOwnerId) {
+    throw new WorkDocNotFoundError(`work doc ${document.id} not found for owner`);
   }
 }
 
@@ -291,5 +323,23 @@ export function validateHistoryOptions(documentId: string, options: WorkDocHisto
   if (typeof options.limit !== 'number' || !Number.isInteger(options.limit) || options.limit < 1 || options.limit > WORK_DOC_HISTORY_LIMIT_MAX) {
     throw new WorkDocValidationError(`history limit must be an integer between 1 and ${WORK_DOC_HISTORY_LIMIT_MAX}`);
   }
-  return { order: options.order, limit: options.limit };
+  return {
+    order: options.order,
+    limit: options.limit,
+    expectedOwnerId:
+      options.expectedOwnerId !== undefined && options.expectedOwnerId !== null
+        ? validateExternalId(options.expectedOwnerId, 'expectedOwnerId')
+        : null,
+  };
+}
+
+/** Validate the owner guard on plain read options (`get`, `listLinks`). */
+export function validateGetOptions(options?: { readonly expectedOwnerId?: string | null }): {
+  readonly expectedOwnerId: string | null;
+} {
+  const expectedOwnerId =
+    options?.expectedOwnerId !== undefined && options?.expectedOwnerId !== null
+      ? validateExternalId(options.expectedOwnerId, 'expectedOwnerId')
+      : null;
+  return { expectedOwnerId };
 }

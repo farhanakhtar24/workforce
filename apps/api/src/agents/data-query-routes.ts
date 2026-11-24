@@ -1,9 +1,15 @@
 /**
- * `query_data` REST route (Phase 4): `POST /api/agents/:slug/data/query` with
- * `{ query, limit? }`.
+ * `query_data` REST route (Phase 4 + pre-Phase 6 isolation): `POST
+ * /api/agents/:slug/data/query` with `{ query, limit? }`.
  *
  * - Served ONLY for the slugs whose composition includes `query_data`
  *   (orchestrator, analyst); every other slug 404s like an unknown agent.
+ * - Owner-bound: the RESOLVED request identity (browser session or signed
+ *   internal header) is required and passed into the service as the RLS
+ *   binding (`workforce.user_id` + `workforce.memory_scope`); the SQL
+ *   executes as the restricted `workforce_query_reader` role (see
+ *   `20261125000100_query_data_rls`). The owner is NEVER accepted from
+ *   SQL/body/query strings.
  * - One SELECT/WITH statement, read-only transaction, statement timeout, row
  *   cap (`cap + 1` detection → fixed 400), optional client-side `limit`
  *   truncation reported as `truncated: true`.
@@ -13,6 +19,8 @@
 import type { Request, Response, RequestHandler } from 'express';
 import { z } from 'zod';
 import { dataQueryErrorStatus, type DataQueryService } from './data-query.js';
+import { ownerOf, AUTH_401_MESSAGE, type AuthOwner } from '../auth/owner.js';
+import { userMemoryScope } from '@workforce/core/auth';
 
 export const INVALID_DATA_QUERY = 'Invalid data query.';
 
@@ -40,6 +48,16 @@ export interface DataQueryRouteDeps {
 export function dataQueryRouteHandler(deps: DataQueryRouteDeps): RequestHandler {
   return async (req: Request, res: Response, next: (error?: unknown) => void): Promise<void> => {
     try {
+      // Defense in depth behind the app-wide owner gate: the resolved owner
+      // is REQUIRED and binds the RLS policy settings inside the query
+      // transaction. Owner-scope derivation lives in one place (below).
+      const resolved: AuthOwner | null = ownerOf(res);
+      if (resolved === null) {
+        res.status(401);
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ error: AUTH_401_MESSAGE }));
+        return;
+      }
       const slug = req.params['slug'] ?? '';
       if (!DATA_QUERY_SLUGS.includes(slug)) {
         res.status(404);
@@ -55,9 +73,16 @@ export function dataQueryRouteHandler(deps: DataQueryRouteDeps): RequestHandler 
         return;
       }
       const { query, limit } = parsed.data;
+      // The owner comes from the RESOLVED request identity (browser session
+      // or the signed internal header) — never from the SQL or the body —
+      // and binds both RLS settings plus the restricted query role inside
+      // the transaction. The memory scope is derived server-side.
       let result;
       try {
-        result = await deps.service.query(query, limit);
+        result = await deps.service.query(query, limit, {
+          ownerId: resolved.userId,
+          memoryScope: userMemoryScope(resolved.userId),
+        });
       } catch (error) {
         const mapped = dataQueryErrorStatus(error);
         res.status(mapped.status);

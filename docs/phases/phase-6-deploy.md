@@ -3,7 +3,7 @@
 **Duration**: 1 week
 **Goal**: Live URL. Not localhost.
 
-> Status: **Not started**. Begin after Phase 5 validation passes.
+> Status (2026-11-24): **Paused — NOT started.** Farhan explicitly paused this phase in favor of the pre-Phase-6 product feature sprint (auth + per-user workspaces + chat/model/usage/learning features), planned in [`design-plans/pre-phase-6-product-features.md`](../../design-plans/pre-phase-6-product-features.md). Phase 5 was validated 2026-11-24; this phase may begin only after that sprint closes with its own recorded gate. Nothing in the sprint counts as Phase 6 progress.
 
 ---
 

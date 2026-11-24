@@ -89,6 +89,8 @@ import { createMockModel, mockUsage } from '../test/helpers.js';
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379';
 const DATABASE_URL = process.env['DATABASE_URL'] ?? DEFAULT_DATABASE_URL;
 const RUN_ID = `${process.pid.toString(36)}-${Date.now().toString(36)}`;
+/** Every live chat/delegation in this file acts for one fixed owner. */
+const OWNER_ID = `owner-${RUN_ID}`;
 const DELEGATION_QUEUE = `workforce-delegation-test-${RUN_ID}`;
 const STREAM_KEY_PREFIX = `workforce:phase4:stream-live:${RUN_ID}`;
 const CONNECT_TIMEOUT_MS = 5_000;
@@ -200,7 +202,7 @@ function trackChat(slug: string, chatId: string): void {
 }
 
 function trackIdempotency(slug: string, chatId: string, messageId: string): void {
-  trackedIdempotencyKeys.push(`${REDIS_KEY_PREFIX}:idempotency:${slug}:${chatId}:${messageId}`);
+  trackedIdempotencyKeys.push(`${REDIS_KEY_PREFIX}:idempotency:${OWNER_ID}:${slug}:${chatId}:${messageId}`);
 }
 
 // -- Stack ---------------------------------------------------------------------
@@ -301,12 +303,15 @@ async function createPhase4Stack(options: Phase4StackOptions): Promise<Phase4Sta
   }
 
   const config = loadApiConfig({ OLLAMA_API_KEY: 'test-only-not-a-real-key', REDIS_URL, DATABASE_URL });
+  // Test-only owner injection (never a production bypass): every gated route
+  // in this suite acts as the SAME per-run owner that DB rows carry.
   const app = buildApp({
     config,
     store,
     streamContext,
     model: options.model,
     background,
+    auth: { staticOwner: { userId: OWNER_ID, email: 'live-phase4@example.com', emailVerified: true } },
     agents: {
       hostDeps: { fetchFn: agentFetchFn, baseUrl: INTERNAL_ORIGIN, signer, delegationTimeoutMs },
       signer,
@@ -364,10 +369,10 @@ async function createPhase4Stack(options: Phase4StackOptions): Promise<Phase4Sta
     //    (server-internal sentinel keys are only discoverable this way).
     try {
       for (const { slug, chatId } of trackedChats) {
-        await base.del(`${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:messages`);
-        await base.del(`${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:active-stream`);
-        // The activity-index member this run's appends created.
-        await base.zRem(`${REDIS_KEY_PREFIX}:chat-index`, `${slug}:${chatId}`);
+        await base.del(`${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${slug}:${chatId}:messages`);
+        await base.del(`${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${slug}:${chatId}:active-stream`);
+        // The activity-index member this run's appends created (per owner).
+        await base.zRem(`${REDIS_KEY_PREFIX}:chat-index:${OWNER_ID}`, `${slug}:${chatId}`);
       }
       for (const key of trackedIdempotencyKeys) {
         await base.del(key);
@@ -383,6 +388,20 @@ async function createPhase4Stack(options: Phase4StackOptions): Promise<Phase4Sta
           }
         } while (cursor !== '0');
       }
+    } catch (error) {
+      void error;
+    }
+
+    // 5b. Delete EXACTLY this run's DB rows: work docs / delegations created
+    //     through the routes carry the run-unique parent chat ids, and the
+    //     per-test Prisma client is already disconnected below, so do it
+    //     here. Never touches anyone else's rows (RUN_ID-scoped patterns).
+    try {
+      await prisma.$executeRaw`DELETE FROM "Delegation" WHERE "parentChatId" LIKE ${`p4-${RUN_ID}-%`}`;
+      await prisma.$executeRaw`DELETE FROM "WorkDocLink" WHERE "documentId" IN (SELECT "id" FROM "WorkDoc" WHERE "chatId" LIKE ${`p4-${RUN_ID}-%`})`;
+      await prisma.$executeRaw`DELETE FROM "WorkDocRevision" WHERE "documentId" IN (SELECT "id" FROM "WorkDoc" WHERE "chatId" LIKE ${`p4-${RUN_ID}-%`})`;
+      await prisma.$executeRaw`DELETE FROM "WorkDocVersion" WHERE "documentId" IN (SELECT "id" FROM "WorkDoc" WHERE "chatId" LIKE ${`p4-${RUN_ID}-%`})`;
+      await prisma.$executeRaw`DELETE FROM "WorkDoc" WHERE "chatId" LIKE ${`p4-${RUN_ID}-%`}`;
     } catch (error) {
       void error;
     }
@@ -413,7 +432,9 @@ async function createPhase4Stack(options: Phase4StackOptions): Promise<Phase4Sta
     }
     void redisClients;
 
-    // 7. Exact DB cleanup: tracked delegation rows, tracked docs (children cascade).
+    // 7. Exact DB cleanup: tracked delegation rows, tracked docs (children
+    //    cascade by the WorkDoc children's own FKs). The run User row is
+    //    deleted in after() AFTER these rows are gone (FK order).
     try {
       if (trackedDelegationIds.length > 0) {
         await bounded(prisma.delegation.deleteMany({ where: { id: { in: trackedDelegationIds } } }), 10_000, 'delegation cleanup');
@@ -437,7 +458,7 @@ async function createPhase4Stack(options: Phase4StackOptions): Promise<Phase4Sta
     dataQuery,
     internalOrigin: INTERNAL_ORIGIN,
     createHeader: (parentChatId: string, parentDepth: number) =>
-      signer.sign({ kind: 'delegation-create', parentChatId, parentDepth, expiresAt: Date.now() + 120_000 }),
+      signer.sign({ kind: 'delegation-create', parentChatId, parentDepth, ownerId: OWNER_ID, expiresAt: Date.now() + 120_000 }),
     close,
   };
 }
@@ -453,6 +474,14 @@ before(async () => {
   if (Number(tables[0]?.found ?? 0) !== 5) {
     throw new Error('Phase 4 tables missing — apply the Phase 4 migration first (root: npm run db:migrate).');
   }
+  // The run owner is a REAL Better Auth row: ownerId FKs (WorkDoc/Delegation)
+  // target "User", so the test-only owner identity must exist before any
+  // owner-scoped write. Deleted once in after() (rows first, user last).
+  await prisma.user.upsert({
+    where: { id: OWNER_ID },
+    create: { id: OWNER_ID, email: 'live-phase4@example.com', name: 'live phase4 owner' },
+    update: {},
+  });
   // Defensive pre-clean (a run id can never repeat): remove orphans of THIS run id.
   try {
     await prisma.delegation.deleteMany({ where: { parentChatId: { startsWith: `p4-${RUN_ID}` } } });
@@ -463,6 +492,14 @@ before(async () => {
 });
 
 after(async () => {
+  // Run-scoped rows first, the run User row last (nothing left dangling).
+  try {
+    await prisma.delegation.deleteMany({ where: { parentChatId: { startsWith: `p4-${RUN_ID}` } } });
+    await prisma.workDoc.deleteMany({ where: { chatId: { startsWith: `p4-${RUN_ID}` } } });
+    await prisma.user.deleteMany({ where: { id: OWNER_ID } });
+  } catch {
+    void 0;
+  }
   await bounded(prisma.$disconnect(), 10_000, 'prisma disconnect');
 });
 
@@ -505,6 +542,7 @@ async function createDirectDelegation(
     mode,
     task: 'Live delegated task: summarize the recorded migration notes.',
     depth: 1,
+    ownerId: OWNER_ID,
   });
   trackedDelegationIds.push(row.id);
   return row;
@@ -644,7 +682,7 @@ test('live sync delegation: same-REST child chat, signed contexts, deterministic
     const parentChatId = `p4-${RUN_ID}-syncp`;
     trackChat('orchestrator', parentChatId);
     const seeded = userMessageLive('please summarize the migration notes', 'pm-sync');
-    await stack.store.appendMessage({ slug: 'orchestrator', chatId: parentChatId }, seeded);
+    await stack.store.appendMessage({ ownerId: OWNER_ID, slug: 'orchestrator', chatId: parentChatId }, seeded);
 
     const created = await fetch(chatUrl(stack.port, 'orchestrator', '/delegations'), {
       method: 'POST',
@@ -681,7 +719,7 @@ test('live sync delegation: same-REST child chat, signed contexts, deterministic
     // The route stores `idempotencyKey(chat, headerKey)` where headerKey =
     // `${chatId}:${messageId}` — the chat id appears twice in the Redis key
     // by design (same as the Phase 2 live suite).
-    const childIdemKey = `${REDIS_KEY_PREFIX}:idempotency:researcher:${row.childChatId}:${row.childChatId}:${row.id}`;
+    const childIdemKey = `${REDIS_KEY_PREFIX}:idempotency:${OWNER_ID}:researcher:${row.childChatId}:${row.childChatId}:${row.id}`;
     trackIdempotency('researcher', row.childChatId, `${row.childChatId}:${row.id}`);
     const idemRaw = await stack.base.get(childIdemKey);
     assert.equal(idemRaw, '1', 'the child generation used the deterministic Idempotency-Key through the real route');
@@ -711,7 +749,7 @@ test('live async delegation: real BullMQ queue + worker drive the OWN run REST; 
   try {
     const parentChatId = `p4-${RUN_ID}-asyncp`;
     trackChat('orchestrator', parentChatId);
-    await stack.store.appendMessage({ slug: 'orchestrator', chatId: parentChatId }, userMessageLive('async please', 'pm-async'));
+    await stack.store.appendMessage({ ownerId: OWNER_ID, slug: 'orchestrator', chatId: parentChatId }, userMessageLive('async please', 'pm-async'));
 
     const created = await fetch(chatUrl(stack.port, 'orchestrator', '/delegations'), {
       method: 'POST',
@@ -777,7 +815,7 @@ test('live pending claim race: two concurrent /run on ONE pending row — one ex
   try {
     const parentChatId = `p4-${RUN_ID}-racep`;
     trackChat('orchestrator', parentChatId);
-    await stack.store.appendMessage({ slug: 'orchestrator', chatId: parentChatId }, userMessageLive('race seed', 'pm-race'));
+    await stack.store.appendMessage({ ownerId: OWNER_ID, slug: 'orchestrator', chatId: parentChatId }, userMessageLive('race seed', 'pm-race'));
 
     // Created DIRECTLY through the real Prisma repository: the async worker
     // cannot consume this row first (sync mode; never enqueued).
@@ -824,7 +862,7 @@ test('live ask_user byte-CAS: real Redis keeps options:[] arrays and huge litera
     const chatId = `p4-${RUN_ID}-hitl`;
     trackChat(slug, chatId);
     trackIdempotency(slug, chatId, 'answer-1');
-    const messagesKey = `${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:messages`;
+    const messagesKey = `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${slug}:${chatId}:messages`;
 
     // Older pending: raw entry with a huge numeric literal + options:[] array —
     // the exact bytes the old cjson script would corrupt.
@@ -839,7 +877,7 @@ test('live ask_user byte-CAS: real Redis keeps options:[] arrays and huge litera
 
     // Newest pending: a REAL pending ask_user (normal object path).
     await stack.store.appendMessage(
-      { slug, chatId },
+      { ownerId: OWNER_ID, slug, chatId },
       {
         id: 'a-newest',
         role: 'assistant',
@@ -896,9 +934,9 @@ test('live ask_user real concurrent race: CAS yields applied+unchanged and never
     const slug = 'orchestrator';
     const chatId = `p4-${RUN_ID}-hitlrace`;
     trackChat(slug, chatId);
-    const messagesKey = `${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:messages`;
+    const messagesKey = `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${slug}:${chatId}:messages`;
     await stack.store.appendMessage(
-      { slug, chatId },
+      { ownerId: OWNER_ID, slug, chatId },
       {
         id: 'a-race',
         role: 'assistant',
@@ -910,8 +948,8 @@ test('live ask_user real concurrent race: CAS yields applied+unchanged and never
 
     // Two REAL concurrent store CAS calls for the SAME pending part.
     const [first, second] = await Promise.all([
-      stack.store.answerPendingAskUser({ slug, chatId }, 'a-race', 'tc-race', 'answer-one'),
-      stack.store.answerPendingAskUser({ slug, chatId }, 'a-race', 'tc-race', 'answer-two'),
+      stack.store.answerPendingAskUser({ ownerId: OWNER_ID, slug, chatId }, 'a-race', 'tc-race', 'answer-one'),
+      stack.store.answerPendingAskUser({ ownerId: OWNER_ID, slug, chatId }, 'a-race', 'tc-race', 'answer-two'),
     ]);
     const outcomes = [first, second].sort();
     assert.deepEqual(outcomes, ['applied', 'unchanged'], 'exactly one CAS wins; the loser re-reads and is a typed no-op');
@@ -937,7 +975,7 @@ test('live running recovery: deterministic child id; stale+transcript recovers; 
   try {
     const parentChatId = `p4-${RUN_ID}-recoverp`;
     trackChat('orchestrator', parentChatId);
-    await stack.store.appendMessage({ slug: 'orchestrator', chatId: parentChatId }, userMessageLive('recover', 'pm-rec'));
+    await stack.store.appendMessage({ ownerId: OWNER_ID, slug: 'orchestrator', chatId: parentChatId }, userMessageLive('recover', 'pm-rec'));
 
     // -- (a) A real run builds a completed child transcript, then the row is
     //        set back to stale running via REAL DB timestamps (no sleeping).

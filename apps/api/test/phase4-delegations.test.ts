@@ -21,6 +21,7 @@ import {
   textStep,
   mockUsage,
   TEST_DELEGATION_SECRET,
+  TEST_OWNER,
 } from './helpers.js';
 import {
   createDelegationContextSigner,
@@ -50,6 +51,7 @@ function createHeader(parentChatId: string, parentMessageId: string, depth = 0, 
     kind: 'delegation-create',
     parentChatId,
     parentDepth: depth,
+    ownerId: TEST_OWNER.userId,
     expiresAt: window.expiresAt,
   });
 }
@@ -130,7 +132,7 @@ test('sync delegation end-to-end', { concurrency: false }, async () => {
 
   const app = await startTestApp({ agents: delegationFixtures(), model: model as never });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-1' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-1' }, [
       userMessage('delegate some research', 'pm-1'),
     ]);
     const response = await postChat({
@@ -184,8 +186,8 @@ class FakeDelegationQueue implements DelegationJobQueue {
   readonly enqueued: Array<{ jobId: string; data: DelegationJobData }> = [];
   closed = false;
 
-  async enqueue(delegationId: string, parentSlug: string): Promise<boolean> {
-    this.enqueued.push({ jobId: delegationJobId(delegationId), data: { delegationId, parentSlug } });
+  async enqueue(delegationId: string, parentSlug: string, ownerId: string): Promise<boolean> {
+    this.enqueued.push({ jobId: delegationJobId(delegationId), data: { delegationId, parentSlug, ownerId } });
     return true;
   }
 
@@ -221,7 +223,7 @@ test('async delegation: deterministic job id enqueue; worker executes through th
 
   const app = await startTestApp({ agents: delegationFixtures({ delegationQueue: queue }), model: model as never });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-async' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-async' }, [
       userMessage('async please', 'pa-1'),
     ]);
     const created = await createDelegation(app, { ...delegationBody(), mode: 'async', parentChatId: 'parent-async', parentMessageId: 'pa-1', task: 'Research async topics.' }, { header: createHeader('parent-async', 'pa-1') });
@@ -233,7 +235,7 @@ test('async delegation: deterministic job id enqueue; worker executes through th
     // Deterministic job id, parent slug carried in the payload.
     assert.equal(queue.enqueued.length, 1);
     assert.equal(queue.enqueued[0]?.jobId, `delegation-${row.id}`);
-    assert.deepEqual(queue.enqueued[0]?.data, { delegationId: row.id, parentSlug: 'orchestrator' });
+    assert.deepEqual(queue.enqueued[0]?.data, { delegationId: row.id, parentSlug: 'orchestrator', ownerId: TEST_OWNER.userId });
 
     // The worker calls its OWN run REST: signer + rewriting fetch from the
     // app's agents fixture (never a direct child generation).
@@ -243,14 +245,14 @@ test('async delegation: deterministic job id enqueue; worker executes through th
       baseUrl: app.agents?.internalOrigin ?? 'http://workforce-test-internal',
       delegationTimeoutMs: 120_000,
     });
-    await processDelegationJob(jobLike({ delegationId: row.id, parentSlug: 'orchestrator' }), runClient);
+    await processDelegationJob(jobLike({ delegationId: row.id, parentSlug: 'orchestrator', ownerId: TEST_OWNER.userId }), runClient);
 
     const after = await detail(app, row.id);
     assert.equal(after.delegation?.status, 'completed');
     assert.equal(after.delegation?.result, 'Async answer from the researcher.');
 
     // Retried job CANNOT double-run: child transcript unchanged, row stable.
-    await processDelegationJob(jobLike({ delegationId: row.id, parentSlug: 'orchestrator' }), runClient);
+    await processDelegationJob(jobLike({ delegationId: row.id, parentSlug: 'orchestrator', ownerId: TEST_OWNER.userId }), runClient);
     const child = await hydrateChild(app, row.childChatId);
     assert.equal(child.messages.length, 2);
     const afterRetry = await detail(app, row.id);
@@ -268,7 +270,7 @@ test('async delegation: deterministic job id enqueue; worker executes through th
 test('create validation: forged/missing/expired headers; wrong parent chat binding; depth 3+ → 403; parent checks', async () => {
   const app = await startTestApp({ agents: delegationFixtures() });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-1' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-1' }, [
       userMessage('hello', 'pm-1'),
     ]);
 
@@ -280,7 +282,7 @@ test('create validation: forged/missing/expired headers; wrong parent chat bindi
     // Forged (different secret).
     const forgedSigner = createDelegationContextSigner(Buffer.from('wrong-secret-wrong-secret-wrong', 'utf8'));
     const forged = await createDelegation(app, delegationBody(), {
-      header: forgedSigner.sign({ kind: 'delegation-create', parentChatId: 'parent-1', parentDepth: 0, expiresAt: Date.now() + 60_000 }),
+      header: forgedSigner.sign({ kind: 'delegation-create', parentChatId: 'parent-1', parentDepth: 0, ownerId: TEST_OWNER.userId, expiresAt: Date.now() + 60_000 }),
     });
     assert.equal(forged.status, 400);
 
@@ -290,7 +292,7 @@ test('create validation: forged/missing/expired headers; wrong parent chat bindi
 
     // Expired.
     const expired = await createDelegation(app, delegationBody(), {
-      header: signer.sign({ kind: 'delegation-create', parentChatId: 'parent-1', parentDepth: 0, expiresAt: Date.now() - 5 }),
+      header: signer.sign({ kind: 'delegation-create', parentChatId: 'parent-1', parentDepth: 0, ownerId: TEST_OWNER.userId, expiresAt: Date.now() - 5 }),
     });
     assert.equal(expired.status, 400);
 
@@ -312,7 +314,8 @@ test('create validation: forged/missing/expired headers; wrong parent chat bindi
       kind: 'delegation-child-chat',
       parentChatId: 'parent-1',
       childChatId: 'c',
-      targetAgent: 'researcher',
+      ownerId: TEST_OWNER.userId,
+targetAgent: 'researcher',
       depth: 1,
       ...contextWindow(60_000),
     });
@@ -343,7 +346,7 @@ test('create validation: forged/missing/expired headers; wrong parent chat bindi
 test('create: depth-0 root succeeds at child depth 1; run without/with wrong internal header is rejected', async () => {
   const app = await startTestApp({ agents: delegationFixtures() });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-run' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-run' }, [
       userMessage('run later', 'pr-1'),
     ]);
     const created = await createDelegation(app, { ...delegationBody(), mode: 'sync', parentChatId: 'parent-run', parentMessageId: 'pr-1' }, { header: createHeader('parent-run', 'pr-1') });
@@ -370,7 +373,8 @@ test('create: depth-0 root succeeds at child depth 1; run without/with wrong int
       kind: 'delegation-child-chat',
       parentChatId: row.parentChatId,
       childChatId: row.childChatId,
-      parentDepth: undefined,
+      ownerId: TEST_OWNER.userId,
+parentDepth: undefined,
       depth: 1,
       targetAgent: row.targetAgent,
       expiresAt: Date.now() + 60_000,
@@ -386,7 +390,8 @@ test('create: depth-0 root succeeds at child depth 1; run without/with wrong int
       kind: 'delegation-create',
       parentChatId: row.parentChatId,
       parentDepth: row.depth - 1,
-      expiresAt: Date.now() + 60_000,
+      ownerId: TEST_OWNER.userId,
+expiresAt: Date.now() + 60_000,
     });
     const rerun = await fetch(`http://127.0.0.1:${app.port}/api/agents/orchestrator/delegations/${row.id}/run`, {
       method: 'POST',
@@ -441,7 +446,7 @@ test('delegation timeout: a slow child marks the row `timeout` with a fixed safe
 
   const app = await startTestApp({ agents: delegationFixtures({ delegationTimeoutMs: 300 }), model: model as never });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-slow' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-slow' }, [
       userMessage('slow child', 'ps-1'),
     ]);
     const created = await createDelegation(app, { ...delegationBody(), mode: 'sync', parentChatId: 'parent-slow', parentMessageId: 'ps-1', task: 'slow task' }, { header: createHeader('parent-slow', 'ps-1') });
@@ -467,7 +472,7 @@ test('provider failure in the child marks the row `failed` with a fixed safe err
   } as never;
   const app = await startTestApp({ agents: delegationFixtures(), model: failingModel });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-fail' }, [
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-fail' }, [
       userMessage('boom', 'pf-1'),
     ]);
     const created = await createDelegation(app, { ...delegationBody(), mode: 'sync', parentChatId: 'parent-fail', parentMessageId: 'pf-1', task: 'boom task' }, { header: createHeader('parent-fail', 'pf-1') });
@@ -498,7 +503,7 @@ test('child chats carry the task as a real user message (same-REST composition p
   } as never);
   const app = await startTestApp({ agents: delegationFixtures(), model: model as never });
   try {
-    await seedMessages(app.store, { slug: 'orchestrator', chatId: 'parent-depth' }, [userMessage('go', 'pd-1')]);
+    await seedMessages(app.store, { ownerId: TEST_OWNER.userId, slug: 'orchestrator', chatId: 'parent-depth' }, [userMessage('go', 'pd-1')]);
     const created = await createDelegation(app, { ...delegationBody(), mode: 'sync', parentChatId: 'parent-depth', parentMessageId: 'pd-1' }, { header: createHeader('parent-depth', 'pd-1') });
     assert.equal(created.status, 201);
     const row = created.body['delegation'] as Delegation;
@@ -525,9 +530,10 @@ test('InMemoryDelegationRepository + queue lifecycle coexist; queue close is ide
     mode: 'async',
     task: 't',
     depth: 1,
+    ownerId: TEST_OWNER.userId,
   });
   assert.equal(row.status, 'pending');
-  assert.equal(await queue.enqueue(row.id, 'orchestrator'), true);
+  assert.equal(await queue.enqueue(row.id, 'orchestrator', TEST_OWNER.userId), true);
   await queue.close();
   assert.equal(queue.closed, true);
   const duplicateChild = await repo.create({

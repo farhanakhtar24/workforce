@@ -39,6 +39,14 @@ export const DELEGATION_WORKER_CONCURRENCY = 2;
 export interface DelegationJobData {
   readonly delegationId: string;
   readonly parentSlug: string;
+  /**
+   * The platform owner (Better Auth `User.id`) the delegation belongs to,
+   * captured at CREATE time: BullMQ persists job payloads, so the async run
+   * (including after a restart) recovers the SAME owner and can mint a
+   * signed run context bound to the row. Ownerless legacy delegations are
+   * never enqueued (the create route is authenticated).
+   */
+  readonly ownerId: string;
 }
 
 export function isDelegationJobData(value: unknown): value is DelegationJobData {
@@ -46,7 +54,8 @@ export function isDelegationJobData(value: unknown): value is DelegationJobData 
     value !== null &&
     typeof value === 'object' &&
     typeof (value as { delegationId?: unknown }).delegationId === 'string' &&
-    typeof (value as { parentSlug?: unknown }).parentSlug === 'string'
+    typeof (value as { parentSlug?: unknown }).parentSlug === 'string' &&
+    typeof (value as { ownerId?: unknown }).ownerId === 'string'
   );
 }
 
@@ -90,7 +99,7 @@ export interface DelegationJobQueueOptions {
 
 export interface DelegationJobQueue {
   /** Enqueues one run job; duplicate ids while in-flight are no-ops. */
-  enqueue(delegationId: string, parentSlug: string): Promise<boolean>;
+  enqueue(delegationId: string, parentSlug: string, ownerId: string): Promise<boolean>;
   ping(timeoutMs?: number): Promise<void>;
   close(): Promise<void>;
 }
@@ -115,9 +124,12 @@ export class BullMQDelegationJobQueue implements DelegationJobQueue {
     }) as unknown as DelegationQueueLike;
   }
 
-  async enqueue(delegationId: string, parentSlug: string): Promise<boolean> {
+  async enqueue(delegationId: string, parentSlug: string, ownerId: string): Promise<boolean> {
     if (this.closed) {
       throw new Error('delegation queue is closed');
+    }
+    if (typeof ownerId !== 'string' || ownerId.length === 0) {
+      throw new Error('delegation enqueue requires an ownerId');
     }
     const jobId = delegationJobId(delegationId);
     const existing = await this.queue.getJob(jobId);
@@ -128,7 +140,9 @@ export class BullMQDelegationJobQueue implements DelegationJobQueue {
       }
       await existing.remove(); // genuine requeue under the same deterministic id.
     }
-    await this.queue.add('run', { delegationId, parentSlug } as DelegationJobData, {
+    // The owner rides in the persisted payload: retried jobs (even across a
+    // restart) recover the SAME owner for the signed run context.
+    await this.queue.add('run', { delegationId, parentSlug, ownerId } as DelegationJobData, {
       ...delegationJobOptions(),
       jobId,
     });
@@ -176,10 +190,11 @@ export class BullMQDelegationJobQueue implements DelegationJobQueue {
 
 export interface DelegationRunJobClient {
   /**
-   * Runs one delegation through the OWN run REST route. Returns whether the
-   * call succeeded (2xx) — terminal/running no-ops are successes.
+   * Runs one delegation through the OWN run route with the owner from the
+   * persisted job payload. Returns whether the call succeeded (2xx) —
+   * terminal/running no-ops are successes.
    */
-  run(delegationId: string, parentSlug: string): Promise<boolean>;
+  run(delegationId: string, parentSlug: string, ownerId: string): Promise<boolean>;
 }
 
 export interface DelegationWorkerOptions {
@@ -210,7 +225,7 @@ export async function processDelegationJob(
   if (!isDelegationJobData(data)) {
     throw new Error('delegation job payload failed validation');
   }
-  const ok = await runClient.run(data.delegationId, data.parentSlug);
+  const ok = await runClient.run(data.delegationId, data.parentSlug, data.ownerId);
   if (!ok) {
     // Transient REST failure: throw so BullMQ's attempts/backoff own the
     // retry. The run route's row-state guarantee keeps retries idempotent.

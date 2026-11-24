@@ -42,7 +42,7 @@ import { loadApiConfig } from '../src/config.js';
 import { buildApp } from '../src/app.js';
 import {
   APPEND_MESSAGE_WITH_INDEX_LUA,
-  CHAT_INDEX_KEY,
+  chatIndexKey,
   createRedisChatStore,
   REDIS_KEY_PREFIX,
   type RedisLike,
@@ -57,6 +57,9 @@ const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://127.0.0.1:6379';
 const RUN_ID = `hist-${process.pid.toString(36)}-${Date.now().toString(36)}`;
 const STREAM_KEY_PREFIX = `workforce:phase2:stream-live-test:${RUN_ID}`;
 const SLUG = 'general';
+/** The live tests exercise ONE owner: key shapes are owner-scoped (pre-Phase 6). */
+const OWNER_ID = `owner-${RUN_ID}`;
+const indexKey = (): string => `${REDIS_KEY_PREFIX}:chat-index:${OWNER_ID}`;
 const INDEXED_CHAT_ID = `${RUN_ID}-live-post`;
 const LEGACY_A_ID = `${RUN_ID}-legacy-a`;
 const LEGACY_B_ID = `${RUN_ID}-legacy-b`;
@@ -78,13 +81,13 @@ interface LiveStack {
 }
 
 function messagesKey(chatId: string, slug = SLUG): string {
-  return `${REDIS_KEY_PREFIX}:chat:${slug}:${chatId}:messages`;
+  return `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${slug}:${chatId}:messages`;
 }
 function activeStreamKey(chatId: string): string {
-  return `${REDIS_KEY_PREFIX}:chat:${SLUG}:${chatId}:active-stream`;
+  return `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${chatId}:active-stream`;
 }
 function idempotencyKey(chatId: string, key: string): string {
-  return `${REDIS_KEY_PREFIX}:idempotency:${SLUG}:${chatId}:${key}`;
+  return `${REDIS_KEY_PREFIX}:idempotency:${OWNER_ID}:${SLUG}:${chatId}:${key}`;
 }
 
 /** Bounded wait around an explicit condition — never an arbitrary sleep. */
@@ -188,12 +191,15 @@ async function createLiveStack(model: LanguageModel | null): Promise<LiveStack &
     keyPrefix: STREAM_KEY_PREFIX,
   });
   const config = loadApiConfig({ OLLAMA_API_KEY: 'test-only-not-a-real-key', PORT: '3001', REDIS_URL });
+  // Test-only owner injection (never a production bypass): the whole suite
+  // acts as the SAME per-run owner the Redis key/scan shapes use.
   const app = buildApp({
     config,
     store,
     streamContext,
     model: (model ?? 'unused') as LanguageModel,
     background,
+    auth: { staticOwner: { userId: OWNER_ID, email: 'live-chat-history@example.com', emailVerified: true } },
   });
   const server = app.listen(0);
   await new Promise<void>((resolve, reject) => {
@@ -219,7 +225,7 @@ async function createLiveStack(model: LanguageModel | null): Promise<LiveStack &
       server.closeIdleConnections();
       await background.waitForAll(3_000);
       await Promise.allSettled([...ownedKeys].map((key) => base.del(key)));
-      await Promise.allSettled([...ownedMembers].map((member) => base.zRem(CHAT_INDEX_KEY, member)));
+      await Promise.allSettled([...ownedMembers].map((member) => base.zRem(indexKey(), member)));
       await Promise.allSettled([base.quit(), publisher.quit(), subscriber.quit()]);
     },
   };
@@ -258,7 +264,7 @@ test('live: legacy discovery + indexed write order over real Redis', { timeout: 
     await base.rPush(foreign, JSON.stringify({ id: 'fx', role: 'user', parts: [{ type: 'text', text: 'foreign' }] }));
     // A hand-planted INDEX member whose message list does not exist: stale.
     stack.ownIndexMember(GHOST_MEMBER);
-    await base.zAdd(CHAT_INDEX_KEY, [{ value: GHOST_MEMBER, score: Date.now() }]);
+    await base.zAdd(indexKey(), [{ value: GHOST_MEMBER, score: Date.now() }]);
 
     // ---- 2. A REAL POST through the real app: the atomic Lua write lands
     // the message list entry AND the index member together.
@@ -274,7 +280,7 @@ test('live: legacy discovery + indexed write order over real Redis', { timeout: 
     await response.text();
     const store = createRedisChatStore(base as unknown as RedisLike);
     await waitFor(
-      async () => (await store.getActiveStreamId({ slug: SLUG, chatId: INDEXED_CHAT_ID })) === null,
+      async () => (await store.getActiveStreamId({ ownerId: OWNER_ID, slug: SLUG, chatId: INDEXED_CHAT_ID })) === null,
       10_000,
       'completion never cleared the active marker',
     );
@@ -283,7 +289,7 @@ test('live: legacy discovery + indexed write order over real Redis', { timeout: 
 
     // Both effects of ONE append are present: the index member got re-scored
     // and the real ZRANGE REV read back newest-score-first.
-    const indexWindow = await base.zRangeWithScores(CHAT_INDEX_KEY, '+inf', '-inf', {
+    const indexWindow = await base.zRangeWithScores(indexKey(), '+inf', '-inf', {
       BY: 'SCORE',
       REV: true,
       LIMIT: { offset: 0, count: 25 },
@@ -359,12 +365,12 @@ test('live: real-Lua atomic append + index (both land together; wrongtype refuse
 
     // The store's own script through REAL Redis: RPUSH + ZADD land together.
     const ok = await base.eval(APPEND_MESSAGE_WITH_INDEX_LUA, {
-      keys: [listKey, CHAT_INDEX_KEY],
+      keys: [listKey, indexKey()],
       arguments: [entry, score, `${SLUG}:${chatId}`],
     });
     assert.equal(ok, 1, 'real Redis executes the atomic append+index script');
     assert.deepEqual(await base.lRange(listKey, 0, -1), [entry], 'the LIST entry landed');
-    const window = await base.zRangeWithScores(CHAT_INDEX_KEY, '+inf', '-inf', { BY: 'SCORE', REV: true });
+    const window = await base.zRangeWithScores(indexKey(), '+inf', '-inf', { BY: 'SCORE', REV: true });
     const scored = window.find((candidate) => candidate.value === `${SLUG}:${chatId}`);
     assert.ok(scored !== undefined, 'the SAME script re-scored the index member');
     assert.equal(Number(scored.score), Number(score));
@@ -397,7 +403,7 @@ test('live: indexed chat outside the read window keeps its real timestamp (zScor
     const store = createRedisChatStore(base as unknown as RedisLike);
     stack.ownKey(messagesKey(chatId));
     stack.ownIndexMember(`${SLUG}:${chatId}`);
-    await store.appendMessage({ slug: SLUG, chatId }, { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'recovered from window overflow' }] } as unknown as UIMessage);
+    await store.appendMessage({ ownerId: OWNER_ID, slug: SLUG, chatId }, { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'recovered from window overflow' }] } as unknown as UIMessage);
     // Overfill the top read window with stale members (no message lists):
     // with limit 5 the window is 5 + 16 = 21 entries < 76 members, so this
     // chat's member falls outside the ZRANGE window and is rediscovered by
@@ -406,16 +412,16 @@ test('live: indexed chat outside the read window keeps its real timestamp (zScor
     // sorts FIRST among legacy candidates (digit prefix), so the fixed
     // behavior is observable deterministically on a shared dev Redis.
     const member = `${SLUG}:${chatId}`;
-    const window = await base.zRangeWithScores(CHAT_INDEX_KEY, '+inf', '-inf', { BY: 'SCORE', REV: true });
+    const window = await base.zRangeWithScores(indexKey(), '+inf', '-inf', { BY: 'SCORE', REV: true });
     const scored = window.find((entry) => entry.value === member);
     assert.ok(scored !== undefined, 'the chat is indexed in real Redis');
     const realScore = Number(scored.score);
     for (let index = 0; index < 70; index += 1) {
       const staleMember = `${SLUG}:${RUN_ID}-stale-${String(index).padStart(2, '0')}`;
       await stack.ownIndexMember(staleMember);
-      await base.zAdd(CHAT_INDEX_KEY, [{ value: staleMember, score: realScore + 1 + index }]);
+      await base.zAdd(indexKey(), [{ value: staleMember, score: realScore + 1 + index }]);
     }
-    const chats = await store.listRecentChats(5);
+    const chats = await store.listRecentChats(OWNER_ID, 5);
     const recovered = chats.find((chat) => chat.chatId === chatId);
     assert.ok(recovered !== undefined, 'the window-fallen indexed chat is still listed on real Redis');
     assert.equal(recovered.lastActivityAt, new Date(realScore).toISOString(), 'real ZSCORE keeps the true timestamp');
@@ -435,17 +441,17 @@ test('live: store-level listRecentChats over real Redis — clamps, timestamp, s
     const listKey = messagesKey(chatId);
     stack.ownKey(listKey);
     stack.ownIndexMember(`${SLUG}:${chatId}`);
-    await store.appendMessage({ slug: SLUG, chatId }, { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'store api text' }] } as unknown as UIMessage);
-    const chats = await store.listRecentChats(50);
+    await store.appendMessage({ ownerId: OWNER_ID, slug: SLUG, chatId }, { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'store api text' }] } as unknown as UIMessage);
+    const chats = await store.listRecentChats(OWNER_ID, 50);
     const summary = chats.filter(isRunChat).find((chat) => chat.chatId === chatId);
     assert.ok(summary !== undefined, 'store.listRecentChats surfaces the indexed chat');
     assert.equal(summary.title, 'store api text');
     assert.equal(summary.messageCount, 1);
     assert.ok(summary.lastActivityAt !== null);
     // Defensive clamps: huge/NaN limits stay bounded reads (never throw).
-    const clamped = await store.listRecentChats(100_000);
+    const clamped = await store.listRecentChats(OWNER_ID, 100_000);
     assert.ok(Array.isArray(clamped));
-    assert.ok(Array.isArray(await store.listRecentChats(Number.NaN)));
+    assert.ok(Array.isArray(await store.listRecentChats(OWNER_ID, Number.NaN)));
 
     // A full Redis-like failure maps to the typed 503-safe error.
     const boom = (): Promise<never> => Promise.reject(new Error('ECONNREFUSED test-only'));
@@ -462,7 +468,7 @@ test('live: store-level listRecentChats over real Redis — clamps, timestamp, s
       scan: boom,
       eval: boom,
     });
-    await assert.rejects(() => broken.listRecentChats(20), StoreUnavailableError);
+    await assert.rejects(() => broken.listRecentChats(OWNER_ID, 20), StoreUnavailableError);
   } finally {
     await stack.close();
   }

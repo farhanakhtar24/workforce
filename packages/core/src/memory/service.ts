@@ -50,7 +50,9 @@ import {
   parseMemoryInput,
   compactPathInputSchema,
   isBoundedMetadata,
+  purgeDerivedChatInputSchema,
   queryBlocksInputSchema,
+  type MemoryPurgeDerivedInput,
   semanticSearchInputSchema,
   writeBlockInputSchema,
   type MemoryCompactPathInput,
@@ -472,7 +474,29 @@ export class MemoryService {
   }
 
   // ===========================================================================
-  // exploreRelated
+  // purgeDerivedChatMemory (personal-memory lifecycle)
+  // ===========================================================================
+
+  /**
+   * Purges DERIVED per-chat personal-memory blocks for the owner scope and
+   * the chat's exact path `chats/{chatId}` — with the optional
+   * `assistantMessageIds` narrowing (the rewind contract deletes ONLY the
+   * blocks derived from the removed assistant messages). Deletes active AND
+   * superseded rows (both are derived from the same chat) and returns the
+   * deleted count. Shape is validated; the store never deletes any other
+   * owner's scope (single-tenant per scope by construction).
+   */
+  async purgeDerivedChatMemory(input: MemoryPurgeDerivedInput): Promise<number> {
+    const parsed = parseMemoryInput(purgeDerivedChatInputSchema, input);
+    return this.options.store.purgeDerivedChatBlocks({
+      scope: parsed.scope,
+      path: parsed.path,
+      ...(parsed.assistantMessageIds !== undefined ? { assistantMessageIds: parsed.assistantMessageIds } : {}),
+    });
+  }
+
+  // ===========================================================================
+  // exploreRelated (block detail)
   // ===========================================================================
 
   /**

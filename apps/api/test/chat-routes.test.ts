@@ -10,6 +10,7 @@ import type { MockLanguageModelV3 } from 'ai/test';
 import type { UIMessage } from 'ai';
 
 import {
+  TEST_OWNER,
   createMockModel,
   createFailingModel,
   calculateStep,
@@ -29,6 +30,8 @@ import { IDEMPOTENCY_KEY_TTL_SECONDS } from '../src/store/types.js';
 import type { ChatStore } from '../src/store/types.js';
 
 const CHAT = 'chat-1';
+/** The owner the buildApp test injection attaches ({@link TEST_OWNER}). */
+const REF = { ownerId: TEST_OWNER.userId } as const;
 
 function chatBody(message: { id: string; text: string }): { id: string; message: UIMessage } {
   return {
@@ -86,7 +89,7 @@ test('hydration: seeded chat returns stored UIMessages and no-store', async () =
     const stored: UIMessage[] = [
       { id: 'msg-user', role: 'user', parts: [{ type: 'text', text: 'seed' }] },
     ];
-    await seedMessages(app.store, { slug: 'general', chatId: CHAT }, stored);
+    await seedMessages(app.store, { ...REF, slug: 'general', chatId: CHAT }, stored);
     const response = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}`);
     assert.equal(response.status, 200);
     const body = (await response.json()) as { messages: UIMessage[]; hasActiveStream: boolean };
@@ -187,7 +190,7 @@ test('POST happy path: SSE response, server-generated ids, full persistence', as
     await app.background.waitForAll(2_000);
     const snapshot = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     assert.equal(snapshot.activeStreamId, null);
     const messages = snapshot.messages as UIMessage[];
     assert.equal(messages.length, 2);
@@ -294,7 +297,7 @@ test('calculate tool parts persist with output and a stable id', async () => {
     await app.background.waitForAll(2_000);
     const snapshot = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     const assistant = (snapshot.messages as UIMessage[])[1];
     const toolPart = assistant?.parts.find(
       (part) => part.type === 'tool-calculate',
@@ -352,7 +355,7 @@ test('existing idempotency key with an unpersisted message: 409, zero extra mode
   try {
     // Simulate a concurrent first request that acquired the key but has not
     // persisted its user message yet (between SET NX and appendMessage).
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.acquireIdempotencyKey(chat, `${CHAT}:m2`, 900);
 
     const second = await postChat({ port: app.port, body: chatBody({ id: 'm2', text: 'two' }) });
@@ -438,7 +441,7 @@ test('provider failure becomes a safe stream error; nothing sensitive leaks', as
     await app.background.waitForAll(2_000);
     const snapshot = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     assert.equal(snapshot.activeStreamId, null);
     const messages = snapshot.messages as UIMessage[];
     assert.equal(messages.length, 1, 'no empty assistant message is persisted');
@@ -470,7 +473,7 @@ test('mid-stream provider failure is contained; partial assistant text persists'
     await app.background.waitForAll(2_000);
     const snapshot = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     const messages = snapshot.messages as UIMessage[];
     assert.equal(messages.length, 2, 'partial assistant content is persisted');
     const assistant = messages[1];
@@ -518,7 +521,7 @@ test('client disconnect neither aborts the model nor drops persistence', async (
 
     const snapshot = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     assert.equal(snapshot.activeStreamId, null, 'completion still clears its own marker');
     const messages = snapshot.messages as UIMessage[];
     const assistant = messages[1];
@@ -561,7 +564,7 @@ test('resume: 204 when no stream is active', async () => {
 test('resume: full SSE replay with the UI message stream headers', async () => {
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.setActiveStreamId(chat, 'strm-active');
     const recordedFrame = 'data: {"type":"text-delta","id":"t1","delta":"Hello "}\n\n';
     const stateResume = (app.streamContext as import('../src/stream-context/memory.js').InMemoryStreamContext).state;
@@ -580,7 +583,7 @@ test('resume: full SSE replay with the UI message stream headers', async () => {
 test('resume: 204 when the active stream vanished (server-side finish/crash)', async () => {
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.setActiveStreamId(chat, 'strm-gone');
     // The memory context has no record of strm-gone: resumeExistingStream → undefined.
     const response = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}/stream`);
@@ -604,6 +607,11 @@ test('redis unavailable: hydration, chat POST, and resume all return explicit 50
     releaseIdempotencyKey: failure,
     answerPendingAskUser: failure,
     listRecentChats: failure,
+    deleteChat: failure,
+    branchChat: () => Promise.reject(new Error('ECONNREFUSED 127.0.0.1:6379')),
+    rewindChat: failure,
+    getChatModel: failure,
+    setChatModel: failure,
   };
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }), store });
   const seen: unknown[] = [];
@@ -652,7 +660,28 @@ test('CORS: web origin allowed with Idempotency-Key; other origins rejected', as
     });
     assert.equal(preflight.status, 204);
     assert.equal(preflight.headers.get('access-control-allow-origin'), TEST_ORIGINAL_ORIGIN);
+    assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
     assert.equal(preflight.headers.get('access-control-allow-headers')?.includes('Idempotency-Key'), true);
+
+    // Chat DELETE and the per-chat model PUT must preflight cross-origin too.
+    const preflightDelete = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}`, {
+      method: 'OPTIONS',
+      headers: { Origin: TEST_ORIGINAL_ORIGIN, 'Access-Control-Request-Method': 'DELETE' },
+    });
+    assert.equal(preflightDelete.status, 204);
+    const allowMethodsDelete = (preflightDelete.headers.get('access-control-allow-methods') ?? '').toUpperCase();
+    assert.equal(allowMethodsDelete.includes('DELETE'), true, 'DELETE allowed');
+    assert.equal(preflightDelete.headers.get('access-control-allow-origin'), TEST_ORIGINAL_ORIGIN);
+    assert.equal(preflightDelete.headers.get('access-control-allow-credentials'), 'true');
+
+    const preflightPut = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}/model`, {
+      method: 'OPTIONS',
+      headers: { Origin: TEST_ORIGINAL_ORIGIN, 'Access-Control-Request-Method': 'PUT' },
+    });
+    assert.equal(preflightPut.status, 204);
+    const allowMethodsPut = (preflightPut.headers.get('access-control-allow-methods') ?? '').toUpperCase();
+    assert.equal(allowMethodsPut.includes('PUT'), true, 'PUT allowed');
+    assert.equal(preflightPut.headers.get('access-control-allow-origin'), TEST_ORIGINAL_ORIGIN);
 
     const stranger = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat`, {
       method: 'OPTIONS',
@@ -660,6 +689,17 @@ test('CORS: web origin allowed with Idempotency-Key; other origins rejected', as
     });
     assert.equal(stranger.status, 204);
     assert.equal(stranger.headers.get('access-control-allow-origin'), null);
+    // Foreign origins are equally rejected for the mutation preflights.
+    const strangerDelete = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}`, {
+      method: 'OPTIONS',
+      headers: { Origin: 'http://evil.example', 'Access-Control-Request-Method': 'DELETE' },
+    });
+    assert.equal(strangerDelete.headers.get('access-control-allow-origin'), null);
+    const strangerPut = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}/model`, {
+      method: 'OPTIONS',
+      headers: { Origin: 'http://evil.example', 'Access-Control-Request-Method': 'PUT' },
+    });
+    assert.equal(strangerPut.headers.get('access-control-allow-origin'), null);
   } finally {
     await app.close();
   }
@@ -668,7 +708,7 @@ test('CORS: web origin allowed with Idempotency-Key; other origins rejected', as
 test('completion clears only its own active stream id (stale-clear protection)', async () => {
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.setActiveStreamId(chat, 'strm-older');
     // A newer stream started (server restart scenario):
     await app.store.setActiveStreamId(chat, 'strm-newer');
@@ -695,7 +735,7 @@ test('full lifecycle: two turns keep history and leave no active stream', async 
 
     const snapshot = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     assert.equal((snapshot.messages as UIMessage[]).length, 4);
     assert.equal(snapshot.activeStreamId, null);
     assert.equal(snapshot.idempotencyKeys.size, 2, 'keys remain (never released once streaming)');
@@ -759,7 +799,7 @@ test('invalid newest message: fixed 400, nothing durable stored, later turns sti
     // No key acquired, nothing appended, no brick: the chat still works.
     const memoryStore = (
       app.store as ReturnType<typeof import('../src/store/memory.js').createInMemoryChatStore>
-    ).snapshot({ slug: 'general', chatId: CHAT });
+    ).snapshot({ ...REF, slug: 'general', chatId: CHAT });
     assert.equal(memoryStore.messages.length, 0);
     assert.equal(memoryStore.idempotencyKeys.size, 0);
 
@@ -776,7 +816,7 @@ test('corrupt pre-existing stored history: fixed 503, no provider work, nothing 
   const model = createMockModel({ steps: [textStep()] });
   const app = await startTestApp({ model });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     // Append a structurally invalid UIMessage directly (simulates corrupt state).
     await app.store.appendMessage(chat, {
       id: 'corrupt',
@@ -802,7 +842,7 @@ test('corrupt pre-existing stored history: fixed 503, no provider work, nothing 
 test('invalid newest message on top of corrupt stored history: 503 (stored classified first)', async () => {
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.appendMessage(chat, {
       id: 'corrupt',
       role: 'user',
@@ -824,7 +864,7 @@ test('invalid newest message on top of corrupt stored history: 503 (stored class
 
 test('store-level: reversed completions retain every appended message', async () => {
   const store = (await import('../src/store/memory.js')).createInMemoryChatStore();
-  const chat = { slug: 'general' as const, chatId: 'c-concurrent' };
+  const chat = { ...REF, slug: 'general' as const, chatId: 'c-concurrent' };
   await store.appendMessage(chat, { id: 'u1', role: 'user', parts: [] } as never);
   await store.appendMessage(chat, { id: 'u2', role: 'user', parts: [] } as never);
   // Stream 2 completes before stream 1.
@@ -857,7 +897,7 @@ test('route-level: an earlier generation completing after a newer user append ke
     const textPromise1 = response1.text();
     await waitFor(
       async () =>
-        (await app.store.loadMessages({ slug: 'general', chatId: CHAT })).some(
+        (await app.store.loadMessages({ ...REF, slug: 'general', chatId: CHAT })).some(
           (message) => (message as { id?: string }).id === 'm1',
         ) && model.doStreamCalls.length >= 1,
       3_000,
@@ -871,7 +911,7 @@ test('route-level: an earlier generation completing after a newer user append ke
     await parseSseChunks(response2);
     await waitFor(
       async () =>
-        (await app.store.loadMessages({ slug: 'general', chatId: CHAT })).some(
+        (await app.store.loadMessages({ ...REF, slug: 'general', chatId: CHAT })).some(
           (message) => (message as { role?: string }).role === 'assistant',
         ),
       3_000,
@@ -883,7 +923,7 @@ test('route-level: an earlier generation completing after a newer user append ke
     await textPromise1;
     await app.background.waitForAll(3_000);
 
-    const messages = (await app.store.loadMessages({ slug: 'general', chatId: CHAT })) as UIMessage[];
+    const messages = (await app.store.loadMessages({ ...REF, slug: 'general', chatId: CHAT })) as UIMessage[];
     const ids = messages.map((message) => message.id);
     assert.equal(messages.length, 4, `exactly four messages survive: ${ids.join(',')}`);
     assert.equal(ids.filter((id) => id === 'm1').length, 1, 'user m1 retained');
@@ -945,7 +985,7 @@ test('oversized JSON body: fixed 413, not a 500', async () => {
 test('resume with a finished stream (null): marker compare-and-deleted, then 204', async () => {
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     const context = app.streamContext as import('../src/stream-context/memory.js').InMemoryStreamContext;
     const state2 = context.state;
     assert.ok(state2 !== undefined);
@@ -967,7 +1007,7 @@ test('resume with a finished stream (null): marker compare-and-deleted, then 204
 test('resume with a vanished stream (undefined): marker compare-and-deleted, then 204', async () => {
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }) });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.setActiveStreamId(chat, 'strm-gone');
     // No checkpoint record at all (crash before the durable copy registered).
 
@@ -990,7 +1030,7 @@ test('resume with a stale-producer ack timeout: marker compare-and-deleted, then
     },
   });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.setActiveStreamId(chat, 'strm-stale-producer');
 
     const response = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}/stream`);
@@ -1012,7 +1052,7 @@ test('resume with a generic failure: safe 503 and the marker is untouched', asyn
     },
   });
   try {
-    const chat = { slug: 'general' as const, chatId: CHAT };
+    const chat = { ...REF, slug: 'general' as const, chatId: CHAT };
     await app.store.setActiveStreamId(chat, 'strm-live');
 
     const response = await fetch(`http://127.0.0.1:${app.port}/api/agents/general/chat/${CHAT}/stream`);
@@ -1044,7 +1084,7 @@ test('stream finish carries optional usage metadata; Phase 2 shape preserved', a
     );
     // The persisted assistant message carries the same metadata; old
     // consumers that ignore `metadata` are unaffected.
-    const stored = (await app.store.loadMessages({ slug: 'general', chatId: CHAT })) as UIMessage[];
+    const stored = (await app.store.loadMessages({ ...REF, slug: 'general', chatId: CHAT })) as UIMessage[];
     const assistant = stored[stored.length - 1] as UIMessage;
     assert.equal(assistant.role, 'assistant');
     assert.deepEqual(

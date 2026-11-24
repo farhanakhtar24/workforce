@@ -2,20 +2,26 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
-import { History, RotateCw } from 'lucide-react';
+import { History, Loader2, RotateCw, Trash2, X } from 'lucide-react';
 import { AgentAvatar } from '@/components/AgentAvatar';
 import { resolveApiBaseUrl } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import {
-  CHATS_CHANGED_EVENT,
   RECENT_CHATS_DEFAULT_LIMIT,
   RECENT_CHATS_HINT,
+  CHATS_CHANGED_EVENT,
   fetchRecentChats,
   formatRecentChatMeta,
   isCurrentRecentChat,
   recentChatHref,
   type RecentChat,
 } from '@/lib/recent-chats';
+import {
+  CHAT_DELETE_NOTE as DELETE_NOTE,
+  deleteChat,
+  notifyChatsChanged,
+  type ChatMutationTarget,
+} from '@/lib/chat-mutations';
 
 /**
  * Real recent-chat history fed by `GET /api/chats` through the public API
@@ -85,9 +91,54 @@ export function RecentChats(): React.ReactElement {
 
   const rows = state.phase === 'ready' ? state.chats : [];
 
+  const [pendingDelete, setPendingDelete] = useState<RecentChat | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+
+  const openDelete = useCallback((chat: RecentChat): void => {
+    setDeleteError(null);
+    setPendingDelete(chat);
+    dialogRef.current?.showModal();
+  }, []);
+
+  const closeDelete = useCallback((): void => {
+    if (deleting) return;
+    dialogRef.current?.close();
+    setPendingDelete(null);
+    setDeleteError(null);
+  }, [deleting]);
+
+  const confirmDelete = useCallback(async (): Promise<void> => {
+    const target = pendingDelete;
+    if (target === null || deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    const mutation: ChatMutationTarget = {
+      apiBaseUrl,
+      slug: target.agent,
+      chatId: target.chatId,
+    };
+    const result = await deleteChat(mutation);
+    setDeleting(false);
+    if (!result.ok) {
+      setDeleteError(result.error);
+      return;
+    }
+    dialogRef.current?.close();
+    setPendingDelete(null);
+    // The list (and any active-generation state) must refresh; deleting the
+    // CURRENT chat also navigates the view to a fresh Plan chat.
+    notifyChatsChanged();
+    if (isCurrentRecentChat(window.location.pathname, target)) {
+      window.location.assign('/');
+    } else {
+      void load({ soft: true });
+    }
+  }, [pendingDelete, deleting, load]);
+
   return (
     <>
-      {/* Desktop: scrollable region between the primary nav and the footer. */}
       <div className="hidden min-h-0 flex-1 flex-col gap-1.5 md:flex">
         <p className="flex items-center gap-1.5 px-2.5 text-[0.7rem] font-semibold tracking-[0.06em] text-sidebar-foreground/55 uppercase">
           <History size={13} aria-hidden="true" />
@@ -98,7 +149,13 @@ export function RecentChats(): React.ReactElement {
           title={RECENT_CHATS_HINT}
           className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-0.5"
         >
-          <RecentChatsBody state={state} chats={rows} pathname={pathname} onRetry={() => void load()} />
+          <RecentChatsBody
+            state={state}
+            chats={rows}
+            pathname={pathname}
+            onRetry={() => void load()}
+            onRequestDelete={openDelete}
+          />
         </nav>
       </div>
 
@@ -121,9 +178,83 @@ export function RecentChats(): React.ReactElement {
           title={RECENT_CHATS_HINT}
           className="max-h-64 overflow-y-auto overscroll-contain"
         >
-          <RecentChatsBody state={state} chats={rows} pathname={pathname} onRetry={() => void load()} />
+          <RecentChatsBody
+            state={state}
+            chats={rows}
+            pathname={pathname}
+            onRetry={() => void load()}
+            onRequestDelete={openDelete}
+          />
         </nav>
       </details>
+
+      {/* Accessible native confirmation dialog (Escape + backdrop close via
+          the explicit Cancel button; focus starts on the dialog). */}
+      <dialog
+        ref={dialogRef}
+        aria-labelledby="recent-chats-delete-title"
+        className="m-auto w-[26rem] max-w-[92vw] rounded-xl border border-border bg-card p-5 text-card-foreground shadow-lg backdrop:bg-black/40"
+        onClick={(event) => {
+          if (event.target === dialogRef.current) closeDelete();
+        }}
+        onCancel={(event) => {
+          event.preventDefault();
+          closeDelete();
+        }}
+      >
+        {pendingDelete !== null && (
+          <>
+            <div className="flex items-start justify-between gap-2">
+              <h2 id="recent-chats-delete-title" className="m-0 flex items-center gap-2 text-[0.95rem] font-semibold">
+                <Trash2 className="size-4 text-destructive" aria-hidden="true" />
+                Delete chat?
+              </h2>
+              <button
+                type="button"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent"
+                aria-label="Close delete confirmation"
+                onClick={closeDelete}
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            </div>
+            <p className="mt-2 mb-0 text-sm">
+              <span className="font-medium">{pendingDelete.title}</span>
+              <span className="block text-xs text-muted-foreground">
+                {pendingDelete.agent} · {formatRecentChatMeta(pendingDelete)}
+              </span>
+            </p>
+            <p className="mt-2 mb-0 text-xs leading-snug text-muted-foreground">{DELETE_NOTE}</p>
+            {deleteError !== null && (
+              <p
+                role="alert"
+                className="mt-2 mb-0 rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200"
+              >
+                {deleteError}
+              </p>
+            )}
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                className="inline-flex h-8 items-center rounded-md border border-input px-3 text-[0.8rem] font-medium hover:bg-accent"
+                onClick={closeDelete}
+                disabled={deleting}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-destructive px-3 text-[0.8rem] font-semibold text-destructive-foreground transition-opacity disabled:opacity-60"
+                onClick={() => void confirmDelete()}
+                disabled={deleting}
+              >
+                {deleting && <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />}
+                Delete chat
+              </button>
+            </div>
+          </>
+        )}
+      </dialog>
     </>
   );
 }
@@ -133,11 +264,13 @@ function RecentChatsBody({
   chats,
   pathname,
   onRetry,
+  onRequestDelete,
 }: {
   state: LoadPhase;
   chats: ReadonlyArray<RecentChat>;
   pathname: string;
   onRetry: () => void;
+  onRequestDelete: (chat: RecentChat) => void;
 }): React.ReactElement {
   if (state.phase === 'loading') {
     return (
@@ -182,10 +315,10 @@ function RecentChatsBody({
         const isActive = isCurrentRecentChat(pathname, chat);
         const meta = formatRecentChatMeta(chat);
         return (
-          <li key={`${chat.agent}:${chat.chatId}`} className="list-none">
+          <li key={`${chat.agent}:${chat.chatId}`} className="group/row relative list-none">
             <a
               className={cn(
-                'flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors',
+                'flex items-center gap-2 rounded-md px-2 pr-8 py-1.5 transition-colors',
                 'text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground',
                 isActive && 'bg-sidebar-accent font-medium text-sidebar-foreground',
               )}
@@ -205,6 +338,21 @@ function RecentChatsBody({
                   assistive tech even in the compact single-line row. */}
               <span className="sr-only">{`. ${meta}`}</span>
             </a>
+            {/* Destructive action outside the anchor: no accidental row
+                navigation; revealed on hover/focus, always visible on touch. */}
+            <button
+              type="button"
+              className={cn(
+                'absolute top-1/2 right-1 inline-flex size-5 -translate-y-1/2 items-center justify-center rounded-md text-sidebar-foreground/50 opacity-100 transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground sm:opacity-0 sm:group-hover/row:opacity-100 sm:group-focus-within/row:opacity-100',
+                'focus-visible:opacity-100',
+                isActive && 'text-sidebar-foreground/70',
+              )}
+              aria-label={`Delete chat: ${chat.title}. ${meta}. ${DELETE_NOTE}. Asking for confirmation.`}
+              title={`Delete chat — ${DELETE_NOTE}`}
+              onClick={() => onRequestDelete(chat)}
+            >
+              <Trash2 size={12} aria-hidden="true" />
+            </button>
           </li>
         );
       })}

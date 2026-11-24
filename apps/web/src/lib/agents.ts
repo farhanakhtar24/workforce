@@ -18,13 +18,17 @@ import { isSafeChatId } from './api';
 export const WEB_AGENT_SLUGS = ['general', 'orchestrator', 'analyst', 'researcher'] as const;
 export type WebAgentSlug = (typeof WEB_AGENT_SLUGS)[number];
 
-/** Plan drafting (no write/delegation tools) versus action execution. */
+/** Plan drafting (no write/delegation tools) versus action execution.
+ *  New chats start in `plan` (Farhan's UX request): explicit `?mode=action`
+ *  URLs and every pre-existing explicit-mode link keep working, while
+ *  absent-mode URLs resolve to `plan` from now on. Only the web default
+ *  changed, never an API contract. */
 export const WEB_AGENT_MODES = ['plan', 'action'] as const;
 export type WebAgentMode = (typeof WEB_AGENT_MODES)[number];
 
-/** Defaults preserve every pre-Phase-4 URL (`/chat/:id` meant general/action). */
+/** Defaults preserve every pre-Phase-4 URL (`/chat/:id` meant general). */
 export const DEFAULT_AGENT: WebAgentSlug = 'general';
-export const DEFAULT_MODE: WebAgentMode = 'action';
+export const DEFAULT_MODE: WebAgentMode = 'plan';
 
 export interface AgentSelection {
   agent: WebAgentSlug;
@@ -77,6 +81,11 @@ export function modeGuidance(selection: AgentSelection): string {
 /** Human label for mode radio buttons. */
 export function modeLabel(mode: WebAgentMode): string {
   return mode === 'plan' ? 'Plan' : 'Action';
+}
+
+/** Page-level mode fallback: absent/unknown `?mode=` → the web default. */
+export function parseChatPageMode(modeParam: unknown): WebAgentMode {
+  return isAgentMode(modeParam) ? (modeParam as WebAgentMode) : DEFAULT_MODE;
 }
 
 /**

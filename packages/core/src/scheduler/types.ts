@@ -68,6 +68,16 @@ export interface AgentTask {
   readonly nextRunAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * The platform user (Better Auth `User.id`, TEXT) that owns this task, or
+   * `null` for LEGACY rows. Core keeps ownership optional at call sites; the
+   * authenticated API layer MUST always pass an owner filter/creation value
+   * so users never touch each other's (or legacy ownerless) rows. Owner
+   * filters match EXACTLY — an expected owner never matches ownerless rows
+   * (what startup reconciliation needs: `ownedOnly: true` selects ONLY rows
+   * with `ownerId != null`).
+   */
+  readonly ownerId: string | null;
 }
 
 /** Structured token usage for one execution. Fields are finite nonnegative integers. */
@@ -104,4 +114,13 @@ export interface AgentTaskExecution {
   readonly updatedAt: string;
   /** Stamped exactly once, at the first terminal CAS; never rewritten. */
   readonly finishedAt: string | null;
+  /**
+   * The platform user (Better Auth `User.id`, TEXT) that owns this execution,
+   * or `null` for LEGACY rows. Defaults to the task's owner at creation time
+   * (an execution belongs to its task's tenant); an explicit creation
+   * `ownerId` overrides. Owner filters match EXACTLY — an expected owner
+   * never matches ownerless rows; the authenticated API layer MUST always
+   * pass one.
+   */
+  readonly ownerId: string | null;
 }

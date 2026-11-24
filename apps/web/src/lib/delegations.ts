@@ -21,7 +21,7 @@ import {
   UUID_PATTERN,
   truncateMemoryText,
 } from './memory';
-import { isSafeChatId } from './api';
+import { isSafeChatId, browserApiFetch, requestAuthError } from './api';
 import { childChatUrl } from './agents';
 
 /** The delegation route namespace belongs to the orchestrator. */
@@ -254,7 +254,7 @@ export async function fetchDelegations(options: {
   limit?: number;
   fetchImpl?: DelegationFetch;
 }): Promise<DelegationListFetchResult> {
-  const { apiBaseUrl, limit, fetchImpl = fetch } = options;
+  const { apiBaseUrl, limit, fetchImpl = browserApiFetch } = options;
   const query = buildDelegationsListQuery({ parentChatId: options.parentChatId, limit });
   if (query === '') {
     return { ok: false, error: 'Delegations are listed per chat — open this page from a chat’s Delegations link.' };
@@ -266,6 +266,8 @@ export async function fetchDelegations(options: {
       headers: { accept: 'application/json' },
     });
     if (!response.ok) {
+      const authError = requestAuthError(response.status ?? 0);
+      if (authError !== null) return { ok: false, error: authError };
       let raw: unknown = null;
       try {
         raw = await response.json();

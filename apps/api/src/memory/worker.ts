@@ -23,6 +23,7 @@ import {
   type MemoryJobData,
   type RedisReconnectStrategy,
 } from './bullmq-queue.js';
+import { processPersonalCaptureJob, type PersonalCaptureWorkerDeps } from './personal-capture.js';
 import type { SafeLogger } from '../logging.js';
 
 export interface MemoryWorkerOptions {
@@ -35,6 +36,11 @@ export interface MemoryWorkerOptions {
   logger: SafeLogger;
   /** ioredis reconnect strategy override (tests fail fast). */
   reconnectStrategy?: RedisReconnectStrategy;
+  /**
+   * Pre-Phase 6 opt-in personal capture handler. REQUIRED for `capture`
+   * jobs: when absent they fail honestly (job lands in the failed log).
+   */
+  personalCapture?: PersonalCaptureWorkerDeps;
 }
 
 export interface MemoryWorkerHandle {
@@ -47,7 +53,11 @@ export interface MemoryWorkerHandle {
  * One job = one service call. Unknown payloads throw a stable error so the
  * job fails (and lands in the failed log) instead of being swallowed.
  */
-export async function processMemoryJob(job: Job<MemoryJobData, void, string>, service: MemoryService): Promise<void> {
+export async function processMemoryJob(
+  job: Job<MemoryJobData, void, string>,
+  service: MemoryService,
+  personalCapture?: PersonalCaptureWorkerDeps,
+): Promise<void> {
   const data: unknown = job.data;
   if (!isMemoryJobData(data)) {
     throw new Error('memory job payload failed validation');
@@ -56,7 +66,22 @@ export async function processMemoryJob(job: Job<MemoryJobData, void, string>, se
     await service.processEmbedding(data.blockId);
     return;
   }
-  await service.processCompaction(data.scope, data.path, data.triggerBlockId);
+  if (data.kind === 'compact') {
+    await service.processCompaction(data.scope, data.path, data.triggerBlockId);
+    return;
+  }
+  // Pre-Phase 6 opt-in personal capture: re-checked enablement, duplicate
+  // guard, bounded extractor, one derived block (or a silent no-op).
+  if (personalCapture === undefined) {
+    throw new Error('memory job payload failed validation');
+  }
+  const outcome = await processPersonalCaptureJob(data, personalCapture);
+  personalCapture.logger.debug?.(`personal-capture ${outcome} ${data.scope}/${personalChatPathForLog(data.chatId)} assistant ${data.assistantMessageId}`);
+}
+
+/** Log-only bounded path (ids are safe; chats/{id} is the derived path). */
+function personalChatPathForLog(chatId: string): string {
+  return `chats/${chatId.toLowerCase()}`;
 }
 
 export function createMemoryWorker(options: MemoryWorkerOptions): MemoryWorkerHandle {
@@ -72,7 +97,7 @@ export function createMemoryWorker(options: MemoryWorkerOptions): MemoryWorkerHa
 
   const worker = new Worker<MemoryJobData, void, string>(
     queueName,
-    (job) => processMemoryJob(job, service),
+    (job) => processMemoryJob(job, service, options.personalCapture),
     { connection, concurrency },
   );
 

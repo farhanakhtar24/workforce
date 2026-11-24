@@ -31,9 +31,12 @@ import { MAX_DELEGATION_DEPTH } from '@workforce/core';
 import type { ChatStore } from '../store/types.js';
 import type { SafeLogger } from '../logging.js';
 import type { FetchLike } from './host-capabilities.js';
+import type { AuthOwner } from '../auth/owner.js';
+import { ownerOf } from '../auth/owner.js';
 import {
   DELEGATION_CONTEXT_HEADER,
   contextWindow,
+  internalOwnerHeader,
   type DelegationContextSigner,
 } from './delegation-context.js';
 import type { DelegationJobQueue } from './delegation-queue.js';
@@ -103,23 +106,37 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
     baseUrl: deps.baseUrl,
     delegationTimeoutMs: deps.delegationTimeoutMs,
     repo: deps.repo,
+    // Model inheritance: the child chat copies the parent's selected model.
+    chatStore: deps.chatStore,
   };
 
-  /** Mints the internal create/run header bound to one row's parent. */
+  /** Mints the internal create/run header bound to one row's parent+owner. */
   const mintCreateHeader = (row: Delegation): Record<string, string> => {
+    if (row.ownerId === null || row.ownerId.length === 0) {
+      // Ownerless rows cannot run: refuse to mint a header for them.
+      throw new Error('cannot mint a run header for an ownerless delegation');
+    }
     const window = contextWindow(deps.delegationTimeoutMs);
     return {
       [DELEGATION_CONTEXT_HEADER]: deps.signer.sign({
         kind: 'delegation-create',
         parentChatId: row.parentChatId,
         parentDepth: row.depth - 1,
+        ownerId: row.ownerId,
         expiresAt: window.expiresAt,
       }),
+      ...internalOwnerHeader(deps.signer, row.ownerId),
     };
   };
 
   const create = async (req: Request, res: Response, next: (error?: unknown) => void): Promise<void> => {
     try {
+      const resolvedOwner: AuthOwner | null = ownerOf(res);
+      if (resolvedOwner === null) {
+        json(res, 401, { error: 'Authentication required.' });
+        return;
+      }
+      const ownerId: string = resolvedOwner.userId;
       const slug = req.params['slug'] ?? '';
       // Delegations are the orchestrator's path ONLY (fixed route per spec).
       if (slug !== 'orchestrator') {
@@ -151,7 +168,9 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
       }
       // parentDepth is unknown before the row exists, so verify the context
       // WITHOUT depth binding first, then enforce the cap on the parsed value.
-      const verified = deps.signer.verify(header, { kind: 'delegation-create' });
+      // The context must also carry THIS resolved owner — a header minted for
+      // another user is a fixed 400 (never a cross-tenant delegation).
+      const verified = deps.signer.verify(header, { kind: 'delegation-create', ownerId });
       if (!verified.ok || verified.payload.kind !== 'delegation-create') {
         json(res, 400, { error: INVALID_DELEGATION_CONTEXT });
         return;
@@ -176,11 +195,13 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
       }
 
       // Parent existence: the chat must have messages and the parent user
-      // message id must be among them (append-only store, exact match).
+      // message id must be among them (append-only store, exact match). The
+      // chat read is OWNER-SCOPED — another user's identical chat id can
+      // never satisfy a parent check.
       if (deps.chatStore !== undefined) {
         let stored: unknown[];
         try {
-          stored = await deps.chatStore.loadMessages({ slug: 'orchestrator', chatId: body.parentChatId });
+          stored = await deps.chatStore.loadMessages({ ownerId, slug: 'orchestrator', chatId: body.parentChatId });
         } catch {
           json(res, 503, { error: 'Chat state is temporarily unavailable.' });
           return;
@@ -199,7 +220,8 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
       }
 
       // Persist the pending row BEFORE any execution (child chat id is
-      // assigned up front and stable even for async runs).
+      // assigned up front and stable even for async runs). The owner is the
+      // RESOLVED identity, never a client field.
       const parsedCreate = createDelegationInputSchema.safeParse({
         id: randomUUID(),
         parentChatId: body.parentChatId,
@@ -209,6 +231,7 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
         mode: body.mode,
         task: body.task,
         depth: childDepth,
+        ownerId,
       });
       if (!parsedCreate.success) {
         json(res, 400, { error: INVALID_DELEGATION_REQUEST });
@@ -240,7 +263,7 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
           return;
         }
         try {
-          await deps.queue.enqueue(delegation.id, 'orchestrator');
+          await deps.queue.enqueue(delegation.id, 'orchestrator', ownerId);
         } catch {
           json(res, 503, { error: DELEGATION_QUEUE_UNAVAILABLE });
           return;
@@ -281,6 +304,12 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
 
   const list = async (req: Request, res: Response, next: (error?: unknown) => void): Promise<void> => {
     try {
+      const resolvedOwner: AuthOwner | null = ownerOf(res);
+      if (resolvedOwner === null) {
+        json(res, 401, { error: 'Authentication required.' });
+        return;
+      }
+      const ownerId: string = resolvedOwner.userId;
       const slug = req.params['slug'] ?? '';
       if (!['general', 'orchestrator', 'analyst', 'researcher'].includes(slug)) {
         json(res, 404, { error: 'Unknown agent slug.' });
@@ -304,7 +333,13 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
         }
         limit = Number(limitRaw);
       }
-      const rows = await deps.repo.listByParent({ parentChatId, ...(limit !== undefined ? { limit } : {}) });
+      // Owner-filtered: only THIS user's delegations for the parent chat.
+      // Ownerless legacy rows never match the exact filter.
+      const rows = await deps.repo.listByParent({
+        parentChatId,
+        ownerId,
+        ...(limit !== undefined ? { limit } : {}),
+      });
       json(res, 200, { delegations: rows });
     } catch {
       json(res, 503, { error: DELEGATION_STORE_UNAVAILABLE });
@@ -313,6 +348,12 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
 
   const detail = async (req: Request, res: Response, next: (error?: unknown) => void): Promise<void> => {
     try {
+      const resolvedOwner: AuthOwner | null = ownerOf(res);
+      if (resolvedOwner === null) {
+        json(res, 401, { error: 'Authentication required.' });
+        return;
+      }
+      const ownerId: string = resolvedOwner.userId;
       const slug = req.params['slug'] ?? '';
       const delegationId = req.params['delegationId'] ?? '';
       if (!['general', 'orchestrator', 'analyst', 'researcher'].includes(slug)) {
@@ -323,7 +364,8 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
         json(res, 404, { error: DELEGATION_NOT_FOUND });
         return;
       }
-      const row = await deps.repo.get(delegationId);
+      // Owner guard: foreign/ownerless rows read as null (no existence oracle).
+      const row = await deps.repo.get(delegationId, { expectedOwnerId: ownerId });
       if (row === null || row === undefined) {
         json(res, 404, { error: DELEGATION_NOT_FOUND });
         return;
@@ -336,6 +378,12 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
 
   const run = async (req: Request, res: Response, next: (error?: unknown) => void): Promise<void> => {
     try {
+      const resolvedOwner: AuthOwner | null = ownerOf(res);
+      if (resolvedOwner === null) {
+        json(res, 401, { error: 'Authentication required.' });
+        return;
+      }
+      const ownerId: string = resolvedOwner.userId;
       const slug = req.params['slug'] ?? '';
       const delegationId = req.params['delegationId'] ?? '';
       if (slug !== 'orchestrator') {
@@ -348,10 +396,11 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
       }
 
       // Run is an INTERNAL surface: the signed create/run context is
-      // mandatory, bound to the row (parent chat + parent depth). External
-      // callers without a valid header are rejected even at depth 1.
+      // mandatory, bound to the row (parent chat + parent depth + owner).
+      // External callers without a valid header are rejected even at depth 1,
+      // and the row read is owner-guarded first (fixed 404 for foreign rows).
       const header = req.get(DELEGATION_CONTEXT_HEADER) ?? undefined;
-      const row = await deps.repo.get(delegationId);
+      const row = await deps.repo.get(delegationId, { expectedOwnerId: ownerId });
       if (row === null || row === undefined) {
         json(res, 404, { error: DELEGATION_NOT_FOUND });
         return;
@@ -361,7 +410,7 @@ export function createDelegationRoutes(deps: DelegationRouteDeps): DelegationRou
         json(res, 400, { error: INVALID_DELEGATION_CONTEXT });
         return;
       }
-      const outcome = await runDelegation(runDeps, header, delegationId);
+      const outcome = await runDelegation(runDeps, header, delegationId, ownerId);
       json(res, 200, { delegation: outcome.delegation, childChatId: outcome.delegation.childChatId, executed: outcome.executed });
     } catch (error) {
       if (error instanceof DelegationRouteError) {

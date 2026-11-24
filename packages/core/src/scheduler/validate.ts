@@ -28,6 +28,7 @@ import {
   agentTaskPromptSchema,
   parseSchedulerInput,
   schedulerIdSchema,
+  schedulerOwnerIdSchema,
   skipDatesSchema,
   skipDateSchema,
   assertRecurrencePair,
@@ -45,10 +46,13 @@ import {
 import {
   schedulerMarkTargets,
   type SchedulerMarkTarget,
+  type SchedulerReadOptions,
   type SchedulerStoreExecutionClaim,
   type SchedulerStoreExecutionCreate,
   type SchedulerStoreExecutionMark,
+  type SchedulerStoreExecutionListParams,
   type SchedulerStoreTaskCreate,
+  type SchedulerStoreTaskListParams,
   type SchedulerStoreTaskUpdate,
 } from './store.js';
 import type {
@@ -79,6 +83,40 @@ export function toOptionalInstant(value: string | Date | null | undefined): Date
 }
 
 // ---------------------------------------------------------------------------
+// Ownership (platform-user owner ids)
+// ---------------------------------------------------------------------------
+
+/** Validate an explicit owner-id value (trimmed 1..128 chars) for writes. */
+export function validateOwnerId(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return parseSchedulerInput(schedulerOwnerIdSchema, value);
+}
+
+/**
+ * Validate owner guard options on single-row reads (`getTask`/`getExecution`).
+ * The guard matches EXACTLY: ownerless legacy rows never satisfy an owner.
+ */
+export function validateReadOptions(options?: SchedulerReadOptions): { expectedOwnerId: string | null } {
+  return { expectedOwnerId: validateOwnerId(options?.expectedOwnerId) };
+}
+
+/**
+ * Enforce the owner guard on a mapped row: a mismatch MUST read as not-found
+ * (the caller never learns that a foreign/ownerless row exists). Used by BOTH
+ * stores so the two adapters cannot drift.
+ */
+export function enforceRowOwner(
+  row: { readonly ownerId: string | null },
+  expectedOwnerId: string | null,
+): void {
+  if (expectedOwnerId !== null && (row.ownerId ?? null) !== expectedOwnerId) {
+    throw new SchedulerNotFoundError('row not found for owner');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Ordering + limits
 // ---------------------------------------------------------------------------
 
@@ -98,9 +136,18 @@ export function compareByCreatedAtThenId(
   };
 }
 
-export function validateListParams(params?: { order?: 'newest' | 'oldest'; limit?: number }): {
+export function validateListParams(params?: {
+  order?: 'newest' | 'oldest';
+  limit?: number;
+  ownerId?: string | null;
+  ownedOnly?: boolean;
+  isActive?: boolean;
+}): {
   order: 'newest' | 'oldest';
   limit: number;
+  ownerId: string | null;
+  ownedOnly: boolean;
+  isActive: boolean | null;
 } {
   const order = params?.order ?? 'newest';
   if (order !== 'newest' && order !== 'oldest') {
@@ -110,7 +157,22 @@ export function validateListParams(params?: { order?: 'newest' | 'oldest'; limit
   if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > SCHEDULER_LIST_LIMIT_MAX) {
     throw new SchedulerValidationError(`limit must be an integer 1..${SCHEDULER_LIST_LIMIT_MAX}`);
   }
-  return { order, limit: rawLimit };
+  const ownerId = validateOwnerId(params?.ownerId);
+  const ownedOnly = params?.ownedOnly;
+  if (ownedOnly !== undefined && typeof ownedOnly !== 'boolean') {
+    throw new SchedulerValidationError('ownedOnly must be a boolean');
+  }
+  const isActive = params?.isActive;
+  if (isActive !== undefined && typeof isActive !== 'boolean') {
+    throw new SchedulerValidationError('isActive must be a boolean');
+  }
+  return {
+    order,
+    limit: rawLimit,
+    ownerId,
+    ownedOnly: ownedOnly ?? false,
+    isActive: isActive === undefined ? null : isActive,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +189,7 @@ export interface ValidatedTaskCreate {
   readonly recurrenceType: RecurrenceType;
   readonly recurrenceConfig: AgentTask['recurrenceConfig'];
   readonly skipDates: readonly string[];
+  readonly ownerId: string | null;
   readonly createdAt: Date;
   readonly after: Date;
   readonly nextRunAt: Date | null;
@@ -148,6 +211,7 @@ export function validateStoreTaskCreate(data: SchedulerStoreTaskCreate): Validat
   }
   const prompt = parseSchedulerInput(agentTaskPromptSchema, data.prompt);
   const scope = normalizeScope(parseSchedulerInput(memoryScopeSchema, data.scope ?? 'default'));
+  const ownerId = validateOwnerId(data.ownerId);
   if (!isRecurrenceTypeValue(data.recurrenceType)) {
     throw new SchedulerValidationError('recurrenceType must be ONCE, DAILY, WEEKLY, MONTHLY, or CUSTOM_CRON');
   }
@@ -158,7 +222,7 @@ export function validateStoreTaskCreate(data: SchedulerStoreTaskCreate): Validat
   const createdAt = nowDate;
   const after = toInstant(data.afterAsOf ?? nowDate, 'afterAsOf');
   const nextRunAt = computeNextRunAt({ recurrenceType, recurrenceConfig, after, skipDates });
-  return { id, name, agentSlug, mode, prompt, scope, recurrenceType, recurrenceConfig, skipDates, createdAt, after, nextRunAt };
+  return { id, name, agentSlug, mode, prompt, scope, recurrenceType, recurrenceConfig, skipDates, ownerId, createdAt, after, nextRunAt };
 }
 
 function isRecurrenceTypeValue(value: unknown): value is RecurrenceType {
@@ -207,6 +271,8 @@ export interface ValidatedTaskUpdate {
   readonly hasRecurrenceChange: boolean;
   readonly after: Date;
   readonly now: Date;
+  /** Owner guard; `null` when unset (never a mutable field). */
+  readonly expectedOwnerId: string | null;
 }
 
 export function validateStoreTaskUpdate(data: SchedulerStoreTaskUpdate): ValidatedTaskUpdate {
@@ -268,6 +334,7 @@ export function validateStoreTaskUpdate(data: SchedulerStoreTaskUpdate): Validat
     hasRecurrenceChange: hasRecurrenceType || skipSet,
     after,
     now: nowDate,
+    expectedOwnerId: validateOwnerId(data.expectedOwnerId),
   };
 }
 
@@ -305,6 +372,8 @@ export interface ValidatedExecutionCreate {
   readonly queueJobId?: string;
   readonly repeatJobKey?: string;
   readonly retryOfExecutionId?: string;
+  /** Explicit owner; stores inherit the task's owner when `null`. */
+  readonly ownerId: string | null;
   readonly now: Date;
 }
 
@@ -345,6 +414,7 @@ export function validateStoreExecutionCreate(
   if (trigger !== 'RETRY' && retryOfExecutionId !== undefined) {
     throw new SchedulerValidationError('retryOfExecutionId is only allowed on RETRY executions');
   }
+  const ownerId = validateOwnerId(data.ownerId);
   return {
     id,
     scheduledFor,
@@ -352,6 +422,7 @@ export function validateStoreExecutionCreate(
     queueJobId,
     repeatJobKey,
     retryOfExecutionId,
+    ownerId,
     now: toInstant(data.now ?? new Date(), 'now'),
   };
 }
@@ -360,6 +431,8 @@ export interface ValidatedClaim {
   readonly id: string;
   readonly attempt: number;
   readonly allowedFrom: 'PENDING' | 'RETRYING';
+  /** Owner guard; `null` when unset. */
+  readonly expectedOwnerId: string | null;
 }
 
 export function validateStoreClaim(data: SchedulerStoreExecutionClaim): ValidatedClaim {
@@ -373,7 +446,7 @@ export function validateStoreClaim(data: SchedulerStoreExecutionClaim): Validate
   if (data.allowedFrom !== 'PENDING' && data.allowedFrom !== 'RETRYING') {
     throw new SchedulerValidationError("allowedFrom must be 'PENDING' or 'RETRYING'");
   }
-  return { id, attempt: data.attempt, allowedFrom: data.allowedFrom };
+  return { id, attempt: data.attempt, allowedFrom: data.allowedFrom, expectedOwnerId: validateOwnerId(data.expectedOwnerId) };
 }
 
 /** CAS matrix for the five mark targets: `expectedFrom` is FIXED per target. */
@@ -411,6 +484,8 @@ export interface ValidatedMark {
   readonly tokenUsage: AgentTaskExecutionTokenUsage | null;
   readonly error: string | null;
   readonly now: Date;
+  /** Owner guard; `null` when unset. */
+  readonly expectedOwnerId: string | null;
 }
 
 const errorTextSchema = z
@@ -461,7 +536,15 @@ export function validateStoreExecutionMark(data: SchedulerStoreExecutionMark): V
   if (target === 'SKIPPED' && tokenUsage !== null) {
     throw new SchedulerValidationError('tokenUsage is only allowed when marking COMPLETED');
   }
-  return { id, target, durationMs, tokenUsage, error, now: toInstant(data.now ?? new Date(), 'now') };
+  return {
+    id,
+    target,
+    durationMs,
+    tokenUsage,
+    error,
+    now: toInstant(data.now ?? new Date(), 'now'),
+    expectedOwnerId: validateOwnerId(data.expectedOwnerId),
+  };
 }
 
 /**

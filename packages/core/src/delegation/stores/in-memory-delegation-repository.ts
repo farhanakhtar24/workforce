@@ -19,8 +19,10 @@ import {
   listDelegationsByParentInputSchema,
   parseDelegationInput,
   updateDelegationStatusInputSchema,
+  delegationReadOptionsSchema,
   type DelegationCreateInput,
   type DelegationListByParentInput,
+  type DelegationReadOptions,
   type DelegationUpdateStatusInput,
 } from '../schemas.js';
 import {
@@ -113,6 +115,7 @@ export class InMemoryDelegationRepository implements DelegationRepository {
       result: null,
       error: null,
       depth: parsed.depth,
+      ownerId: parsed.ownerId ?? null,
       createdAt: createdAtIso,
       updatedAt: createdAtIso,
       completedAt: null,
@@ -124,9 +127,17 @@ export class InMemoryDelegationRepository implements DelegationRepository {
     return clone(delegation);
   }
 
-  async get(id: string): Promise<Delegation | null> {
+  async get(id: string, options?: DelegationReadOptions): Promise<Delegation | null> {
+    const parsedOptions = parseDelegationInput(delegationReadOptionsSchema, options ?? {});
     const delegation = this.delegations.get(id);
-    return delegation ? clone(delegation) : null;
+    if (!delegation) {
+      return null;
+    }
+    // Owner guard: foreign/ownerless rows read as absent — never an oracle.
+    if (parsedOptions.expectedOwnerId !== undefined && delegation.ownerId !== parsedOptions.expectedOwnerId) {
+      return null;
+    }
+    return clone(delegation);
   }
 
   async listByParent(input: DelegationListByParentInput): Promise<readonly Delegation[]> {
@@ -137,7 +148,15 @@ export class InMemoryDelegationRepository implements DelegationRepository {
     }
 
     const matches = [...this.delegations.values()]
-      .filter((delegation) => delegation.parentChatId === parsed.parentChatId)
+      .filter((delegation) => {
+        if (delegation.parentChatId !== parsed.parentChatId) {
+          return false;
+        }
+        if (parsed.ownerId !== undefined && delegation.ownerId !== parsed.ownerId) {
+          return false;
+        }
+        return true;
+      })
       .sort((a, b) => {
         const aMs = Date.parse(a.createdAt);
         const bMs = Date.parse(b.createdAt);
@@ -154,14 +173,21 @@ export class InMemoryDelegationRepository implements DelegationRepository {
     return matches.map((delegation) => clone(delegation));
   }
 
-  async getByChild(childChatId: string): Promise<Delegation | null> {
+  async getByChild(childChatId: string, options?: DelegationReadOptions): Promise<Delegation | null> {
     validateExternalId(childChatId, 'childChatId');
+    const parsedOptions = parseDelegationInput(delegationReadOptionsSchema, options ?? {});
     const id = this.childIndex.get(childChatId);
     if (id === undefined) {
       return null;
     }
     const delegation = this.delegations.get(id);
-    return delegation ? clone(delegation) : null;
+    if (!delegation) {
+      return null;
+    }
+    if (parsedOptions.expectedOwnerId !== undefined && delegation.ownerId !== parsedOptions.expectedOwnerId) {
+      return null;
+    }
+    return clone(delegation);
   }
 
   async updateStatus(input: DelegationUpdateStatusInput): Promise<Delegation> {
@@ -178,6 +204,7 @@ export class InMemoryDelegationRepository implements DelegationRepository {
     result?: string;
     error?: string;
     expectedFrom?: DelegationStatus;
+    expectedOwnerId?: string;
   }): Delegation {
     if (!isDelegationStatus(parsed.status)) {
       throw new DelegationValidationError('delegation status must be one of pending, running, completed, failed, timeout');
@@ -186,6 +213,11 @@ export class InMemoryDelegationRepository implements DelegationRepository {
     const delegation = this.delegations.get(parsed.id);
     if (!delegation) {
       throw new DelegationNotFoundError(`delegation ${parsed.id} not found`);
+    }
+    // Owner guard FIRST: a wrong owner reads as 404 (no status/existence
+    // oracle). Ownerless legacy rows never satisfy any expected owner.
+    if (parsed.expectedOwnerId !== undefined && delegation.ownerId !== parsed.expectedOwnerId) {
+      throw new DelegationNotFoundError(`delegation ${parsed.id} not found for owner`);
     }
     // Atomic claim guard: one synchronous compare-and-set (single-threaded
     // event loop, no await between check and write) — exactly one concurrent

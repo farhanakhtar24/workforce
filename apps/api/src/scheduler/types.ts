@@ -9,6 +9,7 @@ import type { AgentTask, AgentTaskExecution } from '@workforce/core/scheduler';
 import type { SchedulerSyncResult } from '@workforce/queue/scheduler';
 import type { SafeLogger } from '../logging.js';
 import type { FetchLike } from '../agents/host-capabilities.js';
+import type { DelegationContextSigner } from '../agents/delegation-context.js';
 
 /**
  * Structural surface of the BullMQ scheduler queue the API layer owns (the
@@ -39,6 +40,10 @@ export const SCHEDULER_CONFLICT = 'Scheduler conflict.';
 export const SCHEDULER_STORE_UNAVAILABLE = 'Scheduler service is temporarily unavailable.';
 export const SCHEDULER_QUEUE_UNAVAILABLE = 'Scheduler queue is temporarily unavailable.';
 export const SCHEDULER_WORKER_HEADER_REQUIRED = 'Scheduler worker header required.';
+/** Ownerless (pre-auth legacy) tasks can never run — the internal run contract refuses them. */
+export const OWNERLESS_TASK_MESSAGE = 'Ownerless tasks cannot run.';
+/** Missing/invalid signed `internal-scheduler-run` context on a worker run route. */
+export const SCHEDULER_CONTEXT_INVALID = 'Invalid scheduler run context.';
 
 /**
  * Bounded budgets for the scheduler run service (defaults follow the Phase 5
@@ -62,6 +67,13 @@ export interface SchedulerRunBudgets {
   /** Stale threshold (ms) for RUNNING rows in recovery. */
   readonly staleRunningMs: number;
   readonly logger: SafeLogger;
+  /**
+   * Signs the internal headers scheduler runs MUST carry on their own chat
+   * POST / hydration / resume calls (`internal-owner` kind). Present in
+   * production and in tests that exercise the internal paths; absent keeps
+   * those calls ownerless-safe (the chat routes 401 them).
+   */
+  readonly signer?: DelegationContextSigner;
 }
 
 /** Fixed safe failure text routes land on rows after enqueue failures. */

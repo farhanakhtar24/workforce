@@ -1,12 +1,23 @@
 /**
- * The standalone scheduler worker's REST run client (Phase 5): maps the two
- * worker-only run routes onto the `@workforce/queue` {@link SchedulerRunClient}
- * contract — one BullMQ job gets exactly one HTTP run call, and ONLY its
- * result decides `ok`.
+ * The standalone scheduler worker's REST run client (Phase 5 + pre-Phase 6
+ * internal trust): maps the two worker-only run routes onto the
+ * `@workforce/queue` {@link SchedulerRunClient} contract — one BullMQ job
+ * gets exactly one HTTP run call, and ONLY its result decides `ok`.
+ *
+ * Pre-Phase 6 trust contract: every run POST carries —
+ * - the worker CONVENTION header (`X-Workforce-Scheduler-Worker: 1`), and
+ * - a SIGNED `internal-scheduler-run` HMAC context (kind
+ *   `internal-scheduler-run`) bound to THIS taskId/executionId with a short
+ *   TTL, signed with the shared `DELEGATION_CONTEXT_SECRET`. The literal
+ *   header alone is no longer sufficient; a forged context (wrong binding,
+ *   expired, unsigned) reads as a fixed 400. The platform owner itself is
+ *   NOT carried: the run route derives it from the DATABASE ROW (the row is
+ *   the authority) and ownerless legacy rows are refused — the worker never
+ *   needs the owner id.
  *
  * Mapping rules (identical for scheduled and execution runs):
  * - 2xx with `{ ok: true }` → `{ ok: true }` (COMPLETED / SKIPPED / FAILED
- *   nonretryable / already terminal / missing task).
+ *   nonretryable / already terminal / missing or ownerless task).
  * - 2xx with `{ ok: false, reason }` → `{ ok: false, reason }` (the API
  *   already landed RETRYING or DEAD_LETTER; BullMQ owns the retry/backoff).
  * - 2xx with a malformed body → `{ ok: false, reason: 'run-malformed' }`.
@@ -19,14 +30,20 @@
  * other call is a plain POST with the same shape — there are no metadata
  * GETs here because the routes return everything in the run response.
  *
- * Secrets: no provider key, no Prisma, no database — Redis URL + the API
- * base URL are the only inputs. Reasons are fixed machine codes; no bodies,
- * URLs, or headers are ever logged.
+ * Secrets: no provider key, no Prisma, no database — Redis URL, the API
+ * base URL, and the shared signing secret are the only inputs. Reasons are
+ * fixed machine codes; no bodies, URLs, headers, or secret values are ever
+ * logged.
  */
 
 import type { SchedulerRunClient, SchedulerRunResult } from '@workforce/queue/scheduler';
 
 import type { FetchLike } from '../agents/host-capabilities.js';
+import {
+  INTERNAL_SCHEDULER_HEADER,
+  contextWindow,
+  type DelegationContextSigner,
+} from '../agents/delegation-context.js';
 import { SCHEDULER_RUN_STREAM_MARGIN_MS } from './types.js';
 import { SCHEDULER_WORKER_HEADER, SCHEDULER_WORKER_HEADER_VALUE } from './worker-contract.js';
 
@@ -54,24 +71,42 @@ export interface SchedulerRestRunClientOptions {
    * bound; the API keeps generating server-side either way.
    */
   readonly executionTimeoutMs: number;
+  /**
+   * Signs the mandatory `internal-scheduler-run` context (shared
+   * `DELEGATION_CONTEXT_SECRET`). The scheduler worker REQUIRES it: without
+   * a configured secret the worker cannot mint valid contexts and must not
+   * start (see `src/scheduler-worker.ts`).
+   */
+  readonly signer: DelegationContextSigner;
 }
 
 export function createSchedulerRestRunClient(options: SchedulerRestRunClientOptions): SchedulerRunClient {
-  const { fetchFn, baseUrl } = options;
+  const { fetchFn, baseUrl, signer } = options;
   const runBudgetMs = options.executionTimeoutMs + SCHEDULER_RUN_STREAM_MARGIN_MS;
 
   async function postRun(
     path: string,
     body: Record<string, unknown>,
+    signed: { taskId?: string; executionId?: string },
   ): Promise<SchedulerRunResult> {
+    const window = contextWindow(options.executionTimeoutMs);
     let response: Response;
     try {
       response = await fetchFn(`${baseUrl}${path}`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          // Worker convention (NOT authentication) — see worker-contract.ts.
+          // Worker convention (tripwire against browser calls AND a marker
+          // of the BullMQ-occurrence contract).
           [SCHEDULER_WORKER_HEADER]: SCHEDULER_WORKER_HEADER_VALUE,
+          // SIGNED internal run context: bound to THIS task/execution id,
+          // short TTL. The run route verifies both before touching a row.
+          [INTERNAL_SCHEDULER_HEADER]: signer.sign({
+            kind: 'internal-scheduler-run',
+            ...(signed.taskId !== undefined ? { taskId: signed.taskId } : {}),
+            ...(signed.executionId !== undefined ? { executionId: signed.executionId } : {}),
+            expiresAt: window.expiresAt,
+          }),
         },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(runBudgetMs),
@@ -111,6 +146,7 @@ export function createSchedulerRestRunClient(options: SchedulerRestRunClientOpti
       return await postRun(
         `/api/scheduler/tasks/${encodeURIComponent(input.taskId)}/run-scheduled`,
         body,
+        { taskId: input.taskId },
       );
     },
 
@@ -122,6 +158,7 @@ export function createSchedulerRestRunClient(options: SchedulerRestRunClientOpti
       return await postRun(
         `/api/scheduler/executions/${encodeURIComponent(input.executionId)}/run`,
         body,
+        { executionId: input.executionId },
       );
     },
   };

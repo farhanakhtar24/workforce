@@ -61,8 +61,10 @@ import {
 
 import {
   SCHEDULER_RUN_STREAM_MARGIN_MS,
+  OWNERLESS_TASK_MESSAGE,
   type SchedulerRunBudgets,
 } from './types.js';
+import { internalOwnerHeader, type DelegationContextSigner } from '../agents/delegation-context.js';
 
 /** Machine-safe `reason` codes carried by `{ ok: false }` run responses. */
 export const RUN_REASON_RETRYING = 'retrying' as const;
@@ -84,6 +86,11 @@ export type SchedulerRunOkBody = {
   readonly skipped?: boolean;
   /** True when the taskId referenced no task (nothing to run, nothing to retry). */
   readonly taskMissing?: boolean;
+  /**
+   * True when the row was OWNERLESS (pre-auth legacy): it is skipped without
+   * a run, never generated, and never retried ( BullMQ completes the job).
+   */
+  readonly ownerless?: boolean;
 };
 
 export type SchedulerRunOutcome =
@@ -138,6 +145,20 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
 
   const chatBudgetMs = budgets.executionTimeoutMs + SCHEDULER_RUN_STREAM_MARGIN_MS;
   const metadataBudgetMs = budgets.metadataTimeoutMs;
+  const runSigner: DelegationContextSigner | undefined = budgets.signer;
+
+  /**
+   * Signed internal-owner headers for the loopback chat/hydration/resume
+   * calls: the routes resolve the row-derived owner from them. When no
+   * signer was wired (tests that stub the HTTP layer), calls carry no header
+   * and the chat routes honestly 401 them — never an ownerless fallback.
+   */
+  function internalHeaders(ownerId: string): Record<string, string> {
+    if (runSigner === undefined) {
+      return {};
+    }
+    return internalOwnerHeader(runSigner, ownerId);
+  }
 
   // ------------------------------------------------------------ primitives
 
@@ -271,10 +292,10 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
   }
 
   /** Durable hydration of one execution chat (bounded metadata call). */
-  async function hydrateChat(slug: string, chatId: string): Promise<ChatHydration | null> {
+  async function hydrateChat(ownerId: string, slug: string, chatId: string): Promise<ChatHydration | null> {
     const outcome = await boundedFetch(
       `${baseUrl}/api/agents/${encodeURIComponent(slug)}/chat/${encodeURIComponent(chatId)}`,
-      { method: 'GET' },
+      { method: 'GET', headers: internalHeaders(ownerId) },
       metadataBudgetMs,
     );
     if (!outcome.ok || !outcome.response.ok) {
@@ -323,10 +344,10 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
   }
 
   /** Consumes the existing /stream resume; bounded; failures are nonfatal. */
-  async function consumeResumeStream(slug: string, chatId: string): Promise<void> {
+  async function consumeResumeStream(ownerId: string, slug: string, chatId: string): Promise<void> {
     const outcome = await boundedFetch(
       `${baseUrl}/api/agents/${encodeURIComponent(slug)}/chat/${encodeURIComponent(chatId)}/stream`,
-      { method: 'GET' },
+      { method: 'GET', headers: internalHeaders(ownerId) },
       metadataBudgetMs,
     );
     if (
@@ -368,6 +389,17 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
           body: { ok: true, executed: false, skipped: true, taskMissing: true },
         };
       }
+      if (task.ownerId === null || task.ownerId.length === 0) {
+        // Ownerless (pre-auth legacy) task: it can NEVER run — no owner
+        // exists to bind the isolated chat to. Skipped without generation,
+        // never retried (a BullMQ retry would only repeat this refusal).
+        logger.warn('scheduler-run-scheduled-task-ownerless');
+        return {
+          status: 200,
+          body: { ok: true, executed: false, skipped: true, ownerless: true },
+        };
+      }
+      const ownerId: string = task.ownerId;
 
       const skipDate = task.skipDates.includes(utcDateKey(new Date(input.scheduledFor)));
       const skip = !task.isActive || skipDate;
@@ -432,8 +464,10 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
               })?.toISOString() ?? null);
         try {
           // Explicit-only patch: no recurrence fields are supplied, so the
-          // store honors nextRunAt verbatim (null clears, e.g. ONCE).
-          await service.updateTask({ id: task.id, nextRunAt: nextValue });
+          // store honors nextRunAt verbatim (null clears, e.g. ONCE); the
+          // owner CAS binds the patch to the row's owner (never matches
+          // foreign/ownerless rows).
+          await service.updateTask({ id: task.id, nextRunAt: nextValue, expectedOwnerId: ownerId });
         } catch (error) {
           // Honest failure: stop this delivery; BullMQ's retry dedupes the
           // execution (unique row) and re-attempts advancement before
@@ -446,7 +480,7 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
       if (skip && execution.status === 'PENDING') {
         // Paused task or skip-date occurrence: SKIPPED, no provider call.
         try {
-          const skipped = await service.markSkipped({ id: execution.id });
+          const skipped = await service.markSkipped({ id: execution.id, expectedOwnerId: ownerId });
           return {
             status: 200,
             body: { ok: true, execution: skipped, executed: false, skipped: true },
@@ -471,7 +505,7 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
       // paused task go through the standard bounded flow: in-flight rows
       // already hold a claim that predates the pause, and leaving them
       // RUNNING/RETRYING forever would be worse than finishing them.
-      return await runExecutionRow(execution.id, execution);
+      return await runExecutionRow(execution.id, execution, ownerId);
     },
 
     async runExecution(input): Promise<SchedulerRunOutcome> {
@@ -484,7 +518,16 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
       if (execution === null) {
         return { status: 404, body: { error: 'Execution not found.' } };
       }
-      return await runExecutionRow(execution.id, execution);
+      if (execution.ownerId === null || execution.ownerId.length === 0) {
+        // Ownerless (pre-auth legacy) execution: it can NEVER run — the
+        // isolated chat would have no owner. Idempotently skipped.
+        logger.warn('scheduler-run-execution-ownerless');
+        return {
+          status: 200,
+          body: { ok: true, executed: false, ownerless: true },
+        };
+      }
+      return await runExecutionRow(execution.id, execution, execution.ownerId);
     },
   };
 
@@ -494,6 +537,7 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
   async function runExecutionRow(
     executionId: string,
     loaded: AgentTaskExecution,
+    ownerId: string,
   ): Promise<SchedulerRunOutcome> {
     if (isTerminal(loaded.status)) {
       // Terminal rows are immutable: idempotent re-runs are benign, never a
@@ -502,10 +546,11 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     }
 
     if (loaded.status === 'RUNNING') {
-      return await recoverRunning(loaded);
+      return await recoverRunning(loaded, ownerId);
     }
 
-    // PENDING/RETRYING: atomic claim, attempt exactly attemptsMade + 1.
+    // PENDING/RETRYING: atomic claim, attempt exactly attemptsMade + 1, with
+    // the owner CAS (a foreign-claiming writer loses the typed conflict).
     const claimAttempt = loaded.attempt + 1;
     if (claimAttempt > MAX_TASK_ATTEMPTS) {
       // Unreachable for well-formed rows (attempt-3 rows are terminal);
@@ -518,8 +563,9 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
         id: executionId,
         attempt: claimAttempt,
         allowedFrom: loaded.status === 'PENDING' ? 'PENDING' : 'RETRYING',
+        expectedOwnerId: ownerId,
       });
-      return await runClaimed(claimed);
+      return await runClaimed(claimed, ownerId);
     } catch (error) {
       if (!(error instanceof SchedulerConflictError)) {
         const mapped = mapServiceError(error);
@@ -527,7 +573,9 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
       }
       // Loser of the claim: the winner owns the only generation. Recover
       // from durable state — never generate a second chat.
-      const fresh: AgentTaskExecution | null = await service.getExecution(executionId).catch(() => null);
+      const fresh: AgentTaskExecution | null = await service
+        .getExecution(executionId, { expectedOwnerId: ownerId })
+        .catch(() => null);
       if (fresh === null) {
         return conflict409();
       }
@@ -535,7 +583,7 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
         return { status: 200, body: { ok: true, execution: fresh, executed: false } };
       }
       if (fresh.status === 'RUNNING') {
-        return await recoverRunning(fresh);
+        return await recoverRunning(fresh, ownerId);
       }
       // Row bounced back between read and claim: transient; the next BullMQ
       // attempt claims it.
@@ -556,7 +604,7 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
   }
 
   /** Builds the isolated-chat POST for one claimed execution. */
-  function chatRequestPlan(task: AgentTask, execution: AgentTaskExecution, attempt: number): { url: string; init: RequestInit } {
+  function chatRequestPlan(task: AgentTask, execution: AgentTaskExecution, attempt: number, ownerId: string): { url: string; init: RequestInit } {
     const messageId = attemptMessageId(execution, attempt);
     return {
       url: `${baseUrl}/api/agents/${encodeURIComponent(task.agentSlug)}/chat`,
@@ -568,6 +616,9 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
           // POSTs of the SAME attempt can only ever 409 -> durable recovery,
           // never a second message for that attempt.
           'Idempotency-Key': `${execution.chatId}:${messageId}`,
+          // SIGNED internal owner: the chat route resolves the row-derived
+          // owner (the execution/chat belongs to exactly this user).
+          ...internalHeaders(ownerId),
         },
         body: JSON.stringify({
           id: execution.chatId,
@@ -588,42 +639,44 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
    * DEAD_LETTER (attempt 3) via valid transitions — the row can never sit
    * invisible-PENDING again once claimed.
    */
-  async function runClaimed(claimed: AgentTaskExecution): Promise<SchedulerRunOutcome> {
+  async function runClaimed(claimed: AgentTaskExecution, ownerId: string): Promise<SchedulerRunOutcome> {
     const executionId = claimed.id;
     const claimedAtMs = Date.now();
     const attempt = claimed.attempt;
 
-    const task: AgentTask | null = await service.getTask(claimed.taskId).catch(() => null);
+    const task: AgentTask | null = await service
+      .getTask(claimed.taskId, { expectedOwnerId: ownerId })
+      .catch(() => null);
     if (task === null) {
       // The task row vanished mid-run: land the row terminal and be honest.
-      return await landFailed(executionId, RUN_FAILED_TEXT_REQUEST_INVALID);
+      return await landFailed(executionId, RUN_FAILED_TEXT_REQUEST_INVALID, ownerId);
     }
-    const plan = chatRequestPlan(task, claimed, attempt);
+    const plan = chatRequestPlan(task, claimed, attempt, ownerId);
     const recoverExisting = async (): Promise<SchedulerRunOutcome> => {
       // Durable recovery of THIS attempt's already-running/done generation
       // (a duplicate POST answer 409 here). It never regenerates: duplicate
       // POSTs of the same attempt share the deterministic key.
-      const after = await hydrateChat(task.agentSlug, claimed.chatId);
+      const after = await hydrateChat(ownerId, task.agentSlug, claimed.chatId);
       if (after === null) {
-        return await handBackForRetry(executionId, attempt);
+        return await handBackForRetry(executionId, attempt, ownerId);
       }
       if (after.hasActiveStream) {
-        await consumeResumeStream(task.agentSlug, claimed.chatId);
-        const settled = await hydrateChat(task.agentSlug, claimed.chatId);
+        await consumeResumeStream(ownerId, task.agentSlug, claimed.chatId);
+        const settled = await hydrateChat(ownerId, task.agentSlug, claimed.chatId);
         if (settled === null) {
-          return await handBackForRetry(executionId, attempt);
+          return await handBackForRetry(executionId, attempt, ownerId);
         }
         const completed = completedAssistantOf(settled.messages);
         if (completed !== null) {
-          return await markCompletedFromRecovery(executionId, claimedAtMs, completed.usage);
+          return await markCompletedFromRecovery(executionId, claimedAtMs, completed.usage, ownerId);
         }
-        return await handBackForRetry(executionId, attempt);
+        return await handBackForRetry(executionId, attempt, ownerId);
       }
       const completed = completedAssistantOf(after.messages);
       if (completed !== null) {
-        return await markCompletedFromRecovery(executionId, claimedAtMs, completed.usage);
+        return await markCompletedFromRecovery(executionId, claimedAtMs, completed.usage, ownerId);
       }
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     };
 
     // Durable PRE-CHECK before posting the attempt's user turn:
@@ -634,29 +687,29 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     //   (attempt-scoped) turn. A previous attempt's failed turn (error chunk,
     //   consumer timeout) leaves the idempotency key permanently consumed on
     //   ITS message id — this attempt's key is different by construction.
-    const pre = await hydrateChat(task.agentSlug, claimed.chatId);
+    const pre = await hydrateChat(ownerId, task.agentSlug, claimed.chatId);
     if (pre === null) {
       // Metadata read failed before any POST: transient hand-back, the row
       // stays claimable.
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
     const preCompleted = completedAssistantOf(pre.messages);
     if (preCompleted !== null) {
       // An earlier attempt finished the answer durably but never recorded it
       // (its runner died between stream finish and the COMPLETED mark).
-      return await markCompletedFromRecovery(executionId, claimedAtMs, preCompleted.usage);
+      return await markCompletedFromRecovery(executionId, claimedAtMs, preCompleted.usage, ownerId);
     }
     if (pre.hasActiveStream) {
-      await consumeResumeStream(task.agentSlug, claimed.chatId);
-      const settled = await hydrateChat(task.agentSlug, claimed.chatId);
+      await consumeResumeStream(ownerId, task.agentSlug, claimed.chatId);
+      const settled = await hydrateChat(ownerId, task.agentSlug, claimed.chatId);
       if (settled !== null) {
         const completed = completedAssistantOf(settled.messages);
         if (completed !== null) {
-          return await markCompletedFromRecovery(executionId, claimedAtMs, completed.usage);
+          return await markCompletedFromRecovery(executionId, claimedAtMs, completed.usage, ownerId);
         }
       }
       // The stream drained without a durable answer: retry later.
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
 
     // The ONE chat POST this claimed attempt gets. A concurrent duplicate of
@@ -665,7 +718,7 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     if (!postOutcome.ok) {
       // Network/timeout: the server-side generation keeps running (never
       // aborted); a later attempt recovers it via 409/hydration/resume.
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
     const response = postOutcome.response;
 
@@ -674,12 +727,19 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
       // attempt's still-live stream: recover from durable state.
       return await recoverExisting();
     }
+    if (response.status === 401) {
+      // The owner gate rejected the internal POST (missing/misbound signed
+      // context): a configuration defect, not a retryable run. Land the row
+      // FAILED without regeneration.
+      logger.error('scheduler-run-chat-unauthorized', new Error('internal chat POST rejected by the owner gate'));
+      return await landFailed(executionId, RUN_FAILED_TEXT_REQUEST_INVALID, ownerId);
+    }
     if (response.status === 400) {
       // Rejected before generation (validation): nonretryable FAILED.
-      return await landFailed(executionId, RUN_FAILED_TEXT_REQUEST_INVALID);
+      return await landFailed(executionId, RUN_FAILED_TEXT_REQUEST_INVALID, ownerId);
     }
     if (!response.ok || response.body === null) {
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
 
     // Consume the SSE UI-message stream. The bounded consumer never aborts
@@ -688,29 +748,29 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     try {
       consumed = await consumeChatStream(response.body);
     } catch {
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
 
-    const after = await hydrateChat(task.agentSlug, claimed.chatId);
+    const after = await hydrateChat(ownerId, task.agentSlug, claimed.chatId);
     if (after === null) {
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
     if (consumed.sawError) {
       // The provider/stream failure surfaced as the safe error part.
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
     if (hasPendingAskUser(after.messages)) {
       // Autonomous scheduled chat asked a question: FAILED, ok:true — no
       // retry; the pending question remains linked for human inspection.
-      return await landFailed(executionId, RUN_FAILED_TEXT_PENDING_QUESTION);
+      return await landFailed(executionId, RUN_FAILED_TEXT_PENDING_QUESTION, ownerId);
     }
     const completed = completedAssistantOf(after.messages);
     if (completed === null) {
       // Stream finished without a durable answer: invalid response, retryable.
-      return await handBackForRetry(executionId, attempt);
+      return await handBackForRetry(executionId, attempt, ownerId);
     }
     const usage = consumed.usage ?? completed.usage;
-    return await markCompletedAfterRun(executionId, boundedDuration(claimedAtMs), usage, true);
+    return await markCompletedAfterRun(executionId, boundedDuration(claimedAtMs), usage, true, ownerId);
   }
 
   /**
@@ -719,17 +779,19 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
    * then re-hydrated; a FRESH running row with nothing recoverable is a 409;
    * a STALE one lands RETRYING (attempts remain) or DEAD_LETTER (final).
    */
-  async function recoverRunning(loaded: AgentTaskExecution): Promise<SchedulerRunOutcome> {
+  async function recoverRunning(loaded: AgentTaskExecution, ownerId: string): Promise<SchedulerRunOutcome> {
     const stale =
       Number.isFinite(Date.parse(loaded.updatedAt)) &&
       Date.now() - Date.parse(loaded.updatedAt) >= budgets.staleRunningMs;
 
-    const task: AgentTask | null = await service.getTask(loaded.taskId).catch(() => null);
+    const task: AgentTask | null = await service
+      .getTask(loaded.taskId, { expectedOwnerId: ownerId })
+      .catch(() => null);
     if (task === null) {
       return conflict409();
     }
 
-    const hydrated = await hydrateChat(task.agentSlug, loaded.chatId);
+    const hydrated = await hydrateChat(ownerId, task.agentSlug, loaded.chatId);
     if (hydrated === null) {
       // Metadata call failed: transient — never recover on bad reads (a live
       // runner stays untouched and BullMQ retries later).
@@ -737,8 +799,8 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     }
 
     if (hydrated.hasActiveStream) {
-      await consumeResumeStream(task.agentSlug, loaded.chatId);
-      const settled = await hydrateChat(task.agentSlug, loaded.chatId);
+      await consumeResumeStream(ownerId, task.agentSlug, loaded.chatId);
+      const settled = await hydrateChat(ownerId, task.agentSlug, loaded.chatId);
       if (settled !== null) {
         const completed = completedAssistantOf(settled.messages);
         if (completed !== null) {
@@ -746,13 +808,14 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
             loaded.id,
             Date.parse(loaded.updatedAt) || 0,
             completed.usage,
+            ownerId,
           );
         }
       }
       if (!stale) {
         return conflict409();
       }
-      return await staleRunningOutcome(loaded.id, loaded.attempt);
+      return await staleRunningOutcome(loaded.id, loaded.attempt, ownerId);
     }
 
     const completed = completedAssistantOf(hydrated.messages);
@@ -761,24 +824,25 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
         loaded.id,
         Date.parse(loaded.updatedAt) || 0,
         completed.usage,
+        ownerId,
       );
     }
     if (!stale) {
       // Fresh RUNNING row: its claimer is (or was just now) alive; transient.
       return conflict409();
     }
-    return await staleRunningOutcome(loaded.id, loaded.attempt);
+    return await staleRunningOutcome(loaded.id, loaded.attempt, ownerId);
   }
 
   /** Stale RUNNING with no recoverable answer: RETRYING or DEAD_LETTER. */
-  async function staleRunningOutcome(executionId: string, attempt: number): Promise<SchedulerRunOutcome> {
+  async function staleRunningOutcome(executionId: string, attempt: number, ownerId: string): Promise<SchedulerRunOutcome> {
     if (attempt < MAX_TASK_ATTEMPTS) {
       try {
-        await service.markRetrying({ id: executionId });
+        await service.markRetrying({ id: executionId, expectedOwnerId: ownerId });
         return { status: 200, body: { ok: false, reason: RUN_REASON_RETRYING } };
       } catch (error) {
         if (error instanceof SchedulerConflictError) {
-          const fresh = await service.getExecution(executionId).catch(() => null);
+          const fresh = await service.getExecution(executionId, { expectedOwnerId: ownerId }).catch(() => null);
           if (fresh !== null && fresh.status === 'RETRYING') {
             return { status: 200, body: { ok: false, reason: RUN_REASON_RETRYING } };
           }
@@ -789,18 +853,18 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
         return storeOutage();
       }
     }
-    return await deadLetter(executionId);
+    return await deadLetter(executionId, ownerId);
   }
 
   /** HAND-BACK path: RETRYING while attempts remain, DEAD_LETTER at 3. */
-  async function handBackForRetry(executionId: string, attempt: number): Promise<SchedulerRunOutcome> {
+  async function handBackForRetry(executionId: string, attempt: number, ownerId: string): Promise<SchedulerRunOutcome> {
     if (attempt < MAX_TASK_ATTEMPTS) {
       try {
-        await service.markRetrying({ id: executionId });
+        await service.markRetrying({ id: executionId, expectedOwnerId: ownerId });
         return { status: 200, body: { ok: false, reason: RUN_REASON_RETRYING } };
       } catch (error) {
         if (error instanceof SchedulerConflictError) {
-          const fresh = await service.getExecution(executionId).catch(() => null);
+          const fresh = await service.getExecution(executionId, { expectedOwnerId: ownerId }).catch(() => null);
           if (fresh !== null && fresh.status === 'RETRYING') {
             return { status: 200, body: { ok: false, reason: RUN_REASON_RETRYING } };
           }
@@ -811,17 +875,17 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
         return storeOutage();
       }
     }
-    return await deadLetter(executionId);
+    return await deadLetter(executionId, ownerId);
   }
 
   /** RUNNING -> DEAD_LETTER (terminal); BullMQ retains the failed job. */
-  async function deadLetter(executionId: string): Promise<SchedulerRunOutcome> {
+  async function deadLetter(executionId: string, ownerId: string): Promise<SchedulerRunOutcome> {
     try {
-      await service.markDeadLetter({ id: executionId, error: RUN_FAILED_TEXT_DEAD_LETTER });
+      await service.markDeadLetter({ id: executionId, error: RUN_FAILED_TEXT_DEAD_LETTER, expectedOwnerId: ownerId });
       return { status: 200, body: { ok: false, reason: RUN_REASON_DEAD_LETTER } };
     } catch (error) {
       if (error instanceof SchedulerConflictError) {
-        const fresh = await service.getExecution(executionId).catch(() => null);
+        const fresh = await service.getExecution(executionId, { expectedOwnerId: ownerId }).catch(() => null);
         if (fresh !== null && fresh.status === 'DEAD_LETTER') {
           return { status: 200, body: { ok: false, reason: RUN_REASON_DEAD_LETTER } };
         }
@@ -843,17 +907,19 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     durationMs: number,
     usage: AgentTaskExecutionTokenUsage | null,
     executed: boolean,
+    ownerId: string,
   ): Promise<SchedulerRunOutcome> {
     try {
       const completed = await service.markCompleted({
         id: executionId,
         durationMs,
         ...(usage !== null ? { tokenUsage: usage } : {}),
+        expectedOwnerId: ownerId,
       });
       return { status: 200, body: { ok: true, execution: completed, executed } };
     } catch (error) {
       if (error instanceof SchedulerConflictError) {
-        const fresh = await service.getExecution(executionId).catch(() => null);
+        const fresh = await service.getExecution(executionId, { expectedOwnerId: ownerId }).catch(() => null);
         if (fresh !== null && fresh.status === 'COMPLETED') {
           return { status: 200, body: { ok: true, execution: fresh, executed: false } };
         }
@@ -867,19 +933,20 @@ export function createSchedulerRunService(options: SchedulerRunServiceOptions): 
     executionId: string,
     claimStartedAtMs: number,
     usage: AgentTaskExecutionTokenUsage | null,
+    ownerId: string,
   ): Promise<SchedulerRunOutcome> {
     const startedAtMs = Number.isFinite(claimStartedAtMs) && claimStartedAtMs > 0 ? claimStartedAtMs : Date.now();
-    return await markCompletedAfterRun(executionId, boundedDuration(startedAtMs), usage, false);
+    return await markCompletedAfterRun(executionId, boundedDuration(startedAtMs), usage, false, ownerId);
   }
 
   /** RUNNING -> FAILED for a nonretryable outcome (ok:true — no retry). */
-  async function landFailed(executionId: string, errorText: string): Promise<SchedulerRunOutcome> {
+  async function landFailed(executionId: string, errorText: string, ownerId: string): Promise<SchedulerRunOutcome> {
     try {
-      const failed = await service.markFailed({ id: executionId, error: errorText });
+      const failed = await service.markFailed({ id: executionId, error: errorText, expectedOwnerId: ownerId });
       return { status: 200, body: { ok: true, execution: failed, executed: true } };
     } catch (error) {
       if (error instanceof SchedulerConflictError) {
-        const fresh = await service.getExecution(executionId).catch(() => null);
+        const fresh = await service.getExecution(executionId, { expectedOwnerId: ownerId }).catch(() => null);
         if (fresh !== null && fresh.status === 'FAILED') {
           return { status: 200, body: { ok: true, execution: fresh, executed: false } };
         }

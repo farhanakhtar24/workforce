@@ -219,23 +219,34 @@ export interface FetchLike {
  * Fetch hydration for a chat page. Never throws: every failure (network,
  * non-OK, malformed body) becomes a safe fixed message. `no-store` is
  * mandatory — hydration must always reflect live server state.
+ *
+ * Auth: server-side hydration (Next server → API) forwards the browser's
+ * incoming `Cookie` header when one is provided (never logged), so the
+ * session-authenticated API answers with the same transcript the client
+ * could see.
  */
 export async function fetchChatHydration(options: {
   apiBaseUrl: string;
   chatId: string;
   /** Agent slug of the conversation (default `general`). */
   slug?: string;
+  /** Incoming request `Cookie` header value forwarded verbatim (no-store). */
+  cookieHeader?: string;
   fetchImpl?: FetchLike;
 }): Promise<HydrationResult> {
-  const { apiBaseUrl, slug, fetchImpl = fetch } = options;
+  const { apiBaseUrl, slug, fetchImpl = browserApiFetch } = options;
   if (!isSafeChatId(options.chatId)) {
     return { ok: false, error: HYDRATION_ERROR_INVALID };
+  }
+  const headers: Record<string, string> = { accept: 'application/json' };
+  if (options.cookieHeader !== undefined && options.cookieHeader !== '') {
+    headers.cookie = options.cookieHeader;
   }
   try {
     const response = await fetchImpl(hydrationEndpoint(apiBaseUrl, options.chatId, slug), {
       method: 'GET',
       cache: 'no-store',
-      headers: { accept: 'application/json' },
+      headers,
     });
     if (!response.ok) {
       return { ok: false, error: HYDRATION_ERROR_UNREACHABLE };
@@ -244,4 +255,187 @@ export async function fetchChatHydration(options: {
   } catch {
     return { ok: false, error: HYDRATION_ERROR_UNREACHABLE };
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Auth (Better Auth sessions) + credentials-aware browser requests     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The signed-in workspace uses Better Auth session cookies served by the API
+ * under `/api/auth/*`. Every browser→API request must carry
+ * `credentials: 'include'` (CORS is credentials-safe on the API side).
+ */
+export const API_FETCH_CREDENTIALS = 'include' as const;
+
+/** Fixed copy — 403 access denial. */
+export const AUTH_DENIED_ERROR = 'You do not have access to this workspace.';
+/** Fixed copy — 401 session expiry; the fetcher also redirects to /sign-in. */
+export const SESSION_EXPIRED_ERROR = 'Your session expired. Redirecting to sign-in…';
+
+/**
+ * Restricts a `?next=`/callback to a SAME-ORIGIN local web route. Absolute
+ * URLs, scheme-relative (`//evil`), backslash tricks and empty values all
+ * fall back; Better Auth additionally validates trusted origins server-side.
+ */
+export function safeLocalCallback(
+  raw: string | null | undefined,
+  fallback: string = '/',
+): string {
+  if (typeof raw !== 'string') return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === '' || !trimmed.startsWith('/') || trimmed.startsWith('//') || trimmed.startsWith('/\\')) {
+    return fallback;
+  }
+  return trimmed;
+}
+
+/**
+ * Sends the browser to `/sign-in?next=<safe local route>` (session expiry).
+ * Only callable in a browser (client fetchers); never logs anything.
+ */
+export function redirectToSignIn(currentPath: string = '/'): void {
+  if (typeof window === 'undefined') return;
+  const next = safeLocalCallback(currentPath);
+  window.location.assign(`/sign-in?next=${encodeURIComponent(next)}`);
+}
+
+/**
+ * Maps a non-OK API status to fixed auth copy: 401 → session-expired (and
+ * triggers the /sign-in redirect), 403 → access denied, anything else → null
+ * (keep the domain's own fallback error).
+ */
+export function authErrorForStatus(status: number, currentPath: string): string | null {
+  if (status === 401) {
+    redirectToSignIn(currentPath);
+    return SESSION_EXPIRED_ERROR;
+  }
+  if (status === 403) return AUTH_DENIED_ERROR;
+  return null;
+}
+
+/** Public availability endpoint: which OAuth providers are configured. */
+export function authProvidersEndpoint(apiBaseUrl: string): string {
+  return `${apiBaseUrl.replace(/\/+$/, '')}/api/auth/providers`;
+}
+
+export type AuthProvidersResult =
+  | { ok: true; google: boolean; github: boolean }
+  | { ok: false; error: string };
+
+export const AUTH_PROVIDERS_ERROR =
+  'Provider availability could not be read. Check your connection and try again.';
+
+/** Structural mapping of `GET /api/auth/providers` — booleans only. */
+export function mapAuthProviders(payload: unknown): AuthProvidersResult {
+  if (payload === null || typeof payload !== 'object') {
+    return { ok: false, error: AUTH_PROVIDERS_ERROR };
+  }
+  const record = payload as Record<string, unknown>;
+  const google = record['google'];
+  const github = record['github'];
+  if (typeof google !== 'boolean' || typeof github !== 'boolean') {
+    return { ok: false, error: AUTH_PROVIDERS_ERROR };
+  }
+  return { ok: true, google, github };
+}
+
+export async function fetchAuthProviders(options: {
+  apiBaseUrl: string;
+  signal?: AbortSignal;
+}): Promise<AuthProvidersResult> {
+  try {
+    const response = await fetch(authProvidersEndpoint(options.apiBaseUrl), {
+      headers: { accept: 'application/json' },
+      cache: 'no-store',
+      credentials: API_FETCH_CREDENTIALS,
+      signal: options.signal,
+    });
+    if (!response.ok) {
+      return { ok: false, error: AUTH_PROVIDERS_ERROR };
+    }
+    return mapAuthProviders(await response.json());
+  } catch {
+    return { ok: false, error: AUTH_PROVIDERS_ERROR };
+  }
+}
+
+/**
+ * Browser fetch wrapper for API calls: always sends cookies
+ * (`credentials: 'include'`) so the session-authenticated API accepts the
+ * request. Structurally satisfies every domain `*Fetch` interface, so libs
+ * swap their default `fetch` for this without changing their call contracts.
+ */
+export async function browserApiFetch(
+  input: string,
+  init?: {
+    method?: string;
+    cache?: 'no-store';
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  },
+): Promise<Response> {
+  return fetch(input, { ...init, credentials: API_FETCH_CREDENTIALS } as RequestInit);
+}
+
+/**
+ * Auth status → error mapping for domain request helpers: 401 redirects to
+ * /sign-in (client only) and reports the fixed session-expired copy; 403
+ * reports fixed access-denied copy; other statuses return null so the
+ * caller keeps its own domain fallback.
+ */
+/**
+ * Adapter for AI SDK chat transports (send + resume): standard fetch
+ * signature with cookies always included, so `DefaultChatTransport`'s
+ * `fetch` option satisfies its expected `(RequestInfo|URL, RequestInit)` type.
+ */
+export async function browserChatFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  return fetch(input, { ...init, credentials: API_FETCH_CREDENTIALS });
+}
+
+export function requestAuthError(status: number): string | null {
+  const path = typeof window !== 'undefined' && window.location !== undefined ? window.location.pathname : '/';
+  return authErrorForStatus(status, path);
+}
+
+/**
+ * OAuth post-auth application return URL (Farhan bug: the browser landed on
+ * API3001). Better Auth resolves a RELATIVE `callbackURL` against the auth
+ * base URL (`API_ORIGIN/api/auth`, port 3001), so the sign-in flow must pass
+ * an ABSOLUTE same-origin WEB url.
+ *
+ * `absoluteWebCallback` sanitizes the intended local route and prefixes it
+ * with the given web origin ONLY when that origin is a genuine http(s) URL
+ * with non-empty hostname. The caller passes `window.location.origin` (the
+ * real web origin, e.g. `http://localhost:3000`). A hostile `next` (absolute
+ * URL, scheme-relative, backslash tricks, empty/garbage) never becomes an
+ * origin — it collapses to the origin's `/`; the supplied origin can never be
+ * replaced by the input, so the result can never target the API port or an
+ * evil origin. No open redirect: the route part is still path-optional input
+ * validated by `safeLocalCallback` (never protocol-relative), and the final
+ * origin is either the caller-supplied real web origin or the safe fallback.
+ */
+export function absoluteWebCallback(
+  webOrigin: string | null | undefined,
+  next: string | null | undefined,
+): string {
+  let normalizedOrigin: string;
+  try {
+    const parsed = new URL(String(webOrigin ?? ''));
+    if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && parsed.hostname !== '') {
+      normalizedOrigin = parsed.origin;
+    } else {
+      normalizedOrigin = '';
+    }
+  } catch {
+    normalizedOrigin = '';
+  }
+  const route = safeLocalCallback(next, '/');
+  // `route` always starts with '/'; an unusable origin degrades to the
+  // relative route rather than inventing a host.
+  return normalizedOrigin === '' ? route : `${normalizedOrigin}${route}`;
 }

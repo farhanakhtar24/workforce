@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { WorkspaceShell } from '@/components/WorkspaceShell';
+import { WorkspaceGate } from '@/components/WorkspaceShell';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -325,7 +325,7 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
           : 'border border-red-200 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200';
 
   return (
-    <WorkspaceShell
+    <WorkspaceGate
       active="schedules"
       eyebrow="Automation"
       title="Schedules"
@@ -571,7 +571,7 @@ function SchedulesLoaded({ apiBaseUrl }: { apiBaseUrl: string }): React.ReactEle
           </>
         )}
       </Card>
-    </WorkspaceShell>
+    </WorkspaceGate>
   );
 }
 

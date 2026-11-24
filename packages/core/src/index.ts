@@ -24,3 +24,5 @@ export * from './agents/index.js';
 export * from './work-docs/index.js';
 export * from './delegation/index.js';
 export * from './scheduler/index.js';
+// Pre-Phase 6 auth foundation (pure helpers only — see src/auth/index.ts).
+export * from './auth/index.js';

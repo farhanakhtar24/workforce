@@ -62,30 +62,33 @@ test('resumeExistingStream: null when finished, undefined when unknown', async (
 
 test('in-memory store: idempotency TTL semantics and release', async () => {
   const store = createInMemoryChatStore();
-  assert.equal(await store.acquireIdempotencyKey({ slug: 'general', chatId: 'c1' }, 'k', 900), true);
-  const snapshot = store.snapshot({ slug: 'general', chatId: 'c1' });
+  const chat = { ownerId: 'owner-a', slug: 'general', chatId: 'c1' };
+  assert.equal(await store.acquireIdempotencyKey(chat, 'k', 900), true);
+  const snapshot = store.snapshot(chat);
   const expiry = [...snapshot.idempotencyKeys.values()][0] ?? 0;
   assert.ok(Math.abs(expiry - (Date.now() + 900_000)) < 5_000, 'TTL must be 900s');
-  await store.releaseIdempotencyKey({ slug: 'general', chatId: 'c1' }, 'k');
-  assert.equal((await store.acquireIdempotencyKey({ slug: 'general', chatId: 'c1' }, 'k', 900)), true);
+  await store.releaseIdempotencyKey(chat, 'k');
+  assert.equal((await store.acquireIdempotencyKey(chat, 'k', 900)), true);
 });
 
-test('in-memory store: chats are isolated by slug+chatId; appends land in order', async () => {
+test('in-memory store: chats are isolated by owner+slug+chatId; appends land in order', async () => {
   const store = createInMemoryChatStore();
-  await store.appendMessage({ slug: 'general', chatId: 'c1' }, {
+  const chat = { ownerId: 'owner-a', slug: 'general', chatId: 'c1' };
+  await store.appendMessage(chat, {
     id: 'a',
     role: 'user',
     parts: [],
   } as never);
-  assert.deepEqual(await store.loadMessages({ slug: 'general', chatId: 'c2' }), []);
-  assert.deepEqual((await store.loadMessages({ slug: 'other', chatId: 'c1' })), []);
-  await store.appendMessage({ slug: 'general', chatId: 'c1' }, {
+  assert.deepEqual(await store.loadMessages({ ownerId: 'owner-b', slug: 'general', chatId: 'c1' }), []);
+  assert.deepEqual(await store.loadMessages({ ownerId: 'owner-a', slug: 'general', chatId: 'c2' }), []);
+  assert.deepEqual((await store.loadMessages({ ownerId: 'owner-a', slug: 'other', chatId: 'c1' })), []);
+  await store.appendMessage(chat, {
     id: 'b',
     role: 'assistant',
     parts: [],
   } as never);
   assert.deepEqual(
-    (await store.loadMessages({ slug: 'general', chatId: 'c1' })).map(
+    (await store.loadMessages(chat)).map(
       (message) => (message as { id: string }).id,
     ),
     ['a', 'b'],

@@ -12,14 +12,11 @@ import { buildApp } from '../src/app.js';
 import { createBackgroundTracker } from '../src/background.js';
 import { loadApiConfig, type ApiConfig } from '../src/config.js';
 import { createInMemoryChatStore } from '../src/store/memory.js';
+import type { MemoryService } from '@workforce/core/memory';
 import { createInMemoryStreamContext, type InMemoryStreamContext, type InMemoryStreamState } from '../src/stream-context/memory.js';
 import type { StreamContext } from '../src/stream-context/types.js';
-import type { ChatStore } from '../src/store/types.js';
+import { CHAT_OWNER_ID_PATTERN, type ChatRef, type ChatStore } from '../src/store/types.js';
 import type { MemoryRouteDeps } from '../src/memory/routes.js';
-import {
-  createDelegationContextSigner,
-  type DelegationContextSigner,
-} from '../src/agents/delegation-context.js';
 import type { HostCapabilityDeps, FetchLike } from '../src/agents/host-capabilities.js';
 import { WorkDocService } from '@workforce/core/work-docs';
 import { InMemoryWorkDocStore } from '@workforce/core/work-docs';
@@ -35,10 +32,63 @@ import {
 } from '@workforce/core/scheduler';
 import type { SchedulerQueuePort, SchedulerRunBudgets } from '../src/scheduler/types.js';
 import { createDelegationRoutes } from '../src/agents/delegation-routes.js';
+import type { AppAuthDeps } from '../src/app.js';
+import { createDelegationContextSigner, INTERNAL_SCHEDULER_HEADER, internalOwnerHeader, type DelegationContextSigner } from '../src/agents/delegation-context.js';
+import type { AuthOwner } from '../src/auth/owner.js';
 
 export const TEST_ORIGINAL_ORIGIN = 'http://localhost:3000';
 
-export function testConfig(overrides: Partial<{ port: number; webOrigin: string }> = {}): ApiConfig {
+/**
+ * The static TEST owner injected through buildApp deps (`auth: { staticOwner }`)
+ * — never a production bypass. Every pre-existing test exercises its behavior
+ * as this owner; explicit unauthenticated tests opt into `ownerMode: 'none'`.
+ */
+export const TEST_OWNER: AuthOwner = {
+  userId: 'test-owner-0001',
+  email: 'test-owner@example.com',
+  emailVerified: true,
+};
+/** A SECOND owner for cross-owner isolation tests. */
+export const TEST_OWNER_B: AuthOwner = {
+  userId: 'test-owner-0002',
+  email: 'test-owner-b@example.com',
+  emailVerified: true,
+};
+
+let cachedTestSigner: DelegationContextSigner | null = null;
+/** Shared test signer (the SAME secret wiring passes to the app). */
+export function testInternalSigner(): DelegationContextSigner {
+  if (cachedTestSigner === null) {
+    cachedTestSigner = createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8'));
+  }
+  return cachedTestSigner;
+}
+
+/** Signed internal-owner headers for loopback-style test calls. */
+export function internalOwnerHeaders(): Record<string, string> {
+  return internalOwnerHeader(testInternalSigner(), TEST_OWNER.userId);
+}
+
+/**
+ * Worker run headers: convention marker + SIGNED `internal-scheduler-run`
+ * context bound to the task/execution id — exactly the contract the routes
+ * verify (the literal worker header alone is no longer sufficient).
+ */
+export function schedulerRunHeaders(target: { taskId?: string; executionId?: string }): Record<string, string> {
+  return {
+    'X-Workforce-Scheduler-Worker': '1',
+    [INTERNAL_SCHEDULER_HEADER]: testInternalSigner().sign({
+      kind: 'internal-scheduler-run',
+      ...(target.taskId !== undefined ? { taskId: target.taskId } : {}),
+      ...(target.executionId !== undefined ? { executionId: target.executionId } : {}),
+      expiresAt: Date.now() + 300_000,
+    }),
+  };
+}
+
+export function testConfig(
+  overrides: Partial<{ port: number; webOrigin: string; blockedModelPrefixes: string; modelPricingJson: string }> = {},
+): ApiConfig {
   return loadApiConfig({
     OLLAMA_API_KEY: 'test-key-not-real',
     OLLAMA_BASE_URL: 'https://ollama.invalid/v1',
@@ -48,6 +98,10 @@ export function testConfig(overrides: Partial<{ port: number; webOrigin: string 
     WEB_ORIGIN: TEST_ORIGINAL_ORIGIN,
     ...(overrides.port !== undefined ? { PORT: String(overrides.port) } : {}),
     ...(overrides.webOrigin !== undefined ? { WEB_ORIGIN: overrides.webOrigin } : {}),
+    ...(overrides.blockedModelPrefixes !== undefined
+      ? { WORKFORCE_BLOCKED_MODEL_PREFIXES: overrides.blockedModelPrefixes }
+      : {}),
+    ...(overrides.modelPricingJson !== undefined ? { OLLAMA_MODEL_PRICING_JSON: overrides.modelPricingJson } : {}),
   });
 }
 
@@ -193,7 +247,7 @@ export const TEST_DELEGATION_SECRET = 'test-secret-for-signature-0123456789abcde
 /** Seeds chat history through the append-only contract, oldest first. */
 export async function seedMessages(
   store: ChatStore,
-  chat: { slug: string; chatId: string },
+  chat: ChatRef,
   messages: UIMessage[],
 ): Promise<void> {
   for (const message of messages) {
@@ -208,12 +262,63 @@ export interface TestAppOptions {
   webOrigin?: string;
   /** Called on every tracked background rejection. */
   onBackgroundError?: (error: unknown) => void;
+  /**
+   * Owner injection mode: `'static'` (default) attaches {@link TEST_OWNER} to
+   * every gated request through buildApp deps; `'none'` installs no auth deps
+   * at all (fail-closed: every gated route answers the fixed 401).
+   */
+  ownerMode?: 'static' | 'none';
+  /**
+   * Explicit auth deps override (e.g. a DIFFERENT static owner for
+   * cross-owner isolation tests). Default: static TEST_OWNER, or none.
+   */
+  auth?: AppAuthDeps;
+  /**
+   * Pre-Phase 6 model composition (fake catalog + recorded modelFor + the
+   * default id). When present, the model/usage/catalog routes mount and the
+   * chat POST routes through modelFor. When absent: the single-mock behavior.
+   */
+  models?: {
+    readonly catalog: {
+      list(): Promise<{ models: ReadonlyArray<{ id: string; name: string; modifiedAt: string | null; capabilities: ReadonlyArray<string>; parameterSize: string | null; locked: boolean; lockReason: string | null }> }>;
+      details(modelId: string): Promise<{ status: 'ok' | 'not-found'; details?:
+        { contextLength: number | null; capabilities: readonly string[] | null; parameterSize: string | null; thinking: boolean | null } }>;
+    };
+    readonly modelFor: (modelId: string) => LanguageModel;
+    readonly defaultModelId: string;
+  };
+  /**
+   * Pre-Phase 6 per-user settings service (fake). When present, /api/settings
+   * mounts and the personal gate reads it.
+   */
+  settings?: import('../src/settings/settings.js').SettingsServiceLike;
+  /**
+   * Pre-Phase 6 opt-in personal memory composition (fake). When present the
+   * chat POST gates capture/recall/purge on the settings flag.
+   */
+  personal?: {
+    readonly settings: import('../src/settings/settings.js').SettingsServiceLike;
+    readonly memory: MemoryService;
+    readonly capture: {
+      enqueueCapture(input: {
+        ownerId: string;
+        scope: string;
+        chatId: string;
+        slug: string;
+        userMessageId: string;
+        assistantMessageId: string;
+      }): Promise<boolean>;
+    };
+  };
   /** Phase 3 memory pipeline; when omitted the memory routes are absent. */
-  memory?: MemoryRouteDeps;
-  /** Phase 4 agent runtime fixture (see {@link startAgentsTestApp}). */
+  memory?: MemoryRouteDeps;  /** Phase 4 agent runtime fixture (see {@link startAgentsTestApp}). */
   agents?: AgentsFixtures;
   /** Phase 5 scheduler fixture; when present the /api/scheduler routes mount. */
   scheduler?: SchedulerFixtures;
+  /** Pre-Phase 6: env-scoped blocked-model prefixes for the test config. */
+  blockedModelPrefixes?: string;
+  /** Pre-Phase 6: explicit per-million pricing JSON for the test config. */
+  modelPricingJson?: string;
 }
 
 export interface AgentsFixtures {
@@ -326,7 +431,11 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
   const background = createBackgroundTracker({
     onError: options.onBackgroundError ?? (() => undefined),
   });
-  const config = testConfig({ webOrigin: options.webOrigin ?? TEST_ORIGINAL_ORIGIN });
+  const config = testConfig({
+    webOrigin: options.webOrigin ?? TEST_ORIGINAL_ORIGIN,
+    ...(options.blockedModelPrefixes !== undefined ? { blockedModelPrefixes: options.blockedModelPrefixes } : {}),
+    ...(options.modelPricingJson !== undefined ? { modelPricingJson: options.modelPricingJson } : {}),
+  });
 
   // Phase 4 fixtures: the tools/delegations call the SAME REST API through a
   // rewriting fetch — the placeholder origin is substituted with the real
@@ -358,6 +467,9 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
 
   // Phase 5 scheduler fixture: the runner posts the isolated chat through the
   // SAME rewriting loopback fetch (one app, one port), the queue is a fake.
+  // The run service needs the shared signer: scheduler runs sign their
+  // `internal-owner` loopback chat/hydration/resume calls with the owner
+  // derived from the execution row (TEST_OWNER by construction here).
   const schedulerFixtures = options.scheduler;
   const schedulerStore = schedulerFixtures?.store ?? new InMemorySchedulerStore();
   const schedulerService = new SchedulerService({ store: schedulerStore });
@@ -369,7 +481,16 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
     streamContext,
     model: options.model as LanguageModel,
     background,
+    auth:
+      options.auth !== undefined
+        ? options.auth
+        : (options.ownerMode ?? 'static') === 'none'
+          ? undefined
+          : { staticOwner: TEST_OWNER },
+    models: options.models,
     memory: options.memory,
+    settings: options.settings,
+    personal: options.personal,
     agents:
       agentsFixtures?.wire === false
         ? undefined
@@ -407,6 +528,7 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
               executionTimeoutMs: schedulerFixtures.executionTimeoutMs ?? 180_000,
               metadataTimeoutMs: schedulerFixtures.metadataTimeoutMs ?? 10_000,
               staleRunningMs: schedulerFixtures.staleRunningMs ?? 30_000,
+              signer,
               logger: silentLogger,
             },
             logger: silentLogger,

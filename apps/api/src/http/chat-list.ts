@@ -12,14 +12,18 @@
  *   provider details.
  * - Indexed chats come newest-activity-first; legacy (pre-index) chats are
  *   deterministically ordered afterward with `lastActivityAt: null`.
+ * - Owner-scoped: the resolved owner namespaces the whole read — another
+ *   user's chats (and pre-auth ownerless legacy chats) are unreachable.
  * - Store (Redis) failures are a safe 503 — without Redis the exact sidebar
  *   set cannot be honored, matching every other chat route (ADR-005).
- * - No new auth surface in this local phase; CORS is the app-wide middleware.
+ * - CORS is the app-wide middleware; authentication is the app-wide owner
+ *   middleware (pre-Phase 6).
  */
 import type { Request, RequestHandler, Response } from 'express';
 import type { SafeLogger } from '../logging.js';
 import type { ChatStore } from '../store/types.js';
 import { RECENT_CHATS_LIMIT_DEFAULT, RECENT_CHATS_LIMIT_MAX } from '../store/chat-history.js';
+import { ownerOf } from '../auth/owner.js';
 import { sendJsonError } from './adapter.js';
 
 /** Fixed safe validation message; the input value is never echoed. */
@@ -53,6 +57,11 @@ export function createChatListRoute(deps: ChatListRouteDeps): { listChats: Reque
   const { store, logger } = deps;
 
   const listChats: RequestHandler = async (req: Request, res: Response) => {
+    const owner = ownerOf(res);
+    if (owner === null) {
+      sendJsonError(res, 401, 'Authentication required.');
+      return;
+    }
     const limit = parseChatListLimit(req.query['limit']);
     if (limit === null) {
       sendJsonError(res, 400, LIMIT_ERROR_MESSAGE);
@@ -60,7 +69,7 @@ export function createChatListRoute(deps: ChatListRouteDeps): { listChats: Reque
     }
     let chats;
     try {
-      chats = await store.listRecentChats(limit);
+      chats = await store.listRecentChats(owner.userId, limit);
     } catch (error) {
       // Cause logged with context only; the client gets a fixed safe 503.
       logger.error('chat-list-store', error);

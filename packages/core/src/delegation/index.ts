@@ -49,6 +49,8 @@ export {
   delegationExternalIdSchema,
   delegationIdSchema,
   delegationModeSchema,
+  delegationOwnerIdSchema,
+  delegationReadOptionsSchema,
   delegationResultSchema,
   delegationStatusSchema,
   delegationTargetAgentSchema,
@@ -58,9 +60,11 @@ export {
   updateDelegationStatusInputSchema,
   type DelegationCreateInput,
   type DelegationListByParentInput,
+  type DelegationReadOptions,
   type DelegationUpdateStatusInput,
   type ParsedDelegationCreateInput,
   type ParsedDelegationListByParentInput,
+  type ParsedDelegationReadOptions,
   type ParsedDelegationUpdateStatusInput,
 } from './schemas.js';
 
