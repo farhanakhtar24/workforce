@@ -167,7 +167,9 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 ## Phase 6 — Docker, Deploy, Observability (1 week)
 
-**Status (2026-11-24)**: ⏸ **Paused — NOT started.** Farhan explicitly paused this phase in favor of the pre-Phase-6 product feature sprint ([`design-plans/pre-phase-6-product-features.md`](./design-plans/pre-phase-6-product-features.md)); Phase 5 validated 2026-11-24 but this phase gains nothing until the sprint closes.
+**Status (2026-11-25)**: 🚧 **Active — in progress.** The pre-Phase-6 product feature sprint shipped (auth + per-user workspaces + chat lifecycle + models/pricing + hourly budget + personal memory; evidence and honest gaps in [`design-plans/pre-phase-6-product-features.md`](./design-plans/pre-phase-6-product-features.md)), and Farhan closed the sprint by progression on 2026-11-25 ("Now the next phase?"). **Phase 6 is ACTIVE as of 2026-11-25 — but nothing in this phase is built or claimed yet**: no Docker/Compose app packaging, no deploy, no target chosen (Railway/Render/Fly all remain options), and the phase is **not validated** until Farhan explicitly approves the gate.
+>
+> Update 2026-11-25 (subagent): the LOCAL Docker artifact is now built and locally validated (api/web/migrate images, one-command Compose, isolated-project run with dummy secrets — record in [`docs/phases/phase-6-deploy.md`](./docs/phases/phase-6-deploy.md)). Railway/deploy has NOT started, and Phase 6 remains active and **not validated** until the real-OAuth public-URL gate.
 
 **Goal**: Live URL. Not localhost.
 
@@ -178,9 +180,9 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 - 6.4 Deployment targets (Railway / Render / Fly.io + Neon + Upstash)
 - 6.5 12-factor app (env config, secrets)
 
-**Build artifact**: `docker-compose.yml` that brings up `api + postgres + redis + web`. Then deploy to Railway/Render with a public URL.
+**Build artifact**: production Dockerfiles for `api`, `web` and the `scheduler` worker plus a one-command Compose for `api + web + scheduler + postgres + redis` — full spec in the [phase doc](./docs/phases/phase-6-deploy.md). Then deploy to Railway/Render/Fly with a public URL.
 
-**Validation**: I click the URL, chat with an agent, schedule a task. It works.
+**Validation**: I sign in through real OAuth on the public URL, chat with an agent, and schedule a task — it runs. Not validated until Farhan explicitly approves.
 
 📄 Phase doc: [`docs/phases/phase-6-deploy.md`](./docs/phases/phase-6-deploy.md)
 
