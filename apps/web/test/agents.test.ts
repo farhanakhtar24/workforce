@@ -16,6 +16,8 @@ import {
   isDefaultSelection,
   isPlanActionMeaningful,
   modeGuidance,
+  modeReplaceHistoryState,
+  modeUrlValue,
   parseChatPageMode,
   modeLabel,
   parseAgentSelection,
@@ -49,6 +51,22 @@ test('roster + defaults match the API slug/mode vocabulary', () => {
   assert.equal(isAgentSlug(null), false);
   assert.equal(isAgentMode('PLAN'), false);
   assert.equal(isAgentMode(undefined), false);
+});
+
+test('modeUrlValue + shallow replaceState helpers for in-place Plan/Action', () => {
+  // Plan is the URL default: omitted (clean URLs stay clean).
+  assert.equal(modeUrlValue('plan'), null);
+  assert.equal(modeUrlValue('action'), 'action');
+  // Shallow replace keeps the Next.js App Router state and tags the URL,
+  // so Plan→Action never triggers an RSC navigation or a Chat remount.
+  const state = modeReplaceHistoryState({ __NA: true, other: 'v' }, '/agents/general/chat/c1?mode=action');
+  assert.equal(state['url'], '/agents/general/chat/c1?mode=action');
+  assert.equal(state['as'], '/agents/general/chat/c1?mode=action');
+  assert.equal(state['__NA'], true);
+  assert.equal(state['other'], 'v');
+  // Missing history state still yields a usable object.
+  const bare = modeReplaceHistoryState(null, '/x');
+  assert.deepEqual(bare, { as: '/x', url: '/x' });
 });
 
 test('parseChatPageMode: absent/unknown ?mode= → web default plan; explicit honored', () => {

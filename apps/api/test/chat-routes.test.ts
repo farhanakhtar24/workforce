@@ -612,6 +612,9 @@ test('redis unavailable: hydration, chat POST, and resume all return explicit 50
     rewindChat: failure,
     getChatModel: failure,
     setChatModel: failure,
+    getChatMetadata: failure,
+    setChatMetadata: failure,
+    chatExists: failure,
   };
   const app = await startTestApp({ model: createMockModel({ steps: [textStep()] }), store });
   const seen: unknown[] = [];

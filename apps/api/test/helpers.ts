@@ -11,6 +11,7 @@ import type { Server } from 'node:http';
 import { buildApp } from '../src/app.js';
 import { createBackgroundTracker } from '../src/background.js';
 import { loadApiConfig, type ApiConfig } from '../src/config.js';
+import { requestContextHeader } from '../src/logging.js';
 import { createInMemoryChatStore } from '../src/store/memory.js';
 import type { MemoryService } from '@workforce/core/memory';
 import { createInMemoryStreamContext, type InMemoryStreamContext, type InMemoryStreamState } from '../src/stream-context/memory.js';
@@ -293,6 +294,11 @@ export interface TestAppOptions {
    */
   settings?: import('../src/settings/settings.js').SettingsServiceLike;
   /**
+   * Pre-Phase 6 conservative hourly budget service (fake). When present,
+   * /api/usage/hourly mounts and every chat POST admits through it.
+   */
+  budget?: import('../src/budget/hourly-budget.js').HourlyBudgetService;
+  /**
    * Pre-Phase 6 opt-in personal memory composition (fake). When present the
    * chat POST gates capture/recall/purge on the settings flag.
    */
@@ -315,6 +321,8 @@ export interface TestAppOptions {
   agents?: AgentsFixtures;
   /** Phase 5 scheduler fixture; when present the /api/scheduler routes mount. */
   scheduler?: SchedulerFixtures;
+  /** Injectable structured logger (buildApp dep) for observability tests. */
+  logger?: import('../src/logging.js').SafeLogger;
   /** Pre-Phase 6: env-scoped blocked-model prefixes for the test config. */
   blockedModelPrefixes?: string;
   /** Pre-Phase 6: explicit per-million pricing JSON for the test config. */
@@ -446,7 +454,7 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
   let livePort = 0;
   const agentFetchFn: FetchLike = (input, init) => {
     const rewritten = typeof input === 'string' ? input.replace(INTERNAL_ORIGIN, `http://127.0.0.1:${livePort}`) : input;
-    return fetch(rewritten, init);
+    return fetch(rewritten, { ...(init ?? {}), headers: { ...requestContextHeader(), ...(init?.headers ?? {}) } });
   };
   const signer = createDelegationContextSigner(Buffer.from(TEST_DELEGATION_SECRET, 'utf8'));
   const delegationTimeoutMs = agentsFixtures?.delegationTimeoutMs ?? 120_000;
@@ -489,10 +497,12 @@ export async function startTestApp(options: TestAppOptions = {}): Promise<TestAp
           : { staticOwner: TEST_OWNER },
     models: options.models,
     memory: options.memory,
+    logger: options.logger,
     settings: options.settings,
+    budget: options.budget,
     personal: options.personal,
     agents:
-      agentsFixtures?.wire === false
+      (agentsFixtures as AgentsFixtures | undefined)?.wire === false
         ? undefined
         : {
             hostDeps,

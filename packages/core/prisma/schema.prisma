@@ -474,3 +474,52 @@ model UserSettings {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 }
+
+// ---------------------------------------------------------------------------
+// Pre-Phase 6 CONSERVATIVE per-user hourly budget (durable ledger, additive).
+// Rows are an independent accounting truth (never derived from transcripts):
+// one row per admitted top-level chat generation (`request`) or memory
+// compaction run (`compaction`). Admission reserves conservative estimates
+// BEFORE provider work; settlement stores the actual usage when the provider
+// supplied valid numbers; an unsettled row keeps its conservative cost until
+// the rolling 60-minute window expires. No negative remaining values and no
+// account-wide/shared-key data ever live here.
+// ---------------------------------------------------------------------------
+model UserHourlyUsageEvent {
+  id                   String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerId              String
+  // kind: 'request' (top-level/delegated/scheduled chat generation) or
+  // 'compaction' (dollar-only; never a user request count).
+  kind                 String
+  // status: 'reserved' (conservative, unsettled) or 'settled' (actual usage).
+  status               String    @default("reserved")
+  // The exact model id the generation was admitted for.
+  model                String
+  // Settle key (chat generations only; null for compaction).
+  chatId               String?
+  userMessageId        String?
+  // Conservative (worst-case) admission estimate.
+  inputTokens          Int
+  outputTokens         Int
+  estimatedCostUsd     Float
+  // Actual provider usage after settlement (unsettled → null).
+  actualInputTokens    Int?
+  actualOutputTokens   Int?
+  actualCostUsd        Float?
+  usageSettledAt       DateTime?
+  createdAt            DateTime  @default(now())
+
+  @@index([ownerId, createdAt])
+  @@index([ownerId, chatId, userMessageId])
+}
+
+// Links a derived per-user memory scope to its owner so the memory WORKER
+// (which only sees scope+path) can attribute compaction dollar usage to the
+// right user. Written by the memory routes when a user-scoped write happens;
+// legacy anonymous scopes never appear here (their compaction cost is not
+// attributable and stays out of every per-user budget).
+model UserMemoryScopeLink {
+  scope     String   @id
+  ownerId   String
+  createdAt DateTime @default(now())
+}

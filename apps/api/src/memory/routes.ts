@@ -54,6 +54,14 @@ export const SERVICE_UNAVAILABLE = 'Memory service is temporarily unavailable.';
 export interface MemoryRouteDeps {
   service: MemoryService;
   queue: MemoryJobQueue;
+  /**
+   * Pre-Phase 6 hourly budget (optional): links a derived user memory scope
+   * to its owner so the memory WORKER can attribute DOLLAR-ONLY compaction
+   * usage. Absent = legacy behavior (compaction not budget-attributable).
+   */
+  budgetHook?: {
+    recordScopeOwner(scope: string, ownerId: string): Promise<void>;
+  };
   logger?: SafeLogger;
 }
 
@@ -156,7 +164,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
    * even trip validation by naming a foreign scope. Unauthenticated reach
    * (impossible behind the app-wide owner middleware) is a 401.
    */
-  const scopeOf = (req: Request, res: Response): string | null => {
+  const scopeOf = async (req: Request, res: Response): Promise<string | null> => {
     const owner = ownerOf(res);
     if (owner === null) {
       res.status(401);
@@ -165,7 +173,17 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
       res.end(JSON.stringify({ error: 'Authentication required.' }));
       return null;
     }
-    return userMemoryScope(owner.userId);
+    const scope = userMemoryScope(owner.userId);
+    // Hourly-budget attribution: persist the scope → owner link
+    // (idempotent) so the compaction worker can reserve dollar usage.
+    if (deps.budgetHook !== undefined) {
+      try {
+        await deps.budgetHook.recordScopeOwner(scope, owner.userId);
+      } catch (error) {
+        logger?.error('memory-scope-owner-link', error);
+      }
+    }
+    return scope;
   };
 
   /** Removes the client-supplied `scope` before schema parsing (ignore). */
@@ -180,7 +198,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- POST /api/memory/blocks -------------------------------------------------
 
   const createBlock: RequestHandler = handler(async (req, res) => {
-    const scope = scopeOf(req, res);
+    const scope = await scopeOf(req, res);
     if (scope === null) {
       return;
     }
@@ -195,7 +213,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- GET /api/memory/blocks ---------------------------------------------------
 
   const listBlocks: RequestHandler = handler(async (req, res) => {
-    const scope = scopeOf(req, res);
+    const scope = await scopeOf(req, res);
     if (scope === null) {
       return;
     }
@@ -211,7 +229,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- POST /api/memory/search --------------------------------------------------
 
   const search: RequestHandler = handler(async (req, res) => {
-    const scope = scopeOf(req, res);
+    const scope = await scopeOf(req, res);
     if (scope === null) {
       return;
     }
@@ -226,7 +244,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- GET /api/memory/blocks/:id/related ---------------------------------------
 
   const related: RequestHandler = handler(async (req, res) => {
-    const scope = scopeOf(req, res);
+    const scope = await scopeOf(req, res);
     if (scope === null) {
       return;
     }
@@ -240,7 +258,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- POST /api/memory/blocks/:id/retry ----------------------------------------
 
   const retryEmbedding: RequestHandler = handler(async (req, res) => {
-    const scope = scopeOf(req, res);
+    const scope = await scopeOf(req, res);
     if (scope === null) {
       return;
     }
@@ -264,7 +282,7 @@ export function createMemoryRoutes(deps: MemoryRouteDeps): MemoryRouteHandlers {
   // -- POST /api/memory/compact ---------------------------------------------------
 
   const enqueueCompaction: RequestHandler = handler(async (req, res) => {
-    const scope = scopeOf(req, res);
+    const scope = await scopeOf(req, res);
     if (scope === null) {
       return;
     }

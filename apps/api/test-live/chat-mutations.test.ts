@@ -403,3 +403,83 @@ test('live: usage endpoint — exact sums over REAL stored usage; pricing absent
     await stack.close();
   }
 });
+
+test('live metadata + export: persistence, DELETE/branch/rewind semantics, complete markdown', { timeout: 30_000 }, async () => {
+  const model = createMockModel({ steps: [textStep()] });
+  const stack = await createLiveStack(model as unknown as LanguageModel, {
+    userId: OWNER_ID,
+    email: 'live-mutations@example.com',
+    emailVerified: true,
+  });
+  const metadataKey = `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${CHAT_ID}:metadata`;
+  const liveMessagesKey = `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${CHAT_ID}:messages`;
+  try {
+    stack.ownKey(liveMessagesKey);
+    stack.ownKey(metadataKey);
+    const userRaw1 = JSON.stringify({ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'export me please' }] });
+    await stack.base.rPush(liveMessagesKey, userRaw1);
+    await stack.base.zAdd(chatIndexKey(OWNER_ID), [{ value: `${SLUG}:${CHAT_ID}`, score: Date.now() }]);
+
+    // PATCH metadata: persisted hash in REAL Redis; survives a fresh store.
+    const patched = await fetch(`http://127.0.0.1:${stack.port}/api/agents/${SLUG}/chat/${CHAT_ID}/metadata`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Live pinned', pinned: true, archived: true }),
+    });
+    assert.equal(patched.status, 200);
+    assert.deepEqual((await patched.json()) as unknown, { metadata: { title: 'Live pinned', pinned: true, archived: true } });
+    const rawHash = await stack.base.hGetAll(metadataKey);
+    assert.deepEqual(rawHash as unknown, { title: 'Live pinned', pinned: '1', archived: '1' });
+    const freshStore = createRedisChatStore(stack.base as unknown as RedisLike);
+    assert.deepEqual(await freshStore.getChatMetadata({ ownerId: OWNER_ID, slug: SLUG, chatId: CHAT_ID }), {
+      title: 'Live pinned',
+      pinned: true,
+      archived: true,
+    });
+    // Branch does NOT copy metadata to the destination.
+    stack.ownKey(`${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${BRANCH_ID}:messages`);
+    stack.ownKey(`${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${BRANCH_ID}:active-stream`);
+    stack.ownKey(`${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${BRANCH_ID}:model`);
+    const branchMetaKey = `${REDIS_KEY_PREFIX}:chat:${OWNER_ID}:${SLUG}:${BRANCH_ID}:metadata`;
+    stack.ownKey(branchMetaKey);
+    const branched = await fetch(`http://127.0.0.1:${stack.port}/api/agents/${SLUG}/chat/${CHAT_ID}/branch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messageId: 'u1', newChatId: BRANCH_ID }),
+    });
+    assert.equal(branched.status, 201);
+    assert.deepEqual(await stack.base.hGetAll(branchMetaKey) as unknown, {}, 'branch writes NO metadata hash');
+
+    // REWIND preserves metadata.
+    const rewound = await fetch(`http://127.0.0.1:${stack.port}/api/agents/${SLUG}/chat/${CHAT_ID}/rewind`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messageId: 'u1' }),
+    });
+    assert.equal(rewound.status, 200);
+    assert.deepEqual(await freshStore.getChatMetadata({ ownerId: OWNER_ID, slug: SLUG, chatId: CHAT_ID }), {
+      title: 'Live pinned',
+      pinned: true,
+      archived: true,
+    });
+
+    // EXPORT: complete markdown over the REAL stored transcript.
+    const exported = await fetch(`http://127.0.0.1:${stack.port}/api/agents/${SLUG}/chat/${CHAT_ID}/export`);
+    assert.equal(exported.status, 200);
+    assert.equal(exported.headers.get('content-type'), 'text/markdown; charset=utf-8');
+    assert.equal(exported.headers.get('cache-control'), 'no-store');
+    const document = await exported.text();
+    assert.ok(document.includes('export me please'));
+    assert.ok(document.includes('### User'));
+
+    // DELETE clears the metadata hash from REAL Redis (Lua KEYS[5]).
+    const deleted = await fetch(`http://127.0.0.1:${stack.port}/api/agents/${SLUG}/chat/${CHAT_ID}`, { method: 'DELETE' });
+    assert.equal(deleted.status, 200);
+    assert.deepEqual(await stack.base.hGetAll(metadataKey) as unknown, {});
+    // And the sidebar list no longer surfaces it.
+    const listed = await (await fetch(`http://127.0.0.1:${stack.port}/api/chats`)).json() as { chats: Array<{ chatId: string }> };
+    assert.ok(listed.chats.every((chat) => chat.chatId !== CHAT_ID));
+  } finally {
+    await stack.close();
+  }
+});

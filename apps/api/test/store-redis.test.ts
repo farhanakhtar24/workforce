@@ -34,6 +34,16 @@ function nowMs(): number {
  * and-delete script only. No network.
  */
 class TinyRedis implements RedisLike {
+  readonly hashes = new Map<string, Record<string, string>>();
+  async hGetAll(key: string): Promise<Record<string, string> | unknown> {
+    const value = this.hashes.get(key);
+    return value === undefined ? {} : { ...value };
+  }
+  async hSet(key: string, value: Record<string, string>): Promise<number | unknown> {
+    const existing = this.hashes.get(key) ?? {};
+    this.hashes.set(key, { ...existing, ...value });
+    return Object.keys(value).length;
+  }
   readonly data = new Map<string, string>();
   readonly expiryAt = new Map<string, number>();
   readonly lastEvalScript: { script: string; keys: string[]; args: string[] } | null = null;
@@ -201,6 +211,12 @@ class TinyRedis implements RedisLike {
 }
 
 class BrokenRedis implements RedisLike {
+  async hGetAll(): Promise<Record<string, string> | unknown> {
+    throw new Error('simulated database outage');
+  }
+  async hSet(): Promise<number | unknown> {
+    throw new Error('simulated database outage');
+  }
   async get(): Promise<never> {
     throw new Error('READONLY You cannot write against a read only replica');
   }

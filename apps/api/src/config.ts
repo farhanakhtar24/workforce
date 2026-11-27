@@ -70,6 +70,8 @@ export interface ApiConfig {
    * `null` when absent/invalid — usage cost stays `null` (never invented).
    */
   readonly modelPricing: Readonly<Record<string, { input: number; output: number }>> | null;
+  /** Optional structured-log level (allowlisted; default info). */
+  readonly logLevel: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
 }
 
 /** Default model cache directory, resolved relative to the process cwd. */
@@ -128,6 +130,10 @@ const BLANK_AS_ABSENT_ENV_KEYS = [
   'SCHEDULER_EXECUTION_TIMEOUT_MS',
   'WORKFORCE_BLOCKED_MODEL_PREFIXES',
   'OLLAMA_MODEL_PRICING_JSON',
+  // Compose passes LOG_LEVEL: ${LOG_LEVEL:-}, so an UNSET level arrives as
+  // an empty string — blank = absent = the schema default ('info'). A
+  // nonempty value still goes through the enum validation unchanged.
+  'LOG_LEVEL',
 ] as const;
 
 const envSchema = z.object({
@@ -225,6 +231,13 @@ const envSchema = z.object({
     .string({ message: 'OLLAMA_MODEL_PRICING_JSON must be a string' })
     .max(65_536, 'OLLAMA_MODEL_PRICING_JSON must be at most 65536 characters')
     .optional(),
+  // Optional structured-log level; allowlisted, malformed → fixed config
+  // error (default: info). The VALUE is never logged/echoed.
+  LOG_LEVEL: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'], {
+      message: 'LOG_LEVEL must be one of the allowlisted pino levels',
+    })
+    .default('info'),
 });
 
 /**
@@ -334,5 +347,7 @@ export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     auth: parseOptionalAuthEnvironment(env),
     blockedModelPrefixes,
     modelPricing,
+    logLevel: data.LOG_LEVEL,
   });
+  void data.LOG_LEVEL;
 }

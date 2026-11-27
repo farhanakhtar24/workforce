@@ -43,6 +43,8 @@ interface ChatSummaryBody {
     preview: string;
     messageCount: number;
     lastActivityAt: string | null;
+    pinned: boolean;
+    archived: boolean;
   }>;
 }
 
@@ -117,7 +119,9 @@ test('ordering + fields: indexed chats newest first with ISO timestamps', async 
     );
     const newest = body.chats[0];
     assert.ok(newest !== undefined);
-    assert.deepEqual(Object.keys(newest), ['chatId', 'agent', 'title', 'preview', 'messageCount', 'lastActivityAt']);
+    assert.deepEqual(Object.keys(newest), ['chatId', 'agent', 'title', 'preview', 'messageCount', 'lastActivityAt', 'pinned', 'archived']);
+    assert.equal(newest.pinned, false);
+    assert.equal(newest.archived, false);
     assert.equal(newest.title, 'newest chat opening message');
     assert.equal(newest.preview, 'newest reply');
     assert.equal(newest.messageCount, 2);
@@ -407,9 +411,11 @@ test('chat summary type contract: no extra fields beyond the summary', async () 
   assert.ok(only !== undefined);
   assert.deepEqual(Object.keys(only).sort(), [
     'agent',
+    'archived',
     'chatId',
     'lastActivityAt',
     'messageCount',
+    'pinned',
     'preview',
     'title',
   ]);

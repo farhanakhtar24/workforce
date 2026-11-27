@@ -42,7 +42,29 @@ class MutationTinyRedis implements RedisLike {
   readonly data = new Map<string, string>();
   readonly expiryAt = new Map<string, number>();
   readonly zsets = new Map<string, Map<string, number>>();
+  /** Per-chat sidebar metadata hashes (HASH type; separate namespace). */
+  readonly metadata = new Map<string, Record<string, string>>();
   readonly evals: Array<{ script: string; keys: string[]; args: string[] }> = [];
+  metaTypeOf(key: string): 'hash' | 'none' {
+    return this.metadata.has(key) ? 'hash' : 'none';
+  }
+  async hGetAll(key: string): Promise<Record<string, string> | unknown> {
+    if (this.lists.has(key) || this.zsets.has(key) || this.data.has(key)) {
+      throw new Error('WRONGTYPE Operation not allowed');
+    }
+    const value = this.metadata.get(key);
+    return value === undefined ? {} : { ...value };
+  }
+  async hSet(key: string, value: Record<string, string>): Promise<number | unknown> {
+    // Single-type semantics: HSET replaces any other key type.
+    this.lists.delete(key);
+    this.zsets.delete(key);
+    this.data.delete(key);
+    const existing = this.metadata.get(key) ?? {};
+    const merged = { ...existing, ...value };
+    this.metadata.set(key, merged);
+    return Object.keys(value).length;
+  }
   /**
    * When set, a concurrent RPUSH is injected into KEYS[1] BEFORE EVERY
    * script evaluation (persistent — that is how the CAS-conflict test keeps
@@ -202,13 +224,14 @@ class MutationTinyRedis implements RedisLike {
       return value === undefined ? '' : value;
     }
     if (script === DELETE_CHAT_LUA) {
-      const [listKey, markerKey, indexKey, modelKey] = keys as [string, string, string, string];
+      const [listKey, markerKey, indexKey, modelKey, metadataKey] = keys as [string, string, string, string, string];
       const [member] = args;
       const listType = this.typeOf(listKey);
       const markerType = this.typeOf(markerKey);
       const indexType = this.typeOf(indexKey);
       const modelType = this.typeOf(modelKey);
-      if ((listType !== 'none' && listType !== 'list') || (markerType !== 'none' && markerType !== 'string') || (indexType !== 'none' && indexType !== 'zset') || (modelType !== 'none' && modelType !== 'string')) {
+      const metadataType = this.metaTypeOf(metadataKey);
+      if ((listType !== 'none' && listType !== 'list') || (markerType !== 'none' && markerType !== 'string') || (indexType !== 'none' && indexType !== 'zset') || (modelType !== 'none' && modelType !== 'string') || (metadataType !== 'none' && metadataType !== 'hash')) {
         return -3;
       }
       if (this.data.has(markerKey)) return -1;
@@ -216,6 +239,7 @@ class MutationTinyRedis implements RedisLike {
       this.lists.delete(listKey);
       this.data.delete(markerKey);
       this.data.delete(modelKey);
+      this.metadata.delete(metadataKey);
       this.zsets.get(indexKey)?.delete(member ?? '');
       return 1;
     }

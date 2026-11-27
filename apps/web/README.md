@@ -231,7 +231,10 @@ npm test           # tsx --test test/*.test.ts
 
 | Variable | Default | Notes |
 |---|---|---|
-| `NEXT_PUBLIC_API_URL` | `http://localhost:3001` | The only client-exposed value (the public Express API base). Never an API key. |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:3001` | The only client-exposed value (the public Express API base). Never an API key. Development keeps the browser talking to the API directly. |
+| `API_INTERNAL_URL` | `http://localhost:3001` | **Server-side, never browser**: the private API origin for BOTH the baked `/api/:path*` rewrite (validated at `next build` time as a bounded http(s) origin — no path/query/hash/credentials, trailing slash ignored; an invalid value fails the build with one fixed safe error that never echoes the value; travels as a Docker build arg) AND runtime SSR chat hydration (`resolveServerApiBaseUrl`, injected via the Compose `environment.API_INTERNAL_URL`). Absent/blank at runtime falls back to `NEXT_PUBLIC_API_URL` (host dev/direct-API modes). It is never a secret and the browser never sees it. |
+
+Production (Railway): `NEXT_PUBLIC_API_URL` = the public web origin (the browser's own origin), `API_INTERNAL_URL` = the API's private origin (e.g. `http://api.railway.internal:3001`). Local dev sets neither and stays direct-API.
 
 No secrets reach the browser: `OLLAMA_API_KEY` lives only in the API process.
 Memory embeddings run entirely server-side too (local MiniLM, 384-dim); `/memory`
@@ -370,6 +373,7 @@ src/components/Delegations.tsx        'use client': parent-chat delegation list 
 src/components/Schedules.tsx          'use client': Phase 5 schedule dashboard (create/edit form, task table/cards, execution history + polling)
 src/lib/scheduler.ts                  Phase 5 scheduler request/body/mapping/poll/link helpers (tested)
 src/lib/api.ts                        chat request/response helpers (send/hydrate/resume, slug-aware; tested)
+src/lib/api-proxy.ts                  Phase 6 server-only /api/:path* rewrite target for `next.config.ts` (API_INTERNAL_URL; tested)
 src/lib/agents.ts                     agent/mode roster, URL builders, guidance (tested)
 src/lib/tools.ts                      tool-part formatting + pending-ask_user scan (tested)
 src/lib/parts.ts                      assistant-part partitioning into Response/Thinking/Activity regions (tested)
@@ -389,7 +393,7 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
 
 ## Tests (offline, pure — node:test)
 
-`npm test` runs 213 tests across:
+`npm test` runs 240 tests across:
 
 - `test/api.test.ts` — Phase 2 wire contract (send body/headers, endpoints,
   hydration mapping, safe errors) — unchanged and green.
@@ -478,6 +482,17 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   never promising auto-resume); floored/clamped elapsed formatting; offline
   copy keeping draft/history, requesting reconnect, and stating no confirmed
   progress while busy.
+- `test/api-proxy.test.ts` — Phase 6 single-origin API proxy helpers
+  (`src/lib/api-proxy.ts`, ADR-009): the SERVER-ONLY `/api/:path*` rewrite
+  target (`API_INTERNAL_URL`) — default/blank fallback to
+  `http://localhost:3001` (itself a bounded origin), Railway-style private
+  origins accepted with a single trailing slash normalized away, every
+  non-origin shape (real path, trailing multi-slash, query, hash, userinfo,
+  wrong scheme, relative/scheme-relative, empty host, out-of-range port)
+  rejected with the ONE fixed safe error that never echoes the value
+  (build/log safe), and `apiProxyRewrites` building exactly
+  `{ source: '/api/:path*', destination: '<origin>/api/:path*' }` so auth
+  callbacks, `providers` and SSE resume stay same-origin through one source.
 
 ## Validation limitations (honest — the phase gate is Farhan's live run)
 
@@ -506,6 +521,41 @@ through `react-markdown`'s React tree — raw HTML disabled, everything escaped,
   default `agent`; agent-originated `write_doc` calls stay server-side).
   There is no shadow user-content endpoint.
 
+- **Three-column workspace (Farhan, visual refs)**: desktop chat is now
+  left rail + flexible center + a ~320px right **Session** context rail
+  (`lg:flex`, border-left, independent scroll; `<lg` becomes a labelled
+  toggled overlay drawer via the icon button in the quiet center header).
+  The top toolbar is gone — agent select and Plan/Action moved INTO the
+  composer control row, and the model NativeSelect became the reference
+  `ModelPicker` popover (Radix `Popover`, search box, real filtered catalog,
+  selected check, locked-Kimi rows disabled with the lock reason, keyboard +
+  Esc/outside dismissal) with an adjacent detail region fed on hover/focus/
+  selection: provider `Ollama Cloud`, real capabilities, `Input: text[, image]`
+  (image only with a real `vision` capability), `Output: text`, context/
+  parameter where real (`Not reported` otherwise), thinking flag when the API
+  reports one, and **Cost ($/1M tokens)** from the additive `pricing` field or
+  honest `Not configured`. Old model-details/Session-usage header disclosures
+  were REMOVED (functionality moved); per-message usage badges stay. The
+  Session rail shows: provider/model/agent/mode; **context % of the latest
+  request** (latest assistant `metadata.usage.inputTokens` ÷ selected model's
+  real `contextLength`, bounded, `Not reported` if either side missing);
+  exact session in/out/total with per-model buckets; configured estimate or
+  honest reason; latest-turn usage; real tool count from parts; and real
+  delegation rows (target/mode/status + child links) polling only while
+  pending/running and visible (seq-guarded). Unavailable metrics (cache
+  hits, quotas, tokens/sec, timing, files changed) are omitted, never
+  fabricated. Chat keeps transcript-only scrolling with the pinned composer,
+  one composer instance, and all preserved behaviors listed above.
+- **Session rail helpers** (`src/lib/session-rail.ts`, `test/session-rail.test.ts`):
+  `contextPercent` (bounded 0-100, strict integer inputs, unknown `null`),
+  `latestAssistantUsage` (strict metadata read), `countToolParts` (HITL
+  ask_user pending question excluded), `filterModels` (name/id
+  case-insensitive), `inputModality` (image only with real `vision`), and
+  `formatModelCardLines` (provider/real-fields/`Not reported`/pricing or
+  `Not configured`/lock reason). `mapModelDetails` now validates the additive
+  `pricing: null | {inputUsdPerMillion,outputUsdPerMillion}` — non-null but
+  missing/partial/invalid rates REJECT the payload (never $0).
+
 ## Pre-Phase-6 sprint integration note (2026-11-24 final)
 
 Recorded from the orchestrator's live desktop gate (1440×900, explicit
@@ -530,3 +580,97 @@ Not found`) because a relative `callbackURL` resolves against the AUTH base;
 `absoluteWebCallback(window.location.origin, nextPath)` (regression-tested in
 `test/auth.test.ts`). Real Google/GitHub browser confirmation POST-FIX remains
 pending.
+
+## OpenChamber rework follow-up (2026-11-25 — fix pass on the three-column build)
+
+Browser-verified misses from the first three-column build, fixed:
+
+1. **Header layers**: the shell no longer renders the eyebrow/title header on
+   chat surfaces; the chat's own quiet identity line
+   (`{Agent} · {Plan|Action} mode · {model}` with `aria-live`) is the ONLY
+   header, plus the Session rail toggle. Operational page headers unchanged.
+2. **Session sheet**: the rail's per-section bordered cards were replaced by
+   ONE bottom-anchored sheet with rounded top corners
+   (`rounded-t-2xl border-t border-x bg-card shadow-sm`), compact sections
+   divided by hairlines, real metrics only; the raw chat short ID and
+   empty-value noise were removed. The desktop rail column anchors the sheet
+   to the bottom (`justify-end`, scrollable); the <lg drawer holds the same
+   sheet. Collapse/reopen (labelled header button + vertical reopen strip)
+   and the drawer flow are unchanged.
+3. **Model picker**: the always-on detail card was replaced by an
+   OpenChamber-style hover/focus Tooltip (Radix `Tooltip`, portal,
+   `collisionPadding`, side="right") showing EXACTLY Provider, Capabilities,
+   Input, Output, and Cost ($/1M tokens with real in/out rates or honest
+   `Not configured`); no model name, context, parameter size, thinking,
+   modified date, or note in the tooltip. Locked Kimi rows stay disabled
+   with the server lock reason visible ON the row. Search autofocus
+   (`searchRef` focus in `onOpenAutoFocus`), selected check,
+   keyboard/Esc/outside close, and catalog loading/error states kept. The
+   real `detailsLoading` state is threaded and drives honest "Loading…"
+   VALUES inside the five fields (never a fabricated fake row count).
+4. **Plan→Action flicker**: mode is now IN-PLACE client state
+   (`activeMode` + ref) with a shallow
+   `history.replaceState(modeReplaceHistoryState(history.state, url), '', url)`
+   — no RSC navigation, no Chat remount, no useChat reset. The chat page key
+   is now `${agent}:${chatId}` (mode removed), the transport is stable
+   (`useMemo` deps `[apiBaseUrl, agent]`) and reads the mode ref at send
+   time; genuine agent navigation re-hydrates as before via
+   `navigateTo`, which now routes mode changes to the in-place path when
+   only mode differs. Draft, messages, and scroll survive the switch.
+5. **Composer**: one clean rounded rectangle (`rounded-2xl border bg-card`)
+   with the textarea borderless inside it, and a bottom toolbar row
+   (ModelPicker + agent + Plan/Action + hint + Send) under a hairline
+   divider. Empty state centers the same single composer; populated state
+   keeps transcript-only scrolling with the pinned dock; the HITL answer
+   form is unchanged.
+
+Verification (implementation pass): web typecheck clean; web tests 222/222;
+web production build exit 0. Final orchestrator run: root `npm run typecheck`
+PASS and **root tests 1018/1018** = core 314 + queue 47 + CLI 30 + API 405 +
+web 222 (supersedes an earlier timeout and one intermittent API 404 test; no
+behavior change was made for it). The final browser gate used the Browser
+Gate test identity (web `127.0.0.1:3100`, proxy 3002, real API/models/store):
+one compact header, one rounded composer card with model/agent/Plan/Action,
+the bottom-anchored Session sheet (x1094/y346, 330×554, 16px top radius),
+nonduplicated labels with distinct rail/drawer IDs, model search/select and
+locked Kimi, `glm-5.3-flash` default restored, in-place Plan→Action with
+draft preserved and no visible remount, a real send answered **42** (exactly
+2 messages, one `calculate`), real usage 580/64/644 with model-correct
+context **0%** and tools **1**, Session hide/reopen, and reliable small-tab
+(~634px) default Plan + drawer open/close. Pending: post-fix real OAuth
+redirect confirmation; the tooltip's five fields are source/pure-test
+verified (live hover not drivable by the browser API); no claim of
+exhaustive component testing. Post-fix real OAuth redirect confirmation remains pending (fix and regression tests recorded above).
+
+## Phase 6 local production closeout (2026-11-27 — runtime container SSR verified, real OAuth still pending)
+
+The web app passed the Docker isolated **single-origin production gate**
+(local only — unique Compose project, fresh volumes, alternate loopback
+ports, dummy secrets, **local mock OpenAI/Ollama**):
+
+- **Runtime SSR verification passed** in the standalone container: the
+  earlier SSR failure (`Chat history is temporarily unavailable`) is fixed
+  by `resolveServerApiBaseUrl` + the Compose runtime
+  `API_INTERNAL_URL`; rebuilt SSR HTML **includes the transcript** (no
+  error), and unauthenticated/foreign-owner requests see **no** transcript.
+  This confirms the dual role documented in the env table above: the same
+  `API_INTERNAL_URL`/`WORKFORCE_WEB_INTERNAL_API_URL` value drives BOTH the
+  build-time `/api/:path*` rewrite target AND runtime SSR hydration
+  (runtime value changes need `docker compose up --build` for the rewrite;
+  SSR hydration follows the container env).
+- **Browser-side, through the public web origin only**: streamed chat
+  (`calculate`, exact mock usage 28/18/46), hydration/export/usage correct,
+  duplicate send → 409 with no extra model call, disconnect → **full
+  same-origin replay exactly once** → post-complete resume → 204.
+  Same-process replay only (replay completed before restart — **no
+  cross-process replay claim**).
+- **Identity (local only)**: real Better Auth `User`/`Session` fixtures with
+  valid signed cookies; dummy-provider matrix (true/false), unauth
+  get-session → null and chat → 401, and social sign-in init building the
+  public web callback URL without contacting Google/GitHub all verified.
+  **The real Google/GitHub OAuth return is STILL pending** — unchanged from
+  the pending notes above.
+- Current workspace totals within the 2026-11-27 root gate: web offline
+  **245/245**, root offline 1095/1095 + integration 62/62 + full production
+  build — all green. Phase 6 remains active and **not validated** (public
+  URL gate deferred by Farhan's local-only decision).

@@ -271,3 +271,140 @@ test('createSchedulerWorker requires a redisUrl without a factory', () => {
     (error: unknown) => `${(error as Error).message}`.includes('requires redisUrl'),
   );
 });
+
+// ---------------------------------------------------------------------------
+// Job correlation context (hook + deterministic request id)
+// ---------------------------------------------------------------------------
+
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+import {
+  createSchedulerJobEventHandlers,
+  schedulerJobContextId,
+  schedulerRequestId,
+  type SchedulerWorkerEventHandlers,
+} from './scheduler/index.js';
+
+test('schedulerRequestId is deterministic, bounded and safe for hostile job ids', () => {
+  const first = schedulerRequestId('job-1');
+  // Deterministic: same job id → same id.
+  assert.equal(schedulerRequestId('job-1'), first);
+  // Different job id → different id.
+  assert.notEqual(schedulerRequestId('job-2'), first);
+  // Shape: `scheduler-` + hex, bounded to the safe request-id contract.
+  assert.match(first, /^scheduler-[0-9a-f]{32}$/);
+  assert.ok(first.length <= 128);
+  // Hostile ids (colons/repeats/unicode/empty) stay deterministic + safe.
+  for (const hostile of ['repeat:task-1:0', 'job with spaces', 'jobé', '']) {
+    const id = schedulerRequestId(hostile);
+    assert.match(id, /^scheduler-[0-9a-f]{32}$/);
+    assert.equal(schedulerRequestId(hostile), id);
+  }
+});
+
+test('schedulerJobContextId stringifies ids and falls back safely', () => {
+  assert.equal(schedulerJobContextId('job-1'), 'job-1');
+  assert.equal(schedulerJobContextId(42), '42');
+  assert.equal(schedulerJobContextId(undefined), 'unknown');
+  assert.equal(schedulerJobContextId(null), 'unknown');
+});
+
+test('processor + completed/failed events share ONE per-job context', async () => {
+  const als = new AsyncLocalStorage<string>();
+  const hookArgs: string[] = [];
+  // EXACTLY the host hook shape (apps/api/src/scheduler-worker.ts): bind the
+  // DETERMINISTIC request id derived from the raw job id the queue passes.
+  const hook = <T,>(jobId: string, next: () => T): T => {
+    hookArgs.push(jobId);
+    return als.run(schedulerRequestId(jobId), next);
+  };
+  const observed: string[] = [];
+
+  const seenClient: SchedulerRunClient = {
+    runScheduled: async (input) => {
+      observed.push(`scheduled:${als.getStore() ?? 'none'}:${input.queueJobId}`);
+      return { ok: true };
+    },
+    runExecution: async () => ({ ok: true }),
+  };
+
+  let completedInContext: string | undefined;
+  let failedInContext: string | undefined;
+  let failedErrorType: string | undefined;
+  const logger = {
+    warn: (context: string): void => {
+      completedInContext = `${context}@${als.getStore() ?? 'none'}`;
+    },
+    error: (context: string, error: unknown): void => {
+      failedInContext = `${context}@${als.getStore() ?? 'none'}`;
+      failedErrorType = error instanceof Error ? error.name : typeof error;
+    },
+  };
+
+  const handlers: SchedulerWorkerEventHandlers = createSchedulerJobEventHandlers(logger, hook);
+  handlers.onCompleted(makeJob({ id: 'job-1' }));
+  handlers.onFailed(undefined, new TypeError('synthetic'));
+
+  let receivedProcessor: SchedulerProcessor | undefined;
+  const fake = new FakeWorker();
+  const handle = createSchedulerWorker({
+    runClient: seenClient,
+    logger,
+    withJobContext: hook,
+    workerFactory: (processor) => {
+      receivedProcessor = processor;
+      return fake;
+    },
+  });
+  await receivedProcessor!(makeJob({ id: 'job-1', data: { taskId: 'task-1' } }));
+
+  // Same deterministic id in ALL three surfaces for one job occurrence.
+  const expected = schedulerRequestId('job-1');
+  assert.equal(completedInContext, `scheduler-worker-completed job-1@${expected}`);
+  // Failed event WITHOUT a job: safe fallback id, byte-identical log text.
+  assert.equal(failedInContext, `scheduler-worker-failed undefined@${schedulerRequestId('unknown')}`);
+  assert.equal(failedErrorType, 'TypeError');
+  assert.equal(observed[0], `scheduled:${expected}:job-1`);
+  // The queue hands the hook the RAW stringified job id (host hashes it).
+  assert.deepEqual(hookArgs, ['job-1', 'unknown', 'job-1']);
+});
+
+test('without a hook the previous no-context behavior is unchanged', async () => {
+  let processed = 0;
+  const client: SchedulerRunClient = {
+    runScheduled: async () => {
+      processed += 1;
+      return { ok: true };
+    },
+    runExecution: async () => ({ ok: true }),
+  };
+  const lines: string[] = [];
+  const logger = {
+    warn: (context: string): void => {
+      lines.push(context);
+    },
+    error: (context: string): void => {
+      lines.push(context);
+    },
+  };
+
+  let receivedProcessor: SchedulerProcessor | undefined;
+  const fake = new FakeWorker();
+  const handle = createSchedulerWorker({
+    runClient: client,
+    logger,
+    workerFactory: (processor) => {
+      receivedProcessor = processor;
+      return fake;
+    },
+  });
+  await receivedProcessor!(makeJob({ id: 'job-1', data: { taskId: 'task-1' } }));
+  assert.equal(processed, 1);
+
+  const handlers = createSchedulerJobEventHandlers(logger);
+  handlers.onCompleted(makeJob({ id: 'job-1' }));
+  handlers.onFailed(undefined, new Error('synthetic'));
+  // Byte-identical texts, no context machinery involved.
+  assert.deepEqual(lines, ['scheduler-worker-completed job-1', 'scheduler-worker-failed undefined']);
+  await handle.close();
+});

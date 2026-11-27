@@ -33,12 +33,15 @@
  * Secrets: no provider key, no Prisma, no database — Redis URL, the API
  * base URL, and the shared signing secret are the only inputs. Reasons are
  * fixed machine codes; no bodies, URLs, headers, or secret values are ever
- * logged.
+ * logged. Correlation: when the worker bound a per-job request-log context,
+ * outgoing run POSTs carry that SAME deterministic `x-request-id`
+ * (observability only; it can never weaken the signed auth headers).
  */
 
 import type { SchedulerRunClient, SchedulerRunResult } from '@workforce/queue/scheduler';
 
 import type { FetchLike } from '../agents/host-capabilities.js';
+import { requestContextHeader } from '../logging.js';
 import {
   INTERNAL_SCHEDULER_HEADER,
   contextWindow,
@@ -95,6 +98,12 @@ export function createSchedulerRestRunClient(options: SchedulerRestRunClientOpti
       response = await fetchFn(`${baseUrl}${path}`, {
         method: 'POST',
         headers: {
+          // Correlation propagation (observability only): when the worker runs
+          // inside a per-job request-log context, the job's deterministic
+          // `x-request-id` rides along. Empty outside a context; never
+          // overrides anything (the auth/signing headers below are separate
+          // keys and no caller-supplied headers exist on this client).
+          ...requestContextHeader(),
           'content-type': 'application/json',
           // Worker convention (tripwire against browser calls AND a marker
           // of the BullMQ-occurrence contract).

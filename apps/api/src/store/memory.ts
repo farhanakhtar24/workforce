@@ -21,16 +21,19 @@
  */
 import type { UIMessage } from 'ai';
 import { StoreUnavailableError } from '../errors.js';
-import type { AskUserAnswerStatus, ChatRef, ChatStore, ChatSummary } from './types.js';
+import type { AskUserAnswerStatus, ChatMetadata, ChatMetadataPatch, ChatRef, ChatStore, ChatSummary } from './types.js';
 import { CHAT_OWNER_ID_PATTERN } from './types.js';
 import { applyAskUserAnswer } from './ask-user.js';
 import {
   buildChatSummary,
   chatIndexMember,
+  applyChatMetadataPatch,
   clampRecentChatsLimit,
   compareIndexEntriesDesc,
+  DEFAULT_CHAT_METADATA,
   findMessageIndexById,
   legacyOrderKey,
+  orderChatSummaries,
   parseChatIndexMember,
   parseRawEntriesLeniently,
   scoreToIso,
@@ -60,6 +63,7 @@ export function createInMemoryChatStore(options: { now?: () => number } = {}): C
   const chatIndex = new Map<string, number>();
   /** Per-chat selected model: key `model:{owner}:{slug}:{chatId}` → id. */
   const modelSettings = new Map<string, string>();
+  const metadataSettings = new Map<string, ChatMetadata>();
 
   function ensureOwner(chat: ChatRef): string {
     if (typeof chat.ownerId !== 'string' || !CHAT_OWNER_ID_PATTERN.test(chat.ownerId)) {
@@ -184,6 +188,9 @@ export function createInMemoryChatStore(options: { now?: () => number } = {}): C
       chatKeys.delete(mKey);
       // The chat's selected model setting dies with the chat.
       modelSettings.delete(`model:${ensureOwner(chat)}:${chat.slug}:${chat.chatId}`);
+      // Sidebar metadata dies with the chat (Lua DEL KEYS[5] parity).
+      metadataSettings.delete(`metadata:${ensureOwner(chat)}:${chat.slug}:${chat.chatId}`);
+      void 0;
       chatIndex.delete(indexKey(chat));
       // Message-scoped idempotency keys for THIS chat: bounded iteration over
       // the per-owner prefixed keys (same semantic dead-ness as the Redis
@@ -310,7 +317,26 @@ export function createInMemoryChatStore(options: { now?: () => number } = {}): C
         messages.map((message) => JSON.stringify(message)),
       );
     },
-    async listRecentChats(ownerId: string, limit: number): Promise<ChatSummary[]> {
+    async getChatMetadata(chat: ChatRef): Promise<ChatMetadata> {
+      ensureOwner(chat);
+      return metadataSettings.get(`metadata:${ensureOwner(chat)}:${chat.slug}:${chat.chatId}`) ?? DEFAULT_CHAT_METADATA;
+    },
+
+    async setChatMetadata(chat: ChatRef, patch: ChatMetadataPatch): Promise<ChatMetadata> {
+      ensureOwner(chat);
+      const key = `metadata:${ensureOwner(chat)}:${chat.slug}:${chat.chatId}`;
+      const currentKey = `metadata:${ensureOwner(chat)}:${chat.slug}:${chat.chatId}`;
+      const next = applyChatMetadataPatch(metadataSettings.get(currentKey) ?? DEFAULT_CHAT_METADATA, patch);
+      metadataSettings.set(key, next);
+      return next;
+    },
+
+    async chatExists(chat: ChatRef): Promise<boolean> {
+      ensureOwner(chat);
+      return (chatKeys.get(messageKey(chat)) ?? []).length > 0;
+    },
+
+    async listRecentChats(ownerId: string, limit: number, includeArchived?: boolean): Promise<ChatSummary[]> {
       if (typeof ownerId !== 'string' || !CHAT_OWNER_ID_PATTERN.test(ownerId)) {
         throw new StoreUnavailableError('Chat state requires an authenticated owner.');
       }
@@ -375,7 +401,12 @@ export function createInMemoryChatStore(options: { now?: () => number } = {}): C
         const indexedScore = chatIndex.get(indexKey(ref));
         appendSummary(summaries, ref, raw, indexedScore === undefined ? null : scoreToIso(indexedScore));
       }
-      return summaries;
+      // Sidebar presentation parity: metadata, archived filter, pinned first.
+      const withMetadata = summaries.slice(0, bounded).map((summary) => {
+        const metadata = metadataSettings.get(`metadata:${ownerId}:${summary.agent}:${summary.chatId}`) ?? DEFAULT_CHAT_METADATA;
+        return { ...summary, title: metadata.title ?? summary.title, pinned: metadata.pinned, archived: metadata.archived };
+      });
+      return orderChatSummaries(withMetadata, { includeArchived: includeArchived === true });
     },
   };
 }

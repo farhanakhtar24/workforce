@@ -170,8 +170,10 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 **Status (2026-11-25)**: 🚧 **Active — in progress.** The pre-Phase-6 product feature sprint shipped (auth + per-user workspaces + chat lifecycle + models/pricing + hourly budget + personal memory; evidence and honest gaps in [`design-plans/pre-phase-6-product-features.md`](./design-plans/pre-phase-6-product-features.md)), and Farhan closed the sprint by progression on 2026-11-25 ("Now the next phase?"). **Phase 6 is ACTIVE as of 2026-11-25 — but nothing in this phase is built or claimed yet**: no Docker/Compose app packaging, no deploy, no target chosen (Railway/Render/Fly all remain options), and the phase is **not validated** until Farhan explicitly approves the gate.
 >
 > Update 2026-11-25 (subagent): the LOCAL Docker artifact is now built and locally validated (api/web/migrate images, one-command Compose, isolated-project run with dummy secrets — record in [`docs/phases/phase-6-deploy.md`](./docs/phases/phase-6-deploy.md)). Railway/deploy has NOT started, and Phase 6 remains active and **not validated** until the real-OAuth public-URL gate.
+>
+> Update 2026-11-27 — **LOCAL production validation PASSED**: the full root gate (`typecheck && npm test && test:integration && build`) is green — **offline 1095/1095** (core 321, `@workforce/queue` 51, CLI 30, API 448, web 245, zero fail/skip) and **real integration 62/62** (zero skip) — plus the Docker isolated **single-origin** production gate (baked `/api/:path*` rewrite → private `api:3001` with runtime SSR hydration, 8/8 fresh migrations, uid-1000 containers, same-origin SSE chat + full replay, scheduler container with MANUAL run `COMPLETED` attempt 1 and deterministic `schedulerRequestId` correlation across scheduler/API logs, graceful stop/restart with persistence). **Farhan chose LOCAL ONLY**: the public live URL, real Google/GitHub OAuth return, real Ollama provider traffic and cross-process replay stay **deferred by user decision** — nothing is deployed, and Phase 6 is still ACTIVE / **not validated**. No older phase count was touched.
 
-**Goal**: Live URL. Not localhost.
+**Goal**: Live URL. Not localhost. *(Amended 2026-11-27: Farhan chose LOCAL ONLY for now — public URL is deferred by user, not achieved.)*
 
 **Topics**:
 - 6.1 Docker Compose basics (services, volumes, networks)
@@ -182,7 +184,7 @@ Eight weeks part-time to a deployable multi-agent platform. This file is the sin
 
 **Build artifact**: production Dockerfiles for `api`, `web` and the `scheduler` worker plus a one-command Compose for `api + web + scheduler + postgres + redis` — full spec in the [phase doc](./docs/phases/phase-6-deploy.md). Then deploy to Railway/Render/Fly with a public URL.
 
-**Validation**: I sign in through real OAuth on the public URL, chat with an agent, and schedule a task — it runs. Not validated until Farhan explicitly approves.
+**Validation**: I sign in through real OAuth on the public URL, chat with an agent, and schedule a task — it runs. Not validated until Farhan explicitly approves. *(2026-11-27: the public gate is deferred by user decision — LOCAL ONLY; the local production gate passed instead, see the Status updates.)*
 
 📄 Phase doc: [`docs/phases/phase-6-deploy.md`](./docs/phases/phase-6-deploy.md)
 

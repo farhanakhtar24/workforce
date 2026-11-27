@@ -2,7 +2,8 @@ import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
 import { headers } from 'next/headers';
 import { Chat } from '@/components/Chat';
-import { fetchChatHydration, isSafeChatId, resolveApiBaseUrl } from '@/lib/api';
+import { fetchChatHydration, isSafeChatId } from '@/lib/api';
+import { resolveServerApiBaseUrl } from '@/lib/api-proxy';
 import {
   parseChatPageMode,
   isAgentSlug,
@@ -53,7 +54,15 @@ export default async function AgentChatPage({
   const cookieHeader = headerList.get('cookie') ?? undefined;
 
   const result = await fetchChatHydration({
-    apiBaseUrl: resolveApiBaseUrl(process.env.NEXT_PUBLIC_API_URL),
+    // SSR hydration targets the SERVER-ONLY internal API origin in
+    // single-origin Compose (`API_INTERNAL_URL=http://api:3001`); the
+    // browser-facing NEXT_PUBLIC origin must NOT be fetched from inside the
+    // container. Host dev / direct-API modes fall back to the public base.
+    apiBaseUrl: resolveServerApiBaseUrl({
+      runtimeInternalUrl: process.env['API_INTERNAL_URL'],
+      publicApiUrl: process.env.NEXT_PUBLIC_API_URL,
+      isServer: true,
+    }),
     chatId,
     slug: agent,
     cookieHeader,
@@ -62,7 +71,9 @@ export default async function AgentChatPage({
   if (!result.ok) {
     return (
       <Chat
-        key={`${agent}:${chatId}:${mode}`}
+        // Keyed by slug+chatId only: Plan/Action is in-place client state
+        // (shallow URL replace) and must never remount/reset useChat.
+        key={`${agent}:${chatId}`}
         chatId={chatId}
         agent={agent}
         mode={mode}
@@ -80,9 +91,10 @@ export default async function AgentChatPage({
 
   return (
     <Chat
-      // Keyed by slug+mode: selecting a different agent/mode remounts the
-      // client component so useChat re-seeds from that key's hydration result.
-      key={`${agent}:${chatId}:${mode}`}
+      // Keyed by slug+chatId only: agent switches are real navigation (the
+      // server re-hydrates that (slug, chatId) transcript) while Plan/Action
+      // stays in-place client state — no Chat remount, no useChat reset.
+      key={`${agent}:${chatId}`}
       chatId={chatId}
       agent={agent}
       mode={mode}

@@ -51,6 +51,9 @@ import type { SettingsServiceLike } from '../settings/settings.js';
 import type { PersonalCaptureEnqueuer } from '../memory/personal-capture.js';
 import { personalChatPath } from '../memory/personal-capture.js';
 import { recallPersonalMemory, type PersonalRecallDeps } from '../memory/personal-recall.js';
+import { estimateInputTokens, type HourlyBudgetService } from '../budget/hourly-budget.js';
+import { CHAT_TITLE_MAX_CHARS, parseChatMetadataPatch } from '../store/chat-history.js';
+import { renderChatExport, exportFilename } from '../export/markdown-export.js';
 
 const IDEMPOTENCY_HEADER = 'Idempotency-Key';
 
@@ -95,6 +98,19 @@ export interface ChatRoutesDeps {
     /** Deterministic capture-job enqueuer (checked enablement → 1 job). */
     readonly capture: PersonalCaptureEnqueuer;
   };
+  /**
+   * Pre-Phase 6 CONSERVATIVE per-user hourly budget. When absent: no
+   * admission/reservation at all (exact legacy behavior; offline tests).
+   * When present, EVERY top-level generation (browser, delegated, scheduled)
+   * reserves request+cost BEFORE provider work and settles actual usage at
+   * finish; unpriced models fail closed at selection and generation.
+   */
+  budget?: {
+    /** Atomic per-owner admission + settlement + summary. */
+    readonly service: HourlyBudgetService;
+    /** Effective pricing gate (official defaults ∪ explicit overrides). */
+    readonly isModelPriced: (modelId: string) => boolean;
+  };
 }
 
 /** The single model-id contract (server-side; catalog + routes share it). */
@@ -107,6 +123,17 @@ const modelBodySchema = z.strictObject({ modelId: modelIdPatternSchema });
 const branchBodySchema = z.strictObject({ messageId: messageIdSchema, newChatId: clientIdSchema });
 /** POST /rewind body: strict { messageId }. */
 const rewindBodySchema = z.strictObject({ messageId: messageIdSchema });
+
+/** PATCH /metadata body: STRICT, at least one of the three, unknown keys rejected. */
+const chatMetadataBodySchema = z
+  .strictObject({
+    title: z.union([z.string(), z.null()]).optional(),
+    pinned: z.boolean().optional(),
+    archived: z.boolean().optional(),
+  })
+  .refine((body) => body.title !== undefined || body.pinned !== undefined || body.archived !== undefined, {
+    message: 'at least one of title/pinned/archived is required',
+  });
 
 /** Runs an async handler, forwarding rejections to Express' error handling. */
 function asyncRoute(handler: (req: Request, res: Response, next: NextFunction) => Promise<void>): RequestHandler {
@@ -285,6 +312,12 @@ export interface ChatRouteHandlers {
   branchChat: RequestHandler;
   /** POST a destructive rewind: keep messages through the selection, drop the tail. */
   rewindChat: RequestHandler;
+  /** GET the chat's persistent sidebar metadata. */
+  getMetadata: RequestHandler;
+  /** PATCH strict {title?, pinned?, archived?} (≥1 field, fixed 200 shape). */
+  patchMetadata: RequestHandler;
+  /** GET the COMPLETE transcript as safe `text/markdown` (owner-scoped). */
+  exportChat: RequestHandler;
   /** GET the chat's selected (or default) model id. */
   getModel: RequestHandler;
   /** PUT a validated model selection (blocked/absent → fixed 400). */
@@ -641,6 +674,28 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
   });
 
 
+  /**
+   * Owner-scoped chat existence gate for the metadata/export routes: a
+   * non-empty messages list is a live chat; unknown/foreign/legacy-ownerless
+   * chats are a fixed 404 (metadata creation on unknown chats is forbidden).
+   * A store failure reads as the safe 503.
+   */
+  const chatExistsOr404 = async (chat: ChatRef, res: Response): Promise<'yes' | null> => {
+    let exists: boolean;
+    try {
+      exists = await store.chatExists(chat);
+    } catch (error) {
+      logger.error('chat-exists-read', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return null;
+    }
+    if (exists === false) {
+      sendJsonError(res, 404, 'Chat not found.');
+      return null;
+    }
+    return 'yes';
+  };
+
   const postChat = asyncRoute(async (req: Request, res: Response) => {
     const resolved = ownerOr401(res);
     if (resolved === null) {
@@ -714,6 +769,12 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     }
     if (isBlockedModelId(chatModelId, deps.config.blockedModelPrefixes)) {
       sendJsonError(res, 400, 'Model is not allowed.');
+      return;
+    }
+    // Fail-closed pricing policy (budget wired): unpriced / unknown model
+    // ids are not servable (consistent with the selection-time check).
+    if (deps.budget !== undefined && deps.budget.isModelPriced(chatModelId) === false) {
+      sendJsonError(res, 400, 'Model is not available.');
       return;
     }
 
@@ -795,8 +856,104 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       return;
     }
 
+    // Bounded before-mutation state keys: admission binding + the aggregate
+    // output budget (declared here so the pre-stream failure hooks below —
+    // including the ask_user/append paths — can cancel the reservation).
+    // HITL ask_user inventory (pure read): pending parts are resolved AFTER
+    // admission so a budget denial never mutates them.
+    const pendingAskUser = findPendingAskUserParts(stored);
+    const answerText = newestUserText(message);
+    let admittedKey: { chatId: string; userMessageId: string } | null = null;
+    let outputBudget: number | undefined;
+
+    // Opt-in personal memory RECALL (READ-ONLY, happens BEFORE admission for
+    // the estimate; never blocks the turn): bounded untrusted reference
+    // context, or plain none on any failure/disabling. No transcript or
+    // HITL mutation has happened at this point.
+    const personalRecallDeps: PersonalRecallDeps | null =
+      deps.personal !== undefined
+        ? { memory: deps.personal.memory, settings: deps.personal.settings, logger }
+        : null;
+    let memoryContext: string | undefined;
+    if (personalRecallDeps !== null) {
+      memoryContext = (await recallPersonalMemory(personalRecallDeps, { ownerId: ownerUserId, newestUserText: newestUserText(message) })) ?? undefined;
+    }
+
+    // ---- Hourly budget ADMISSION (before ANY provider work) ---------------
+    // Duplicates/409s above consume nothing. The input estimate INCLUDES the
+    // recalled personal-memory context (it IS outgoing content); the settle
+    // key binds admission, cancellation and settlement to this exact turn.
+    if (deps.budget !== undefined) {
+      // Conservative before-mutation estimate: the loaded transcript + the
+      // newest message + system prompt + recalled context + a bounded pad
+      // for the up-to-N pending ask_user answers that the post-admission
+      // HITL resolution will add (sentinel + the newest user text each).
+      const inputEstimate =
+        estimateInputTokens([...stored, message] as unknown[], prepared !== null ? prepared.systemPrompt : null) +
+        (typeof memoryContext === 'string' ? Math.ceil(memoryContext.length / 3) : 0) +
+        pendingAskUser.length * (Math.ceil(answerText.length / 3) + 33);
+      let admission;
+      try {
+        admission = await deps.budget.service.admitChatUse({
+          ownerId: ownerUserId,
+          modelId: chatModelId,
+          inputTokensEstimate: inputEstimate,
+          chatId,
+          userMessageId: message.id,
+        });
+      } catch (error) {
+        logger.error('hourly-budget-admission', error);
+        // The failed admission consumes nothing: release the key (the caller
+        // can retry once the window rolls or the store recovers).
+        try {
+          await store.releaseIdempotencyKey(chat, headerKey);
+        } catch (releaseError) {
+          logger.error('chat-idempotency-release', releaseError);
+        }
+        sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+        return;
+      }
+      if (admission.outcome === 'denied') {
+        try {
+          await store.releaseIdempotencyKey(chat, headerKey);
+        } catch (releaseError) {
+          logger.error('chat-idempotency-release', releaseError);
+        }
+        res.status(429);
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify({ error: 'Hourly usage limit reached.', retryAt: admission.retryAt, reason: admission.reason }));
+        return;
+      }
+      if (admission.outcome === 'unpriced') {
+        try {
+          await store.releaseIdempotencyKey(chat, headerKey);
+        } catch (releaseError) {
+          logger.error('chat-idempotency-release', releaseError);
+        }
+        sendJsonError(res, 400, 'Model is not available.');
+        return;
+      }
+      admittedKey = { chatId, userMessageId: message.id };
+      // The admitted reservation's derived output cap feeds streamText's
+      // prepareStep throttle (AGGREGATE across up to MAX_MODEL_STEPS steps).
+      outputBudget = admission.outcome === 'admitted' ? admission.conservativeOutputTokens : undefined;
+    }
+
+    // An ACCEPTED admission is cancelled whenever the turn FAILS BEFORE any
+    // provider streaming began (every pre-stream key-release below). The
+    // cancellation is idempotent and deletes ONLY the still-reserved row.
+    // HITL inventory: pending ask_user parts are resolved AFTER admission so
+    // a budget denial never mutates them.
     const releaseKeyAndFail = async (logContext: string, error: unknown, status: number, message_: string): Promise<void> => {
       logger.error(logContext, error);
+      if (admittedKey !== null && deps.budget !== undefined) {
+        try {
+          await deps.budget.service.cancelChatUse({ ownerId: ownerUserId, ...admittedKey });
+        } catch (cancelError) {
+          logger.error('hourly-budget-cancel', cancelError);
+        }
+      }
       try {
         await store.releaseIdempotencyKey(chat, headerKey);
       } catch (releaseError) {
@@ -814,8 +971,6 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     // new input never mutates the questions and duplicate submits never
     // double-answer ('unchanged' is an idempotent no-op; 'stale' after retries
     // fails the turn safely instead of guessing).
-    const pendingAskUser = findPendingAskUserParts(stored);
-    const answerText = newestUserText(message);
     if (pendingAskUser.length > 0) {
       try {
         for (const pending of pendingAskUser) {
@@ -858,21 +1013,38 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
 
     // Hand off to generation. From here on the key is never released: once the
     // stream has started, retries go through resume instead (ADR-005).
-    // Opt-in personal memory RECALL first (never blocks the turn): bounded
-    // untrusted reference context, or plain none on any failure/disabling.
-    const personalRecallDeps: PersonalRecallDeps | null =
-      deps.personal !== undefined
-        ? { memory: deps.personal.memory, settings: deps.personal.settings, logger }
-        : null;
-    let memoryContext: string | undefined;
-    if (personalRecallDeps !== null) {
-      memoryContext = (await recallPersonalMemory(personalRecallDeps, { ownerId: ownerUserId, newestUserText: answerText })) ?? undefined;
-    }
-    // Opt-in personal CAPTURE: one deterministic job per completed assistant
-    // turn, gated again at finish and (defense in depth) in the worker.
+
+    // Finish hooks (fire-and-forget, tracked): opt-in personal CAPTURE and
+    // hourly-budget SETTLEMENT (actual provider usage; missing/invalid usage
+    // retains the conservative reservation until the window rolls).
     const onAssistantFinished: CreateChatTurnStreamOptions['onAssistantFinished'] | undefined =
-      deps.personal !== undefined
+      deps.personal !== undefined || deps.budget !== undefined
         ? (finished) => {
+            if (deps.budget !== undefined) {
+              background.track(
+                deps.budget.service
+                  .settleChatUse({
+                    ownerId: ownerUserId,
+                    chatId,
+                    userMessageId: finished.userMessageId,
+                    modelId: chatModelId,
+                    usage:
+                      finished.usage !== undefined &&
+                      typeof finished.usage.inputTokens === 'number' &&
+                      typeof finished.usage.outputTokens === 'number'
+                        ? { inputTokens: finished.usage.inputTokens, outputTokens: finished.usage.outputTokens }
+                        : undefined,
+                  })
+                  .catch((error: unknown) => {
+                    // Settlement is best-effort accounting: the reservation
+                    // (worst case) stands; the window remains honest.
+                    logger.error('hourly-budget-settle', error);
+                  }),
+              );
+            }
+            if (deps.personal === undefined) {
+              return;
+            }
             background.track(
               (async () => {
                 const gate = await deps.personal?.settings.get(ownerUserId);
@@ -908,6 +1080,7 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
         validationTools,
         systemPrompt,
         memoryContext,
+        outputTokenBudget: deps.budget !== undefined ? outputBudget : undefined,
         onAssistantFinished,
         // Deadline abort for INTERNAL delegated children only: the verified
         // context carries the run deadline. Browser disconnects still never
@@ -917,6 +1090,15 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
           : {}),
       });
     } catch (error) {
+      // Generation never STARTED streaming (the provider work begins when the
+      // response is consumed): cancel the reservation on BOTH failure paths.
+      if (admittedKey !== null && deps.budget !== undefined) {
+        try {
+          await deps.budget.service.cancelChatUse({ ownerId: ownerUserId, ...admittedKey });
+        } catch (cancelError) {
+          logger.error('hourly-budget-cancel', cancelError);
+        }
+      }
       if (error instanceof InvalidStoredChatError) {
         // Generation never started: release the key we acquired. The ask_user
         // answer update + user append stand (honest persisted state); a retry
@@ -942,7 +1124,15 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       await store.setActiveStreamId(chat, turn.streamId);
     } catch (error) {
       logger.error('chat-active-stream', error);
-      // No SSE byte has been sent yet: safe to release and fail cleanly.
+      // No SSE byte has been sent yet: safe to release and fail cleanly —
+      // and the reservation cancels with the key.
+      if (admittedKey !== null && deps.budget !== undefined) {
+        try {
+          await deps.budget.service.cancelChatUse({ ownerId: ownerUserId, ...admittedKey });
+        } catch (cancelError) {
+          logger.error('hourly-budget-cancel', cancelError);
+        }
+      }
       try {
         await store.releaseIdempotencyKey(chat, headerKey);
       } catch (releaseError) {
@@ -1075,6 +1265,12 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
       sendJsonError(res, 400, MODEL_LOCK_REASON);
       return;
     }
+    // Fail-closed pricing policy (budget wired): unknown / unpriced model ids
+    // are not selectable (identical generation-time check below).
+    if (deps.budget !== undefined && deps.budget.isModelPriced(modelId) === false) {
+      sendJsonError(res, 400, 'Model is not available.');
+      return;
+    }
     let available: boolean;
     try {
       const catalog = await deps.models.catalog.list();
@@ -1108,6 +1304,115 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     res.end(JSON.stringify({ modelId }));
   });
 
+  /**
+   * GET /metadata: the chat's persistent sidebar metadata (defaults when
+   * unset). Unknown/foreign/legacy-ownerless chats → fixed 404.
+   */
+  const getMetadata: RequestHandler = async (req, res) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    const exists = await chatExistsOr404(chat, res);
+    if (exists === null) {
+      return;
+    }
+    try {
+      const metadata = await store.getChatMetadata(chat);
+      res.status(200);
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.end(JSON.stringify({ metadata }));
+    } catch (error) {
+      logger.error('chat-metadata-read', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+    }
+  };
+
+  /**
+   * PATCH /metadata: strict ≥1-field patch {title?|pinned?|archived?}.
+   * Title trims, empty string or null CLEARS, ≤80 Unicode-safe chars.
+   * Creating metadata on an unknown chat is forbidden (fixed 404).
+   */
+  const patchMetadata: RequestHandler = async (req, res) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    if (!req.is('application/json')) {
+      sendJsonError(res, 415, 'Content-Type must be application/json.');
+      return;
+    }
+    const bodyCheck = chatMetadataBodySchema.safeParse(req.body);
+    if (!bodyCheck.success || bodyCheck.data === undefined) {
+      sendJsonError(res, 400, 'Metadata must be a JSON object with at least one of { title, pinned, archived }.');
+      return;
+    }
+    // Unknown keys already rejected by the strict schema; title/pinned/
+    // archived VALUE shapes validated here (Unicode-safe length, clearing).
+    const patch = parseChatMetadataPatch(bodyCheck.data);
+    if (patch === null) {
+      sendJsonError(res, 400, 'Metadata values are invalid: title must be a string of at most ' + String(CHAT_TITLE_MAX_CHARS) + ' characters; pinned/archived must be booleans.');
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    const exists = await chatExistsOr404(chat, res);
+    if (exists === null) {
+      return;
+    }
+    try {
+      const metadata = await store.setChatMetadata(chat, patch);
+      res.status(200);
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.end(JSON.stringify({ metadata }));
+    } catch (error) {
+      logger.error('chat-metadata-write', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+    }
+  };
+
+  /**
+   * GET /export: the COMPLETE stored transcript as `text/markdown`.
+   * Every visible user/assistant text, clearly-labelled reasoning sections,
+   * and tool inputs/outputs as complete JSON inside structurally-safe fenced
+   * blocks. No metadata/usage/model ids/secrets; NO provider calls and NO
+   * budget consumption.
+   */
+  const exportChat: RequestHandler = async (req, res) => {
+    const target = parseMutationTarget(req, res);
+    if (target === null) {
+      return;
+    }
+    const chat = chatRefFromRequest(target.ownerId, target.slug, target.clientChatId);
+    const exists = await chatExistsOr404(chat, res);
+    if (exists === null) {
+      return;
+    }
+    let stored: unknown[];
+    try {
+      stored = await store.loadMessages(chat);
+    } catch (error) {
+      logger.error('chat-export-store', error);
+      sendJsonError(res, 503, 'Chat state is temporarily unavailable.');
+      return;
+    }
+    const exportedAt = new Date().toISOString();
+    const document = renderChatExport({
+      chatId: target.clientChatId,
+      agent: target.slug,
+      exportedAt,
+      messages: stored,
+    });
+    res.status(200);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Disposition', `attachment; filename="${exportFilename(target.clientChatId, exportedAt)}"`);
+    res.end(document);
+  };
+
+
   /** GET /usage: exact token sums + per-model buckets + honest cost. */
   const chatUsage: RequestHandler = async (req, res) => {
     const target = parseMutationTarget(req, res);
@@ -1139,6 +1444,9 @@ export function createChatRoutes(deps: ChatRoutesDeps): ChatRouteHandlers {
     rewindChat,
     getModel,
     setModel,
+    getMetadata,
+    patchMetadata,
+    exportChat,
     usage: chatUsage,
   };
 }

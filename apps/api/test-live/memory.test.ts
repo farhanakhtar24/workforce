@@ -432,40 +432,65 @@ test('queryBlocks honors path prefix, keyword, kind, limit and the superseded de
 
 test('semanticSearch: relevance, exact 0.8/0.2 fields, no vectors, failed and pending excluded', async () => {
   const target = await writeBlock({ path: 'projects/atlas', content: 'atlas database migration pgvector atlas engine' });
-  const failed = await writeBlock({ path: 'projects/gamma', content: 'failed zebra error atlas' });
   await waitReady([target.id]);
-  await stack.store.markEmbeddingFailed(failed.id, { model: MEMORY_EMBEDDING_MODEL });
 
-  const results = await stack.service.semanticSearch({ query: 'atlas database migration pgvector', scope: RUN_SCOPE, limit: 10 });
-  assert.ok(results.length >= 1, 'search must return ready candidates');
-  assert.equal(results[0]?.block.id, target.id, 'exact-keyword block must rank first');
-  assert.ok(results.every((result) => result.block.embeddingStatus === 'ready'), 'only ready blocks returned');
-  assert.ok(!results.some((result) => result.block.id === failed.id), 'failed block excluded');
-
-  for (const result of results) {
-    // Exact decomposition: score === 0.8*cosine + 0.2*recency (same float ops).
-    assert.equal(result.score, 0.8 * result.cosineSimilarity + 0.2 * result.recencyScore);
-    for (const key of Object.keys(result)) {
-      assert.ok(['block', 'cosineSimilarity', 'recencyScore', 'score'].includes(key), key);
-    }
-    for (const key of Object.keys(result.block)) {
-      assert.ok(!['embedding', 'vector', 'data', 'embeddingVector'].includes(key), key);
-    }
-  }
-
-  // Pending exclusion, deterministic: pause the REAL worker, write, search.
+  // Deterministic exclusion guard: PAUSE the REAL worker BEFORE creating the
+  // failed/pending blocks. Their embedding jobs may otherwise be picked up
+  // in-flight and processEmbedding's markEmbeddingReady would land AFTER the
+  // manual markEmbeddingFailed below, flipping the status back to ready
+  // (correct BullMQ retry semantics — proven by the retry assertion at the
+  // end) and racing this test. Paused => the jobs stay queued, so the
+  // statuses below are stable for the whole search/assertion window.
   await stack.worker.worker.pause();
+  let failed: MemoryBlock;
+  let pending: MemoryBlock | null = null;
   try {
-    const pending = await writeBlock({ path: 'projects/gamma', content: 'zebra jungle habitat pending probe' });
+    failed = await writeBlock({ path: 'projects/gamma', content: 'failed zebra error atlas' });
+    await stack.store.markEmbeddingFailed(failed.id, { model: MEMORY_EMBEDDING_MODEL });
+    const failedStatusAtMark = (await stack.store.getBlock(failed.id))?.embeddingStatus;
+    assert.equal(failedStatusAtMark, 'failed', 'the guard: failed status is stable while the worker is paused');
+
+    const results = await stack.service.semanticSearch({ query: 'atlas database migration pgvector', scope: RUN_SCOPE, limit: 10 });
+    assert.ok(results.length >= 1, 'search must return ready candidates');
+    assert.equal(results[0]?.block.id, target.id, 'exact-keyword block must rank first');
+    assert.ok(results.every((result) => result.block.embeddingStatus === 'ready'), 'only ready blocks returned');
+    assert.ok(!results.some((result) => result.block.id === failed.id), 'failed block excluded');
+
+    for (const result of results) {
+      // Exact decomposition: score === 0.8*cosine + 0.2*recency (same float ops).
+      assert.equal(result.score, 0.8 * result.cosineSimilarity + 0.2 * result.recencyScore);
+      for (const key of Object.keys(result)) {
+        assert.ok(['block', 'cosineSimilarity', 'recencyScore', 'score'].includes(key), key);
+      }
+      for (const key of Object.keys(result.block)) {
+        assert.ok(!['embedding', 'vector', 'data', 'embeddingVector'].includes(key), key);
+      }
+    }
+
+    // Pending exclusion (worker already paused): write, search.
+    pending = await writeBlock({ path: 'projects/gamma', content: 'zebra jungle habitat pending probe' });
+    const pendingNow = pending;
     const midResults = await stack.service.semanticSearch({ query: 'zebra jungle habitat pending', scope: RUN_SCOPE, limit: 10 });
-    assert.ok(!midResults.some((result) => result.block.id === pending.id), 'pending block excluded');
-    await stack.worker.worker.resume();
-    await waitReady([pending.id]);
-    const after = await stack.service.semanticSearch({ query: 'zebra jungle habitat pending', scope: RUN_SCOPE, limit: 10 });
-    assert.ok(after.some((result) => result.block.id === pending.id), 'same block searchable once ready');
+    assert.ok(!midResults.some((result) => result.block.id === pendingNow.id), 'pending block excluded');
   } finally {
     await stack.worker.worker.resume().catch(() => undefined);
   }
+
+  // Bounded state polling (no sleeps): the resumed worker settles the queued
+  // embedding jobs — including the FAILED one, whose retry re-embeds and
+  // flips it back to ready (the documented BullMQ retry semantics).
+  if (pending !== null) {
+    await waitReady([failed.id, pending.id]);
+  } else {
+    await waitReady([failed.id]);
+  }
+  const after = await stack.service.semanticSearch({ query: 'atlas database migration pgvector', scope: RUN_SCOPE, limit: 10 });
+  assert.ok(after.some((result) => result.block.id === failed.id), 'failed block becomes searchable once its retry re-embeds (product retry semantics)');
+  if (pending === null) {
+    assert.fail('pending block was required by this fixture');
+  }
+  const pendingAfter = await stack.service.semanticSearch({ query: 'zebra jungle habitat pending', scope: RUN_SCOPE, limit: 10 });
+  assert.ok(pendingAfter.some((result) => result.block.id === pending.id), 'pending block searchable once ready');
 });
 
 test('semanticSearch access accounting: accessCount increments, score unchanged', async () => {

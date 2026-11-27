@@ -40,7 +40,7 @@ import { createPrismaDelegationRepository } from '@workforce/core/delegation/pos
 import { createBackgroundTracker } from './background.js';
 import { loadApiConfig } from './config.js';
 import { loadProjectEnvFiles } from './env.js';
-import { consoleLogger, type SafeLogger } from './logging.js';
+import { consoleLogger, createSafeLogger, requestContextHeader, type SafeLogger } from './logging.js';
 import { createRuntimeModelFactory } from './models/runtime.js';
 import { createModelCatalog } from './models/catalog.js';
 import {
@@ -56,6 +56,13 @@ import { createOllamaCompactor } from './memory/ollama-compactor.js';
 import { BullMQMemoryJobQueue } from './memory/bullmq-queue.js';
 import { createMemoryWorker, type MemoryWorkerHandle } from './memory/worker.js';
 import { createPrismaSettingsService, type SettingsServiceLike } from './settings/settings.js';
+import {
+  COMPACTION_OUTPUT_TOKEN_CAP,
+  HourlyBudgetDeniedError,
+  compactionDedupeKey,
+  createPostgresHourlyBudgetService,
+} from './budget/hourly-budget.js';
+import { effectiveModelPricing } from '@workforce/core/pricing';
 import {
   createDataQueryService,
   type DataQueryService,
@@ -135,6 +142,11 @@ export function startupFailureReason(error: unknown): string {
     if (message === 'Postgres connect timeout') {
       return 'Postgres connection timed out';
     }
+    // The pinned compaction model must be explicitly priced at startup; the
+    // message is authored by this codebase and safe to surface verbatim.
+    if (message === 'Compaction model is not priced; set OLLAMA_MODEL to a priced model or add an override rate.') {
+      return 'Compaction model is not priced';
+    }
     // Config errors compose schema-authored issue text; do NOT echo it — the
     // composed detail can contain schema-declared default URLs.
     if (message.startsWith('Invalid API configuration (values are never included)')) {
@@ -206,12 +218,12 @@ export interface ApiServerHandle {
 }
 
 export async function startServer(): Promise<ApiServerHandle> {
-  const logger = consoleLogger;
   // Hydrate process.env from the gitignored env files BEFORE config reads
   // it (shell values always win). Runs once per real start; never on a bare
   // module import under WORKFORCE_API_SKIP_LISTEN (tests).
   loadProjectEnvFiles();
   const config = loadApiConfig();
+  const logger = createSafeLogger(config.logLevel ?? 'info');
 
   if (config.apiKey === null) {
     // Fixed text only; never mentions any key value.
@@ -313,7 +325,32 @@ export async function startServer(): Promise<ApiServerHandle> {
     const embeddingProvider = createLocalEmbeddingProvider({
       cacheDir: config.embeddingCacheDir,
     });
-    const compactor = createOllamaCompactor({ model });
+    // Pre-Phase 6: DOLLAR-ONLY compaction reservations — attributed to the
+    // owning user through the memory-scope link (legacy scopes skip).
+    const compactor = createOllamaCompactor({
+      model,
+      budget: {
+        reserve: async ({ scope, path, triggerBlockId, sourceCharCount }) => {
+          const ownerId = await budgetService.ownerForScope(scope);
+          if (ownerId === null) {
+            return; // legacy/anonymous scope: not budget-attributable
+          }
+          const outcome = await budgetService.reserveCompactionUse({
+            ownerId,
+            modelId: config.model,
+            inputTokensEstimate: Math.ceil(sourceCharCount / 3),
+            outputTokensCap: COMPACTION_OUTPUT_TOKEN_CAP,
+            dedupeKey: compactionDedupeKey(scope, path, triggerBlockId),
+          });
+          // FAIL CLOSED: denied/unpriced compaction raises the typed fixed
+          // error so BullMQ retries the JOB — the provider never runs
+          // without a reservation.
+          if (outcome !== 'admitted') {
+            throw new HourlyBudgetDeniedError();
+          }
+        },
+      },
+    });
     const bullmqQueue = new BullMQMemoryJobQueue({ redisUrl: config.redisUrl });
     const memoryService = new MemoryService({
       store: memoryStore,
@@ -324,6 +361,18 @@ export async function startServer(): Promise<ApiServerHandle> {
     });
     // Pre-Phase 6: per-user opt-in settings (UserSettings upsert/read).
     const settingsService: SettingsServiceLike = createPrismaSettingsService(prisma);
+    // Pre-Phase 6 conservative per-user hourly budget: Postgres-backed,
+    // atomic per-owner admission. Pricing: official defaults with the
+    // explicit OLLAMA_MODEL_PRICING_JSON override (exact ids only).
+    const budgetService = createPostgresHourlyBudgetService(prisma, {
+      modelPricingOverride: config.modelPricing,
+    });
+    // Startup assertion: the PINNED compaction model must be explicitly
+    // priced (official defaults or override) — otherwise every compaction
+    // job would fail closed at the hook and never run. Fixed safe reason.
+    if (effectiveModelPricing(config.modelPricing, config.model) === null) {
+      throw new Error('Compaction model is not priced; set OLLAMA_MODEL to a priced model or add an override rate.');
+    }
     // Worker with its own blocking connection; concurrency 2 per spec. The
     // personal-capture handler shares the SAME memory service (store/embed
     // pipeline), the SAME pinned-default model, the settings gate, and the
@@ -360,7 +409,13 @@ export async function startServer(): Promise<ApiServerHandle> {
 
     // Tools/delegation call the OWN REST API (ADR-002): loopback base URL,
     // defaulting to the configured PORT (INTERNAL_API_BASE_URL overrides).
-    const fetchFn: FetchLike = globalThis.fetch;
+    // Correlation: the CURRENT request's own id round-trips through the
+    // internal call (observability only — never auth/ownership). Calls made
+    // OUTSIDE any request context (worker/queue callbacks) carry no header.
+    const fetchFn: FetchLike = (input, init) => {
+      const nextHeaders = { ...requestContextHeader(), ...(init?.headers ?? {}) } as RequestInit['headers'];
+      return globalThis.fetch(input, { ...(init ?? {}), headers: nextHeaders });
+    };
     const hostDeps = {
       fetchFn,
       baseUrl: config.internalApiBaseUrl,
@@ -459,6 +514,7 @@ export async function startServer(): Promise<ApiServerHandle> {
         defaultModelId: config.model,
       },
       settings: settingsService,
+      budget: budgetService,
       personal: {
         settings: settingsService,
         memory: memoryService,
@@ -521,7 +577,7 @@ export async function startServer(): Promise<ApiServerHandle> {
       console.log(JSON.stringify({ level: 'info', context: 'api-listening', port: config.port }));
     });
     server.on('error', (error: unknown) => {
-      consoleLogger.error('api-http-server-error', error);
+      logger.error('api-http-server-error', error);
       console.error(JSON.stringify({ level: 'error', context: 'api-http-server-error', startupReason: startupFailureReason(error) }));
       if (!listening) {
         process.exit(1);

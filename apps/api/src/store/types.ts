@@ -109,7 +109,17 @@ export interface ChatStore {
    * (generation correctness), not on this read-only summary path.
    * Throws `StoreUnavailableError` when the backing storage fails.
    */
-  listRecentChats(ownerId: string, limit: number): Promise<ChatSummary[]>;
+  /** Default list EXCLUDES archived; `includeArchived=true` includes them. */
+  listRecentChats(ownerId: string, limit: number, includeArchived?: boolean): Promise<ChatSummary[]>;
+
+  /** Read one chat's persistent metadata; an absent row is all-default. */
+  getChatMetadata(chat: ChatRef): Promise<ChatMetadata>;
+
+  /** Applies a strict patch (≥1 field) atomically and returns the result. */
+  setChatMetadata(chat: ChatRef, patch: ChatMetadataPatch): Promise<ChatMetadata>;
+
+  /** True when the messages list is non-empty (a live chat in this namespace). */
+  chatExists(chat: ChatRef): Promise<boolean>;
 
   /**
    * Owner-scoped DESTRUCTIVE delete (pre-Phase 6 chat lifecycle):
@@ -225,4 +235,22 @@ export interface ChatSummary {
   readonly preview: string;
   readonly messageCount: number;
   readonly lastActivityAt: string | null;
+  /** Custom title cleared (null) → derived first-user-text title in `title`. */
+  readonly pinned: boolean;
+  readonly archived: boolean;
+}
+
+/** Owner-scoped per-chat sidebar metadata (persistent, additive). */
+export interface ChatMetadata {
+  /** Trimmed custom title (1..80 Unicode-safe chars) or null = cleared. */
+  readonly title: string | null;
+  readonly pinned: boolean;
+  readonly archived: boolean;
+}
+
+/** Strict PATCH body for chat metadata (at least one field). */
+export interface ChatMetadataPatch {
+  readonly title?: string | null;
+  readonly pinned?: boolean;
+  readonly archived?: boolean;
 }

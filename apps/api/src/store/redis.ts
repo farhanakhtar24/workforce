@@ -36,12 +36,15 @@ import type {
   AskUserAnswerStatus,
   ChatBranchResult,
   ChatDeleteResult,
+  ChatMetadata,
+  ChatMetadataPatch,
   ChatRef,
   ChatRewindResult,
   ChatStore,
   ChatSummary,
 } from './types.js';
 import { CHAT_OWNER_ID_PATTERN } from './types.js';
+import { applyChatMetadataPatch, DEFAULT_CHAT_METADATA, orderChatSummaries } from './chat-history.js';
 import { applyAskUserAnswer } from './ask-user.js';
 import { MODEL_ID_PATTERN } from '../models/catalog.js';
 import {
@@ -193,10 +196,13 @@ local indexType = redis.call('TYPE', KEYS[3])
 if type(indexType) == 'table' then indexType = indexType['ok'] end
 local modelType = redis.call('TYPE', KEYS[4])
 if type(modelType) == 'table' then modelType = modelType['ok'] end
+local metadataType = redis.call('TYPE', KEYS[5])
+if type(metadataType) == 'table' then metadataType = metadataType['ok'] end
 if (listType ~= 'none' and listType ~= 'list')
    or (markerType ~= 'none' and markerType ~= 'string')
    or (indexType ~= 'none' and indexType ~= 'zset')
-   or (modelType ~= 'none' and modelType ~= 'string') then
+   or (modelType ~= 'none' and modelType ~= 'string')
+   or (metadataType ~= 'none' and metadataType ~= 'hash') then
   return -3
 end
 if redis.call('EXISTS', KEYS[2]) == 1 then
@@ -208,6 +214,7 @@ end
 redis.call('DEL', KEYS[1])
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[4])
+redis.call('DEL', KEYS[5])
 redis.call('ZREM', KEYS[3], ARGV[1])
 return 1
 `.trim();
@@ -385,6 +392,10 @@ export interface RedisLike {
     cursor: number | string,
     options?: { MATCH?: string; COUNT?: number },
   ): Promise<{ cursor: string | number; keys: string[] } | unknown>;
+  /** Redis HGETALL: every field of one hash; missing key → empty object. */
+  hGetAll(key: string): Promise<Record<string, string> | unknown>;
+  /** Redis HSET: set every field in one atomic call (field count returned). */
+  hSet(key: string, value: Record<string, string>): Promise<number | unknown>;
   eval(script: string, options?: { keys?: string[]; arguments?: string[] }): Promise<unknown>;
   del(key: string): Promise<number | unknown>;
 }
@@ -404,6 +415,19 @@ function activeStreamKey(chat: ChatRef): string {
 }
 function modelKey(chat: ChatRef): string {
   return `${REDIS_KEY_PREFIX}:chat:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:model`;
+}
+/** Owner-scoped persistent per-chat sidebar metadata (single HASH key). */
+function metadataKey(chat: ChatRef): string {
+  return `${REDIS_KEY_PREFIX}:chat:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:metadata`;
+}
+
+/** Lenient HGETALL → ChatMetadata; an absent/empty hash is ALL-DEFAULT. */
+function metadataFromRedis(reply: Record<string, string>): ChatMetadata {
+  const titleRaw = reply['title'] ?? '';
+  const title = titleRaw.length > 0 ? titleRaw : null;
+  const pinned = reply['pinned'] === '1';
+  const archived = reply['archived'] === '1';
+  return { title, pinned, archived };
 }
 function idempotencyKey(chat: ChatRef, key: string): string {
   return `${REDIS_KEY_PREFIX}:idempotency:${chatRefForKeys(chat)}:${chat.slug}:${chat.chatId}:${key}`;
@@ -589,7 +613,7 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
       const owner = chatRefForKeys(chat);
       try {
         const result = await client.eval(DELETE_CHAT_LUA, {
-          keys: [messagesKey(chat), activeStreamKey(chat), chatIndexKey(owner), modelKey(chat)],
+          keys: [messagesKey(chat), activeStreamKey(chat), chatIndexKey(owner), modelKey(chat), metadataKey(chat)],
           arguments: [chatIndexMember(chat)],
         });
         const code = toMutationCode(result);
@@ -768,11 +792,66 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
       }
     },
 
-    async listRecentChats(ownerId: string, limit: number): Promise<ChatSummary[]> {
+    async getChatMetadata(chat: ChatRef): Promise<ChatMetadata> {
+      chatRefForKeys(chat);
+      try {
+        const reply = await client.hGetAll(metadataKey(chat));
+        if (reply === null || typeof reply !== 'object') {
+          throw new StoreUnavailableError('Chat state could not be read (metadata).');
+        }
+        return metadataFromRedis(reply as Record<string, string>);
+      } catch (error) {
+        if (error instanceof StoreUnavailableError) {
+          throw error;
+        }
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async setChatMetadata(chat: ChatRef, patch: ChatMetadataPatch): Promise<ChatMetadata> {
+      chatRefForKeys(chat);
+      try {
+        // Atomic per-chat write: ONE HSET replaces the whole metadata shape
+        // (field values are pre-validated by the route; the store re-shapes).
+        const current = await (async () => {
+          const reply = await client.hGetAll(metadataKey(chat));
+          if (reply === null || typeof reply !== 'object') {
+            throw new StoreUnavailableError('Chat state could not be read (metadata).');
+          }
+          return metadataFromRedis(reply as Record<string, string>);
+        })();
+        const next = applyChatMetadataPatch(current, patch);
+        const encoded: Record<string, string> = {
+          title: next.title ?? '',
+          pinned: next.pinned ? '1' : '0',
+          archived: next.archived ? '1' : '0',
+        };
+        client.hSet(metadataKey(chat), encoded);
+        return next;
+      } catch (error) {
+        if (error instanceof StoreUnavailableError) {
+          throw error;
+        }
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async chatExists(chat: ChatRef): Promise<boolean> {
+      chatRefForKeys(chat);
+      try {
+        const len = await client.lLen(messagesKey(chat));
+        return isLengthReply(len) && len > 0;
+      } catch (error) {
+        rethrowAsUnavailable(error);
+      }
+    },
+
+    async listRecentChats(ownerId: string, limit: number, includeArchived?: boolean): Promise<ChatSummary[]> {
       if (typeof ownerId !== 'string' || !CHAT_OWNER_ID_PATTERN.test(ownerId)) {
         throw new StoreUnavailableError('Chat state requires an authenticated owner.');
       }
       const bounded = clampRecentChatsLimit(limit);
+      const withArchived = includeArchived === true;
       const ownerIndexKey = chatIndexKey(ownerId);
       try {
         // ---- 1. Newest chats from the user's activity index. BYSCORE REV
@@ -831,7 +910,20 @@ export function createRedisChatStore(client: RedisLike, options: RedisChatStoreO
           const score = toIndexScore(await client.zScore(ownerIndexKey, chatIndexMember(ref)));
           summaries.push(score === null ? summary : { ...summary, lastActivityAt: scoreToIso(score) });
         }
-        return summaries;
+        // ---- 3. Sidebar presentation: attach persistent metadata, drop
+        // archived chats unless explicitly included, and order pinned chats
+        // first (relative order otherwise preserved). One bounded HGETALL
+        // per listed chat.
+        const withMetadata: ChatSummary[] = [];
+        for (const summary of summaries.slice(0, bounded)) {
+          const meta = await client.hGetAll(metadataKey({ ownerId, slug: summary.agent, chatId: summary.chatId }));
+          const metadata =
+            meta !== null && typeof meta === 'object' && !Array.isArray(meta)
+              ? metadataFromRedis(meta as Record<string, string>)
+              : DEFAULT_CHAT_METADATA;
+          withMetadata.push({ ...summary, title: metadata.title ?? summary.title, pinned: metadata.pinned, archived: metadata.archived });
+        }
+        return orderChatSummaries(withMetadata, { includeArchived: withArchived });
       } catch (error) {
         rethrowAsUnavailable(error);
       }

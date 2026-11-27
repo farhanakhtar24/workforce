@@ -5,7 +5,8 @@
  */
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import type { ApiConfig } from './config.js';
-import { consoleLogger, type SafeLogger } from './logging.js';
+import { consoleLogger, safeRequestId, withRequestLogContext, type SafeLogger } from './logging.js';
+import { createSafeLogger } from './logging.js';
 import type { ChatStore } from './store/types.js';
 import type { StreamContext } from './stream-context/types.js';
 import type { BackgroundTaskTracker } from './background.js';
@@ -25,6 +26,8 @@ import { createRequireOwner, type StaticOwnerInjection } from './auth/owner.js';
 import { createModelsRoutes, type ModelsRouteDeps } from './models/routes.js';
 import type { ModelCatalogLike } from './models/catalog.js';
 import { createSettingsRoutes } from './settings/routes.js';
+import { createHourlyUsageRoutes } from './budget/routes.js';
+import { effectiveModelPricing, isModelExplicitlyPriced } from '@workforce/core/pricing';
 import type { WorkDocRouteDeps } from './agents/work-doc-routes.js';
 import { createWorkDocRoutes } from './agents/work-doc-routes.js';
 import type { DelegationRouteHandlers } from './agents/delegation-routes.js';
@@ -81,6 +84,13 @@ export interface AppDependencies {
    * are absent (404). Production wiring always supplies it.
    */
   settings?: import('./settings/settings.js').SettingsServiceLike;
+  /**
+   * Pre-Phase 6 CONSERVATIVE per-user hourly budget. When absent: no
+   * admission/reservation and no `/api/usage/hourly` route (legacy behavior,
+   * offline tests). Production wiring always supplies the Postgres-backed
+   * service (atomic per-owner admission with the advisory-lock transaction).
+   */
+  budget?: import('./budget/hourly-budget.js').HourlyBudgetService;
   /**
    * Pre-Phase 6 opt-in personal memory (capture/recall/purge). When absent:
    * ZERO capture, ZERO recall, ZERO purge; no chat behavior change.
@@ -147,11 +157,51 @@ export function corsMiddleware(config: Pick<ApiConfig, 'webOrigin'>): (req: Requ
 
 export function buildApp(dependencies: AppDependencies): Express {
   const app = express();
-  const logger = dependencies.logger ?? consoleLogger;
+  // Structured logging: the pino-backed SafeLogger at the configured level
+  // (tests may inject a logger; the correlation middleware always runs).
+  const logger = dependencies.logger ?? createSafeLogger(dependencies.config.logLevel ?? 'info');
 
   // No trust-proxy / compression / cookie middleware: responses stream raw.
   // JSON bodies are bounded; larger payloads are rejected, not queued.
   app.disable('x-powered-by');
+
+  // ---- Request correlation + structured request log (pre-Phase 6) --------
+  // The incoming `x-request-id` is accepted ONLY when it matches the bounded
+  // safe pattern; anything else is replaced with a randomUUID. The id is
+  // echoed as a response header, bound into the AsyncLocalStorage log
+  // context (EVERY SafeLogger call inside the request emits it), and logged
+  // at request completion — method + bounded path (no query) + statusCode +
+  // durationMs. Observability only: NEVER trusted for auth/idempotency.
+  app.use((req: Request, res: Response, next: NextFunction): void => {
+    const requestId = safeRequestId(req.headers['x-request-id']);
+    res.setHeader('x-request-id', requestId);
+    (res.locals as Record<string, unknown>)['requestId'] = requestId;
+    const startedAt = Date.now();
+    res.on('finish', () => {
+      const routeTemplate = req.route?.path !== undefined ? `${req.baseUrl ?? ''}${String(req.route.path)}` : req.path ?? '';
+      // Bounded path (route template or path), NO query string, no headers.
+      const boundedPath = routeTemplate.slice(0, 256);
+      const statusCode = res.statusCode;
+      const durationMs = Date.now() - startedAt;
+      if (statusCode >= 500) {
+        logger.error(`http-request ${req.method} ${boundedPath} ${String(statusCode)} ${String(durationMs)}ms ${requestId}`);
+      } else if (statusCode >= 400) {
+        logger.warn(`http-request ${req.method} ${boundedPath} ${String(statusCode)} ${String(durationMs)}ms ${requestId}`);
+      } else {
+        if (logger.debug !== undefined) {
+          logger.debug(`http-request ${req.method} ${boundedPath} ${String(statusCode)} ${String(durationMs)}ms ${requestId}`);
+        }
+      }
+    });
+    res.on('close', () => {
+      if (res.writableFinished === false) {
+        // Client disconnect mid-stream: log once, never crash the process.
+        const boundedPath = (req.path ?? '').slice(0, 256);
+        logger.warn(`http-request-disconnected ${req.method} ${boundedPath} ${String((startedAt !== undefined ? Date.now() - startedAt : 0))}ms ${requestId}`);
+      }
+    });
+    withRequestLogContext(requestId, next);
+  });
 
   // CORS FIRST: the single Next origin (ADR-005) with credentials enabled
   // (Better Auth session cookies ride on cross-origin XHR) — never a
@@ -168,12 +218,21 @@ export function buildApp(dependencies: AppDependencies): Express {
     logger,
     models: dependencies.models,
     personal: dependencies.personal,
+    budget:
+      dependencies.budget === undefined
+        ? undefined
+        : {
+            service: dependencies.budget,
+            // Fail-closed pricing gate: official defaults ∪ explicit overrides.
+            isModelPriced: (modelId: string) =>
+              isModelExplicitlyPriced(dependencies.config.modelPricing, modelId),
+          },
     agents:
       dependencies.agents !== undefined
         ? { hostDeps: dependencies.agents.hostDeps, signer: dependencies.agents.signer }
         : undefined,
   });
-  const { health, hydration, postChat, resumeStream, deleteChat, branchChat, rewindChat, getModel, setModel, usage } = chatRoutes;
+  const { health, hydration, postChat, resumeStream, deleteChat, branchChat, rewindChat, getModel, setModel, getMetadata, patchMetadata, exportChat, usage } = chatRoutes;
 
   // PUBLIC: unauthenticated liveness only.
   app.get('/health', health);
@@ -268,6 +327,11 @@ export function buildApp(dependencies: AppDependencies): Express {
   app.delete('/api/agents/:slug/chat/:clientChatId', deleteChat);
   app.post('/api/agents/:slug/chat/:clientChatId/branch', branchChat);
   app.post('/api/agents/:slug/chat/:clientChatId/rewind', rewindChat);
+  // Pre-Phase 6 sidebar chat actions: persistent metadata (GET/PATCH) and
+  // the complete-transcript Markdown export. Owner-scoped, no budget use.
+  app.get('/api/agents/:slug/chat/:clientChatId/metadata', getMetadata);
+  app.patch('/api/agents/:slug/chat/:clientChatId/metadata', patchMetadata);
+  app.get('/api/agents/:slug/chat/:clientChatId/export', exportChat);
   // Pre-Phase 6 model composition: per-chat model selection (next-generation
   // apply), provenance via hydration, and the authenticated usage/cost read.
   // Catalog routes only when the composition is wired.
@@ -275,8 +339,9 @@ export function buildApp(dependencies: AppDependencies): Express {
     const modelRouteDeps: ModelsRouteDeps = {
       catalog: dependencies.models.catalog,
       defaultModelId: dependencies.models.defaultModelId,
-      // Details pricing: ONLY the explicitly configured per-million rates.
-      modelPricing: dependencies.config.modelPricing,
+      // Details pricing: OFFICIAL DEFAULTS with the explicit override
+      // (exact ids only; cachedInput only when officially known).
+      resolvePricing: (modelId: string) => effectiveModelPricing(dependencies.config.modelPricing, modelId),
     };
     const modelsRoutes = createModelsRoutes(modelRouteDeps);
     app.get('/api/models', modelsRoutes.listModels);
@@ -301,9 +366,26 @@ export function buildApp(dependencies: AppDependencies): Express {
     app.patch('/api/settings', settingsRoutes.patchSettings);
   }
 
+  // Pre-Phase 6 CONSERVATIVE per-user hourly budget usage read — only when
+  // the budget service is wired (production always; absent → 404).
+  if (dependencies.budget !== undefined) {
+    const hourlyUsageRoutes = createHourlyUsageRoutes({ budget: dependencies.budget, logger });
+    app.get('/api/usage/hourly', hourlyUsageRoutes.getHourlyUsage);
+  }
+
   // Phase 3 memory routes, only when memory deps are injected.
   if (dependencies.memory !== undefined) {
-    const memoryRoutes = createMemoryRoutes({ ...dependencies.memory, logger });
+    const memoryRoutes = createMemoryRoutes({
+      ...dependencies.memory,
+      // Pre-Phase 6 hourly budget: production wiring links each user memory
+      // scope to its owner so the WORKER can attribute DOLLAR-only
+      // compaction usage (regression-tested through this wiring).
+      budgetHook:
+        dependencies.budget === undefined
+          ? undefined
+          : { recordScopeOwner: (scope: string, ownerId: string) => dependencies.budget!.recordScopeOwner(scope, ownerId) },
+      logger,
+    });
     app.post('/api/memory/blocks', memoryRoutes.createBlock);
     app.get('/api/memory/blocks', memoryRoutes.listBlocks);
     app.post('/api/memory/search', memoryRoutes.search);

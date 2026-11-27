@@ -6,11 +6,15 @@
  *   hard max {@link RECENT_CHATS_LIMIT_MAX}; ANY other value (non-numeric,
  *   0, negative, fractional, oversized, `?limit=`, `?limit=a&limit=b`) is a
  *   fixed safe 400 — never an echo of the input.
+ * - `includeArchived`: optional strict boolean query; only `true`/`false`
+ *   (case-insensitive) are accepted — absent or `false` preserve the normal
+ *   ACTIVE list (archived chats excluded), junk values are a fixed safe 400.
  * - Response `200 { chats: ChatSummary[] }` with `Cache-Control: no-store`:
- *   identity + bounded title/preview + message count + activity timestamp
- *   only. No message contents beyond those bounds, no tool payloads, no
- *   provider details.
- * - Indexed chats come newest-activity-first; legacy (pre-index) chats are
+ *   identity + bounded title/preview + message count + activity timestamp +
+ *   `pinned`/`archived` flags (pre-Phase 6 sidebar actions) only. No message
+ *   contents beyond those bounds, no tool payloads, no provider details.
+ * - Indexed chats come newest-activity-first; pinned chats are listed FIRST
+ *   (relative order preserved); legacy (pre-index) chats are
  *   deterministically ordered afterward with `lastActivityAt: null`.
  * - Owner-scoped: the resolved owner namespaces the whole read — another
  *   user's chats (and pre-auth ownerless legacy chats) are unreachable.
@@ -28,6 +32,8 @@ import { sendJsonError } from './adapter.js';
 
 /** Fixed safe validation message; the input value is never echoed. */
 const LIMIT_ERROR_MESSAGE = `limit must be an integer between 1 and ${String(RECENT_CHATS_LIMIT_MAX)}.`;
+/** Fixed safe validation message for the archival toggle. */
+const INCLUDE_ARCHIVED_ERROR_MESSAGE = 'includeArchived must be exactly `true` or `false`.';
 
 /**
  * Accepts `undefined` (→ default) and plain digit strings validated against
@@ -46,6 +52,24 @@ function parseChatListLimit(raw: unknown): number | null {
     return null;
   }
   return value;
+}
+
+/** Strict `true`/`false` (case-insensitive); absent → false; else null. */
+function parseIncludeArchived(raw: unknown): boolean | null {
+  if (raw === undefined) {
+    return false;
+  }
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const lowered = raw.toLowerCase();
+  if (lowered === 'true') {
+    return true;
+  }
+  if (lowered === 'false') {
+    return false;
+  }
+  return null;
 }
 
 export interface ChatListRouteDeps {
@@ -67,9 +91,14 @@ export function createChatListRoute(deps: ChatListRouteDeps): { listChats: Reque
       sendJsonError(res, 400, LIMIT_ERROR_MESSAGE);
       return;
     }
+    const includeArchived = parseIncludeArchived(req.query['includeArchived']);
+    if (includeArchived === null) {
+      sendJsonError(res, 400, INCLUDE_ARCHIVED_ERROR_MESSAGE);
+      return;
+    }
     let chats;
     try {
-      chats = await store.listRecentChats(owner.userId, limit);
+      chats = await store.listRecentChats(owner.userId, limit, includeArchived);
     } catch (error) {
       // Cause logged with context only; the client gets a fixed safe 503.
       logger.error('chat-list-store', error);

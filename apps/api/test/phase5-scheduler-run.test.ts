@@ -32,10 +32,12 @@ import {
   createSchedulerWorker,
   processSchedulerJob,
   SCHEDULER_RUN_RETRYABLE_MESSAGE,
+  schedulerRequestId,
   type SchedulerRunClient,
   type SchedulerRunExecutionInput,
   type SchedulerRunScheduledInput,
 } from '@workforce/queue/scheduler';
+import { withRequestLogContext } from '../src/logging.js';
 import type { FetchLike } from '../src/agents/host-capabilities.js';
 
 const silentLogger = { error: (): void => undefined, warn: (): void => undefined };
@@ -836,6 +838,38 @@ test('run client posts the worker header and occurrence metadata; ok maps', asyn
     repeatJobKey: 'rep-9',
   });
   assert.ok(call.init?.signal instanceof AbortSignal);
+});
+
+test('run client propagates the per-job request id; signed headers unaffected', async () => {
+  const harness = runClientFixture(() => jsonResponse(200, { ok: true }));
+  const taskId = '00000000-0000-4000-8000-00000000def0';
+  // Host hook shape (scheduler-worker.ts): one deterministic id per job id,
+  // hostile ids included; bound around the run-client call.
+  const jobId = 'repeat:task-1:0';
+  const requestId = schedulerRequestId(jobId);
+  assert.match(requestId, /^[A-Za-z0-9._-]{1,128}$/);
+  const result = await withRequestLogContext(requestId, () =>
+    harness.client.runScheduled({
+      taskId,
+      scheduledFor: '2026-11-21T09:00:00.000Z',
+      queueJobId: jobId,
+      attempt: 1,
+    }),
+  );
+  assert.deepEqual(result, { ok: true });
+  const headers = (harness.runCalls()[0] as RecordedCall).init?.headers as Record<string, string>;
+  assert.equal(headers['x-request-id'], requestId);
+  // Signed/worker convention headers intact — correlation never weakens auth.
+  assert.equal(headers['X-Workforce-Scheduler-Worker'], '1');
+  const signedContext = testInternalSigner().verify(String(headers[INTERNAL_SCHEDULER_HEADER]), { kind: 'internal-scheduler-run', taskId });
+  assert.equal(signedContext.ok, true);
+
+  // Outside any job context: NO x-request-id header at all.
+  const outside = await harness.client.runExecution({ executionId: '00000000-0000-4000-8000-00000000def1', attempt: 1 });
+  assert.deepEqual(outside, { ok: true });
+  const outsideHeaders = (harness.runCalls()[1] as RecordedCall).init?.headers as Record<string, string>;
+  assert.equal('x-request-id' in outsideHeaders, false);
+  assert.equal(outsideHeaders['X-Workforce-Scheduler-Worker'], '1');
 });
 
 test('run client execution mapping: path/body/attempt/queueJobId', async () => {

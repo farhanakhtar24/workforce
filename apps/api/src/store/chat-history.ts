@@ -21,7 +21,7 @@
  * - Legacy chats (created before the activity index existed) surface with
  *   `lastActivityAt: null`. Timestamps are NEVER fabricated.
  */
-import type { ChatSummary } from './types.js';
+import type { ChatMetadata, ChatMetadataPatch, ChatSummary } from './types.js';
 import { clientIdSchema, isKnownSlug } from '../validation.js';
 
 export const RECENT_CHATS_LIMIT_DEFAULT = 20;
@@ -167,15 +167,104 @@ export function buildChatSummary(input: {
   titleEntries: readonly unknown[];
   previewEntries: readonly unknown[];
   lastActivityAt: string | null;
+  metadata?: ChatMetadata;
 }): ChatSummary {
   return {
     chatId: input.chatId,
     agent: input.slug,
-    title: extractChatTitle(input.titleEntries),
+    title: input.metadata?.title ?? extractChatTitle(input.titleEntries),
     preview: extractChatPreview(input.previewEntries),
     messageCount: input.messageCount,
     lastActivityAt: input.lastActivityAt,
+    pinned: input.metadata?.pinned ?? false,
+    archived: input.metadata?.archived ?? false,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Chat metadata (pre-Phase 6 sidebar actions): pure validation + ordering
+// ---------------------------------------------------------------------------
+
+/** Max custom title length (Unicode-safe: counts CODE POINTS, not UTF-16). */
+export const CHAT_TITLE_MAX_CHARS = 80;
+
+/** Normalized patch (≥1 field, Unicode-safe title ≤80 code points). */
+export interface ParsedChatMetadataPatch {
+  readonly title?: string | null;
+  readonly pinned?: boolean;
+  readonly archived?: boolean;
+}
+
+/**
+ * Strict patch validation at the trust edge. `null`/empty/whitespace title
+ * CLEARS the custom title (normalized to null); a non-empty title trims and
+ * accepts 1..80 code points. Wrong types / unknown semantics are the
+ * caller's (zod) responsibility — this validates VALUE shape.
+ */
+export function parseChatMetadataPatch(patch: ChatMetadataPatch): ParsedChatMetadataPatch | null {
+  let sawAny = false;
+  const parsed: { title?: string | null; pinned?: boolean; archived?: boolean } = {};
+  if (patch.title !== undefined) {
+    if (patch.title === null || typeof patch.title === 'string') {
+      if (typeof patch.title === 'string') {
+        const trimmed = patch.title.trim();
+        if (trimmed.length === 0) {
+          parsed.title = null;
+        } else if ([...trimmed].length <= CHAT_TITLE_MAX_CHARS) {
+          parsed.title = trimmed;
+        } else {
+          return null;
+        }
+      } else {
+        parsed.title = null;
+      }
+      sawAny = true;
+    } else {
+      return null;
+    }
+  }
+  if (patch.pinned !== undefined) {
+    if (typeof patch.pinned !== 'boolean') {
+      return null;
+    }
+    parsed.pinned = patch.pinned;
+    sawAny = true;
+  }
+  if (patch.archived !== undefined) {
+    if (typeof patch.archived !== 'boolean') {
+      return null;
+    }
+    parsed.archived = patch.archived;
+    sawAny = true;
+  }
+  return sawAny ? parsed : null;
+}
+
+/** Applies a normalized patch onto current metadata (pure). */
+export function applyChatMetadataPatch(current: ChatMetadata, patch: ParsedChatMetadataPatch): ChatMetadata {
+  return {
+    title: patch.title !== undefined ? patch.title : current.title,
+    pinned: patch.pinned !== undefined ? patch.pinned : current.pinned,
+    archived: patch.archived !== undefined ? patch.archived : current.archived,
+  };
+}
+
+export const DEFAULT_CHAT_METADATA: ChatMetadata = { title: null, pinned: false, archived: false };
+
+/**
+ * Sidebar presentation: pinned chats FIRST (their existing relative order is
+ * preserved), then the rest in the SAME relative order the caller produced
+ * (newest-activity / deterministic). `includeArchived=false` drops archived
+ * chats entirely.
+ */
+export function orderChatSummaries(
+  summaries: readonly ChatSummary[],
+  options: { includeArchived: boolean },
+): ChatSummary[] {
+  const visible = options.includeArchived ? [...summaries] : summaries.filter((chat) => chat.archived === false);
+  const pinned = visible.filter((chat) => chat.pinned === true);
+  const rest = visible.filter((chat) => chat.pinned !== true);
+  return [...pinned, ...rest];
 }
 
 /**

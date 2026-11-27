@@ -29,6 +29,7 @@ See [`ADR-TEMPLATE.md`](./ADR-TEMPLATE.md).
 | 006 | [BullMQ Job Schedulers over in-process cron](./ADR-006-bullmq-scheduler.md) | 5 | 🟢 Accepted 2026-11-23 (design fixed; Phase 5 not built yet) |
 | 007 | [pgvector + local MiniLM embeddings](./ADR-007-pgvector.md) | 3 | 🟢 Accepted 2026-11-19 |
 | 008 | [AI SDK UI message streams vs. custom protocol](./ADR-008-ai-sdk-ui-streams.md) | 2 | 🟢 Accepted 2026-11-17 |
+| 009 | [Railway deployment (one public web origin, private API, pgvector template)](./ADR-009-railway-deployment.md) | 6 | 🟢 Accepted 2026-11-25 (design only; Phase 6 not validated) |
 
 ---
 

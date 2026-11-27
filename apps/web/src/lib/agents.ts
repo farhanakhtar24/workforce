@@ -7,7 +7,8 @@
  * dependency.
  *
  * URL scheme: canonical chat URLs are `/agents/<slug>/chat/<chatId>` with an
- * optional `?mode=` (plan only — action is the default and omitted). Legacy
+ * optional `?mode=` (the web default is plan and omitted; action is explicit).
+ * Legacy
  * `/chat/<chatId>` pages redirect to the `general` agent (the Phase 2 slug),
  * honoring a valid `?agent=`/`?mode=` so old links never lose context.
  * Unknown URL values never crash: they fall back to the defaults.
@@ -81,6 +82,24 @@ export function modeGuidance(selection: AgentSelection): string {
 /** Human label for mode radio buttons. */
 export function modeLabel(mode: WebAgentMode): string {
   return mode === 'plan' ? 'Plan' : 'Action';
+}
+
+/** URL query value for a mode: the default (plan) is omitted; action is `action`. */
+export function modeUrlValue(mode: WebAgentMode): string | null {
+  return mode === DEFAULT_MODE ? null : mode;
+}
+
+/**
+ * History state for a SHALLOW URL replacement that preserves the Next.js
+ * App Router state (`?mode=` Plan/Action switch without an RSC navigation).
+ * Returns the state object to pass to `history.replaceState`.
+ */
+export function modeReplaceHistoryState(
+  historyState: unknown,
+  url: string,
+): Record<string, unknown> {
+  const prior = (historyState ?? {}) as Record<string, unknown>;
+  return { ...prior, as: url, url };
 }
 
 /** Page-level mode fallback: absent/unknown `?mode=` → the web default. */

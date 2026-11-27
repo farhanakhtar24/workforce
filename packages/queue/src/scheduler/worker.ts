@@ -15,7 +15,14 @@
  *   backoff). A run client that THROWS keeps its error untouched.
  * - NO raw payload, reason, or error text is ever logged: failure/error
  *   contexts carry only a fixed type plus the job id.
+ * - Correlation (observability only): with a configured
+ *   {@link SchedulerJobContextHook}, the processor AND the completed/failed
+ *   event logging run inside one per-job async context keyed by
+ *   {@link schedulerRequestId} — the same deterministic id the host's outgoing
+ *   calls can carry as `x-request-id`. No hook = previous no-context behavior.
  */
+
+import { createHash } from 'node:crypto';
 
 import { Worker } from 'bullmq';
 
@@ -31,7 +38,7 @@ import {
   scheduledInputFromJob,
   type SchedulerJobLike,
 } from './job-helpers.js';
-import { isSchedulerJobData, type SchedulerJobData, type SchedulerRunClient } from './types.js';
+import { isSchedulerJobData, type SchedulerJobData, type SchedulerJobContextHook, type SchedulerRunClient } from './types.js';
 
 /**
  * Minimal structural surface of a running worker (tests fake the BullMQ
@@ -59,6 +66,11 @@ export interface SchedulerWorkerOptions {
   workerFactory?: SchedulerWorkerFactory;
   /** close() bound; default {@link SCHEDULER_CLOSE_TIMEOUT_MS} (tests shorten). */
   closeTimeoutMs?: number;
+  /**
+   * Per-job context hook around the processor and completed/failed logging
+   * (see {@link SchedulerJobContextHook}); optional, undefined = no context.
+   */
+  withJobContext?: SchedulerJobContextHook;
 }
 
 export interface SchedulerWorkerHandle {
@@ -72,6 +84,74 @@ export interface SchedulerWorkerHandle {
 export const INVALID_SCHEDULER_PAYLOAD_MESSAGE = 'scheduler job payload failed validation' as const;
 export const SCHEDULER_RUN_RETRYABLE_MESSAGE = 'scheduler run result requested a retry' as const;
 export const SCHEDULER_RUN_MALFORMED_MESSAGE = 'scheduler run client returned a malformed result' as const;
+
+/** `scheduler-` + sha256 hex prefix: bounded to `[A-Za-z0-9-]` ⊂ request-id contract. */
+const SCHEDULER_REQUEST_ID_PREFIX = 'scheduler-';
+const SCHEDULER_REQUEST_ID_HASH_CHARS = 32;
+/** Event fallback when a failed/completed event carries NO job (e.g. stalled). */
+export const SCHEDULER_JOB_CONTEXT_ID_FALLBACK = 'unknown' as const;
+
+/**
+ * Pure deterministic correlation id for ONE BullMQ job occurrence: every
+ * context binding for the same job id yields the SAME value, hostile job ids
+ * (colons/unicode/overlong) hash to the same safe shape. `scheduler-` + 32
+ * hex chars = 42 chars of `[A-Za-z0-9-]` (safe request-id contract).
+ */
+export function schedulerRequestId(jobId: string): string {
+  const digest = createHash('sha256').update(jobId, 'utf8').digest('hex');
+  return `${SCHEDULER_REQUEST_ID_PREFIX}${digest.slice(0, SCHEDULER_REQUEST_ID_HASH_CHARS)}`;
+}
+
+/**
+ * Stringifies a BullMQ job id exactly like the log lines do; events without
+ * a job collapse into the fixed, safe {@link SCHEDULER_JOB_CONTEXT_ID_FALLBACK}.
+ */
+export function schedulerJobContextId(jobId: unknown): string {
+  if (typeof jobId === 'string' || typeof jobId === 'number') {
+    return String(jobId);
+  }
+  return SCHEDULER_JOB_CONTEXT_ID_FALLBACK;
+}
+
+/** Runs `next`, optionally bound to the job's correlation context. */
+function withOptionalJobContext<T>(
+  withJobContext: SchedulerJobContextHook | undefined,
+  jobId: unknown,
+  next: () => T,
+): T {
+  if (withJobContext === undefined) {
+    return next();
+  }
+  return withJobContext(schedulerJobContextId(jobId), next);
+}
+
+/**
+ * The completed/failed event logging, extracted so tests can drive it
+ * WITHOUT Redis: the SAME hook wraps the SAME stringified job id as the
+ * processor, and the log text stays byte-identical to the previous behavior.
+ */
+export interface SchedulerWorkerEventHandlers {
+  onCompleted(job: SchedulerJobLike | undefined): void;
+  onFailed(job: SchedulerJobLike | undefined, error: unknown): void;
+}
+
+export function createSchedulerJobEventHandlers(
+  logger: SchedulerLogger,
+  withJobContext?: SchedulerJobContextHook,
+): SchedulerWorkerEventHandlers {
+  return {
+    onCompleted(job): void {
+      withOptionalJobContext(withJobContext, job?.id, () => {
+        logger.warn(`scheduler-worker-completed ${String(job?.id)}`);
+      });
+    },
+    onFailed(job, error): void {
+      withOptionalJobContext(withJobContext, job?.id, () => {
+        logger.error(`scheduler-worker-failed ${String(job?.id)}`, error);
+      });
+    },
+  };
+}
 
 /**
  * Worker→BullMQ retry bridge for the result contract: `ok: true` resolves;
@@ -123,9 +203,13 @@ export async function processSchedulerJob(
 /** Creates the real BullMQ worker (or the factory-faked one) for a processor. */
 export function createSchedulerWorker(options: SchedulerWorkerOptions): SchedulerWorkerHandle {
   const { runClient, logger } = options;
+  const withJobContext = options.withJobContext;
   const queueName = options.queueName ?? SCHEDULER_QUEUE_NAME;
   const concurrency = options.concurrency ?? SCHEDULER_WORKER_CONCURRENCY;
-  const processor: SchedulerProcessor = (job) => processSchedulerJob(job, runClient);
+  // Processor runs INSIDE the job's correlation context (when a hook is
+  // configured), so the injected run client's outgoing calls observe it.
+  const processor: SchedulerProcessor = (job) =>
+    withOptionalJobContext(withJobContext, job.id, () => processSchedulerJob(job, runClient));
 
   let handle: SchedulerWorkerLike;
   if (options.workerFactory !== undefined) {
@@ -142,11 +226,12 @@ export function createSchedulerWorker(options: SchedulerWorkerOptions): Schedule
       // connections for blocking commands are all closed by worker.close()).
       { connection, concurrency },
     );
+    const jobEvents = createSchedulerJobEventHandlers(logger, withJobContext);
     worker.on('completed', (job) => {
-      logger.warn(`scheduler-worker-completed ${String(job.id)}`);
+      jobEvents.onCompleted(job);
     });
     worker.on('failed', (job, error) => {
-      logger.error(`scheduler-worker-failed ${String(job?.id)}`, error);
+      jobEvents.onFailed(job, error);
     });
     worker.on('error', (error) => {
       logger.error('scheduler-worker-error', error);

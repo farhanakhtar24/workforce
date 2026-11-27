@@ -69,8 +69,22 @@ export class CompactionOutputError extends Error {
   }
 }
 
+/** Dollar-only budget reservation hook (pre-Phase 6 hourly budget). */
+export interface CompactionBudgetHook {
+  /**
+   * Reserves DOLLARS (never a request count) under the owner's rolling
+   * window before any provider work. Denial/unpriced MUST throw a typed
+   * fixed error (BullMQ owns the retry backoff): the compact call must NEVER
+   * continue to the provider after a denied reservation. Transient failures
+   * also rethrow (fail closed, safe retry).
+   */
+  reserve(input: { scope: string; path: string; triggerBlockId: string; sourceCharCount: number; blockCount: number }): Promise<void>;
+}
+
 export interface OllamaCompactorOptions {
   model: LanguageModel;
+  /** DOLLAR-only hourly-budget hook; absent = legacy unreserved behavior. */
+  budget?: CompactionBudgetHook;
 }
 
 export interface OllamaCompactor extends MemoryCompactor {}
@@ -140,9 +154,28 @@ function classifyEmptyOutput(finishReason: string): CompactionOutputErrorCode {
 
 /** Builds a `MemoryCompactor` that asks the model for a plain summary. */
 export function createOllamaCompactor(options: OllamaCompactorOptions): OllamaCompactor {
-  const { model } = options;
+  const { model, budget } = options;
   return {
     compact: async (request: MemoryCompactionRequest): Promise<string> => {
+      // DOLLAR-ONLY budget reservation (pre-Phase 6 hourly budget): before
+      // any provider work, attribute the compaction's conservative cost to
+      // the owning user (never a request count). Best-effort: failures log
+      // and never break the compaction job. Unknown/unlinked scopes (legacy
+      // anonymous memory) are simply not budget-attributable.
+      if (budget !== undefined) {
+        // FAIL CLOSED: a denied/unpriced/failed reservation propagates as a
+        // typed, fixed-safe error so BullMQ retries the JOB — the provider is
+        // never called without a reservation. The dedupe key (scope/path/
+        // triggerBlockId) makes BullMQ retries idempotent.
+        const sourceCharCount = request.blocks.reduce<number>((sum, block) => sum + block.content.length, 0);
+        await budget.reserve({
+          scope: request.scope,
+          path: request.path,
+          triggerBlockId: request.triggerBlockId,
+          sourceCharCount,
+          blockCount: request.blocks.length,
+        });
+      }
       // Both provider calls (first summary + optional repair) share ONE abort
       // signal created before the first call: total compaction provider work
       // stays bounded at COMPACTION_TIMEOUT_MS instead of the timeout per

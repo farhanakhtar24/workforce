@@ -1,14 +1,29 @@
-# Local infrastructure only: Phase 2 Redis (chat messages, idempotency keys,
-# active stream markers, resumable-stream relay, BullMQ memory queue) and
-# Phase 3 Postgres with pgvector (the memory store).
-# App containers (api/web images built and deployed) are still Phase 6 —
-# see ROADMAP.md.
+# Phase 6 production stack (local Docker): one command brings up
+# postgres (pgvector) + redis + a one-shot `migrate` release step + api + web
+# + scheduler-worker.
+#
+#   docker compose up --build       # or: npm run docker:up
+#
+# The dev-only helper is unchanged: `npm run dev:infra` (= compose up -d
+# redis postgres) still starts ONLY the two infra services below with the
+# same images, volumes and host ports as before Phase 6.
+#
+# Secrets and provider/OAuth configuration are never baked into images or
+# build args: the api/scheduler services interpolate ${VAR:-} values from the
+# process environment or the optional root `.env` (see .env.example). Values
+# that point inside the compose network use internal hostnames
+# (postgres/redis/api); they are overridden with the WORKFORCE_ prefixed
+# variables so a local-dev DATABASE_URL/REDIS_URL in `.env` can never poison
+# the containers. BETTER_AUTH_URL / WEB_ORIGIN / NEXT_PUBLIC_API_URL must
+# stay coherent with the effective host ports for browser sign-in.
+name: workforce
+
 services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -25,7 +40,7 @@ services:
       POSTGRES_PASSWORD: workforce
       POSTGRES_DB: workforce
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-55432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -35,6 +50,170 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # One-shot release step: prisma migrate deploy (existing wrapper).
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: migrate
+    image: workforce-migrate
+    environment:
+      DATABASE_URL: postgresql://workforce:workforce@postgres:5432/workforce
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: runtime
+    image: workforce-api
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      NODE_OPTIONS: --enable-source-maps
+      # Internal topology: container hostname `postgres` on 5432 (never the
+      # host 55432). Override with WORKFORCE_DATABASE_URL/WORKFORCE_REDIS_URL
+      # for external managed stores.
+      DATABASE_URL: ${WORKFORCE_DATABASE_URL:-postgresql://workforce:workforce@postgres:5432/workforce}
+      REDIS_URL: ${WORKFORCE_REDIS_URL:-redis://redis:6379}
+      # Tools/delegation call the API's own loopback REST routes.
+      INTERNAL_API_BASE_URL: ${WORKFORCE_INTERNAL_API_URL:-http://127.0.0.1:3001}
+      EMBEDDING_CACHE_DIR: /app/.cache/workforce-models
+      # Browser-facing web origin (trusted origin + CORS with credentials).
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      # Optional tunables (blank = code default; the API treats blank as
+      # absent, so an empty value is safe).
+      DELEGATION_TIMEOUT_MS: ${DELEGATION_TIMEOUT_MS:-}
+      QUERY_STATEMENT_TIMEOUT_MS: ${QUERY_STATEMENT_TIMEOUT_MS:-}
+      QUERY_ROW_CAP: ${QUERY_ROW_CAP:-}
+      SCHEDULER_EXECUTION_TIMEOUT_MS: ${SCHEDULER_EXECUTION_TIMEOUT_MS:-}
+      WORKFORCE_BLOCKED_MODEL_PREFIXES: ${WORKFORCE_BLOCKED_MODEL_PREFIXES:-}
+      OLLAMA_MODEL_PRICING_JSON: ${OLLAMA_MODEL_PRICING_JSON:-}
+      # Provider + auth configuration: from the environment or the optional
+      # root .env. Blanks stay blank (the API refuses to start without a
+      # provider key, BETTER_AUTH secret/URL and one complete OAuth pair).
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3001}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      AUTH_EMAIL_ALLOWLIST: ${AUTH_EMAIL_ALLOWLIST:-}
+      DELEGATION_CONTEXT_SECRET: ${DELEGATION_CONTEXT_SECRET:-}
+      # Structured-log level; blank = the config default (info). Never a secret.
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-3001}:3001"
+    volumes:
+      - embedding-cache:/app/.cache/workforce-models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: runner
+      args:
+        # Public, non-secret: inlined into the browser bundle at build time.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+        # BUILD-TIME: next.config.ts resolves this arg and bakes /api/:path*
+        # -> <this value>/api/:path* into the standalone routes manifest for
+        # the BAKED browser rewrite. The SAME nonsecret value ALSO governs
+        # runtime SSR hydration below (environment.API_INTERNAL_URL), so the
+        # web container must fetch it server-to-server, never through the
+        # public web hostname. Compose default points INSIDE the network
+        # (single-origin proxy mode). DISTINCT SETTING: api/scheduler runtime
+        # calls use WORKFORCE_INTERNAL_API_URL — do not bind them to the same
+        # variable. Non-secret.
+        API_INTERNAL_URL: ${WORKFORCE_WEB_INTERNAL_API_URL:-http://api:3001}
+    image: workforce-web
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+      # RUNTIME server-only internal origin for SSR hydration (web server
+      # -> API). Same nonsecret value as the build arg above; browser-facing
+      # NEXT_PUBLIC_API_URL stays public. Non-secret.
+      API_INTERNAL_URL: ${WORKFORCE_WEB_INTERNAL_API_URL:-http://api:3001}
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then((r) => process.exit(r.status < 500 ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+  # Scheduler worker reuses the SAME runtime image as api with a different
+  # command. Runtime env is deliberately minimal: only what scheduler-worker
+  # actually reads (REDIS_URL, INTERNAL_API_BASE_URL, the shared signing
+  # secret, optional tunables) — no provider key, no DATABASE_URL, no auth
+  # variables (the worker never constructs a provider or Prisma client).
+  scheduler:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: runtime
+    image: workforce-api
+    command: ["node", "apps/api/dist/scheduler-worker.js"]
+    environment:
+      NODE_ENV: production
+      REDIS_URL: ${WORKFORCE_REDIS_URL:-redis://redis:6379}
+      INTERNAL_API_BASE_URL: ${WORKFORCE_INTERNAL_API_URL:-http://api:3001}
+      DELEGATION_CONTEXT_SECRET: ${DELEGATION_CONTEXT_SECRET:-}
+      SCHEDULER_EXECUTION_TIMEOUT_MS: ${SCHEDULER_EXECUTION_TIMEOUT_MS:-}
+      # Structured-log level; blank = the config default (info). Never a secret.
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 20s
+    # No listening port: health = live scheduler-worker process (PID1) AND
+    # API /health reachability. Node-only, bounded, silent (never prints
+    # URLs/errors/values); unhealthy on any failure. Works as the non-root
+    # `node` user (PID1 cmdline is owner-readable).
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'try{const fs=require("node:fs");if(!fs.readFileSync("/proc/1/cmdline","utf8").includes("apps/api/dist/scheduler-worker.js"))process.exit(1);fetch(new URL("/health",process.env.INTERNAL_API_BASE_URL||"http://127.0.0.1:3001"),{signal:AbortSignal.timeout(4000)}).then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));}catch{process.exit(1)}'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
 volumes:
   redis-data:
   postgres-data:
+  # Transformers.js MiniLM model cache (first API use downloads once).
+  embedding-cache:

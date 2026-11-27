@@ -193,7 +193,7 @@ Any value already in `process.env` wins over ALL files, including a shell-export
 | `POST` | `/api/agents/:slug/chat` | Send the newest user `UIMessage` (exact `{ id, message }` + optional `mode: 'plan' \| 'action'`, default `action`). Slugs: `general` (calculate-only, unchanged), `orchestrator`, `analyst`, `researcher` — the Phase 4 roster requires the agent runtime to be wired (otherwise only `general` is servable, byte-compatible legacy 404s). Depth is resolved ONLY from the verified `X-Workforce-Delegation-Context` header; client body fields like `depth` are rejected (400). |
 | `GET` | `/api/agents/:slug/chat/:clientChatId` | Hydration: `{ messages: UIMessage[], hasActiveStream: boolean }` (plus `modelId` when the model composition is wired), `Cache-Control: no-store`. |
 | `GET` | `/api/agents/:slug/chat/:clientChatId/stream` | Resume the active stream; `204` when none; full replay otherwise. |
-| `GET` | `/api/chats?limit=N` | Real recent-chat history for the workspace sidebar: `{ chats: [{ chatId, agent: 'general'\|'orchestrator'\|'analyst'\|'researcher', title, preview, messageCount, lastActivityAt }] }` — default 20, max 50 (`limit` clamped; invalid → fixed 400), Redis unavailable → fixed 503, always `Cache-Control: no-store` (client copies it too). Titles/previews are real bounded plain text from stored messages (server-capped, trimmed — no Markdown guarantees); ordering uses the chat index (atomic `RPUSH` + `ZADD` on every persistence with last-activity timestamps, bounded `ZREVRANGE` reads); legacy chats have no indexed timestamp and surface `lastActivityAt: null`. Backfill for pre-index chats uses a bounded legacy `SCAN` (cursor-paged, capped). Real integration coverage: the full real-Redis suite previously passed **37/37**, and after the `zScore` edge fix the targeted real chat-history suite passed **4/4** (one new test added; no full rerun claimed). |
+| `GET` | `/api/chats?limit=N&includeArchived=true` | Real recent-chat history for the workspace sidebar: `{ chats: [{ chatId, agent: 'general'\|'orchestrator'\|'analyst'\|'researcher', title, preview, messageCount, lastActivityAt, pinned, archived }] }` — default 20, max 50 (`limit` clamped; invalid → fixed 400), `includeArchived` strict `true`/`false` (absent/false = archived EXCLUDED; junk → fixed 400), pinned chats listed FIRST (relative order preserved), Redis unavailable → fixed 503, always `Cache-Control: no-store` (client copies it too). `title` is the custom trimmed title when set (Unicode-safe ≤80 chars), else the derived first-user-text title. Titles/previews are real bounded plain text from stored messages (server-capped, trimmed — no Markdown guarantees); ordering uses the chat index (atomic `RPUSH` + `ZADD` on every persistence with last-activity timestamps, bounded `ZREVRANGE` reads); legacy chats have no indexed timestamp and surface `lastActivityAt: null`. Backfill for pre-index chats uses a bounded legacy `SCAN` (cursor-paged, capped). Real integration coverage: the full real-Redis suite previously passed **37/37**, and after the `zScore` edge fix the targeted real chat-history suite passed **4/4** (one new test added; no full rerun claimed). |
 | `POST` | `/api/agents/orchestrator/delegations` | Create a tracked delegation (`{parentChatId, parentMessageId, target, task, mode}`). Signed internal context required (400 without); child depth `parentDepth+1` — 3+ → 403. Sync waits for the run and returns `201 { delegation, childChatId }`; async enqueues on `workforce-delegation` and returns `202 {…, status:'pending'}`. |
 | `GET` | `/api/agents/:slug/delegations?parentChatId&limit` | List a parent chat's delegations, newest first. |
 | `GET` | `/api/agents/:slug/delegations/:delegationId` | Status + result/error + child chat id. |
@@ -544,6 +544,37 @@ npm run typecheck:integration --workspace @workforce/api
   `workforce:chats-changed` after successful delete/branch/rewind (its
   existing sidebar-refresh channel).
 
+## Sidebar chat actions (pre-Phase 6): metadata + export
+
+- `GET /api/agents/:slug/chat/:clientChatId/metadata` — `200 {metadata:
+  {title: string|null, pinned: boolean, archived: boolean}}` (all-default
+  when unset), `Cache-Control: no-store`. Unknown/foreign/legacy-ownerless
+  chats → fixed 404 `Chat not found.`.
+- `PATCH /api/agents/:slug/chat/:clientChatId/metadata` — strict JSON body
+  with AT LEAST one of `{title?: string|null, pinned?: boolean, archived?:
+  boolean}` (unknown keys / wrong types / empty patch → fixed 400; wrong
+  Content-Type → 415). Title trims, empty string or null CLEARS the custom
+  title, max 80 Unicode-safe characters (code points). Unknown chat → fixed
+  404 BEFORE any write. `200 {metadata:{title, pinned, archived}}`; stored
+  as one owner-scoped Redis HASH (`…chat:{owner}:{slug}:{chatId}:metadata`,
+  atomic single HSET, persistent) with exact in-memory parity; survives
+  restart; NEVER consumes hourly request/cost budget.
+- Lifecycle: DELETE removes the metadata hash atomically in the SAME Lua
+  script as the other chat keys (Redis `DEL KEYS[5]`), branch does NOT copy
+  metadata (the destination starts all-default), rewind PRESERVES it, and
+  the model-copy behavior is unchanged.
+- `GET /api/agents/:slug/chat/:clientChatId/export` — `200 text/markdown;
+  charset=utf-8` with `Content-Disposition: attachment; filename="chat-
+  <safe-id>-<date>.md"` and `Cache-Control: no-store`: the COMPLETE stored
+  transcript as Markdown — `### User` / `### Assistant` headings per turn,
+  message ids, ALL visible text verbatim, reasoning under labelled
+  `**Reasoning**` sections, and tool parts with their COMPLETE input/output
+  JSON in fenced `json` blocks (the fence length is derived from the content
+  so payloads can never break the document structure; nothing inside a
+  payload is trimmed). No metadata/usage/model ids/owner identifiers/secrets;
+  no provider calls; no budget consumption. Unknown/foreign chat → fixed 404
+  JSON.
+
 ## Model catalog + per-chat model selection (pre-Phase 6)
 
 The server proxies the Ollama cloud catalog (`ollama.com`) — the API key
@@ -601,6 +632,50 @@ no-store`.
 - Chat lifecycle: branch copies the model, delete removes it, rewind keeps
   it (see the mutations section above).
 
+## Structured logging + request correlation (pre-Phase 6)
+
+- The API logs with **pino** (`pino@10.4.0`, exact runtime dep) as a
+  production-safe structured logger behind the existing SafeLogger
+  allowlist: error logs carry ONLY `{ level, msg:<fixed context>,
+  errorType }` (+`requestId` when in a tracked request) — NEVER error
+  messages/stacks; warn/debug carry fixed context strings. Chat/memory/tool
+  content, provider payloads, keys, urls, cookies, and signed headers never
+  reach a logger argument.
+- **Request correlation**: every request accepts an incoming
+  `x-request-id` ONLY when it matches `1..128` chars of `[A-Za-z0-9._-]`;
+  anything else (missing/malformed/oversized) is replaced with a
+  `randomUUID()`. The SAME id is echoed in the `x-request-id` response
+  header, bound into the request's log context via AsyncLocalStorage (all
+  SafeLogger calls inside the request carry it), and included in the
+  request-completion line (`http-request <method> <route-template>
+  <status> <durationMs> <id>` — bounded route template, no query string).
+  Internal same-REST loopback calls (tool/delegation/scheduler fetches)
+  propagate the CURRENT request's id round-trip. Correlation is
+  observability-only: NEVER trusted for auth/ownership/idempotency.
+- **Levels**: optional `LOG_LEVEL` env, allowlisted
+  (`fatal|error|warn|info|debug|trace`, default `info`); malformed values
+  fail validation with a safe fixed message (value never echoed). 4xx
+  completions log at `warn`, 5xx at `error`, success at `debug`. Blank
+  values normalize to absent (the Compose `${LOG_LEVEL:-}` pass-through
+  yields `info`).
+- **Scheduler job correlation (standalone worker)**: every BullMQ job
+  occurrence gets ONE deterministic request id — `schedulerRequestId(jobId)`
+  = `scheduler-` + 32 sha256-hex chars (same job id → same id; hostile ids
+  hash to the same bounded `[A-Za-z0-9._-]` shape). The worker's
+  `withJobContext` hook binds it via AsyncLocalStorage so the processor, the
+  `scheduler-worker-completed/failed` log lines, AND the run client's
+  outgoing API POSTs (as `x-request-id`) share the same id end-to-end;
+  failed events without a job fall back to the fixed `unknown` id.
+  Observability-only — never auth/ownership. `withRequestLogContext` is
+  generic (return values/promises pass through).
+- **Compose scheduler healthcheck** (no port, no server): PID1 cmdline must
+  contain `apps/api/dist/scheduler-worker.js` AND `/health` must fetch OK
+  from `INTERNAL_API_BASE_URL` (4s AbortSignal budget); any failure exits 1
+  silently — never prints URLs/errors/env.
+- **Runtime verification 2026-11-27** (Docker single-origin production gate, local only, mock providers/dummy secrets): observed behavior matched the bullets above — the deterministic `schedulerRequestId(execution-<executionId>)` is **identical** in the scheduler's completion log and the API's scheduler-run/chat/hydration request logs; safe supplied request IDs are echoed and correlated; `LOG_LEVEL=debug` reached **both** API and scheduler and enabled the 2xx request-completion logs; the Compose scheduler healthcheck behaved as documented (healthy with the API up → unhealthy after retries with the API stopped, without crashing → healthy again on API restart); a full log scan for secret values found **0** hits.
+- Client disconnects mid-stream are logged once and never crash the
+  process. `startupFailureReason` output is unchanged (safe fixed reasons).
+
 ## Live integration suites (opt-in, no Ollama, no API key)
 
 ### 1. Real memory pipeline — `npm run test:integration` (workspace: `apps/api`)
@@ -628,6 +703,15 @@ totals **54 tests / 54 passed** across the suites below, including the newer
   resolutions), and `query_data` over real Postgres (rollback/discard,
   statement timeout, row cap, dangerous-function rejection). Models stay
   mocked — **no real provider anywhere**.
+
+Superseding dated entry (2026-11-27, Phase 6 local production closeout): the
+full root gate passed — `npm run typecheck && npm test &&
+npm run test:integration && npm run build` — with **offline 1095/1095**
+(core 321, queue 51, CLI 30, API 448, web 245, zero fail/skip) and
+**integration 62/62** (zero skip; memory/RLS/budgets/personal-memory/SSE
+resume/WorkDocs/delegation/scheduler retries-DLQ/SIGKILL recovery; a
+memory-suite race fix was **test-only**). The 54/54 entry above stays as its
+dated historical record.
 
 Prerequisites:
 
@@ -719,3 +803,64 @@ durable observations from COMPLETED turns going forward — nothing is imported
 retroactively; up to 3 relevant memories may later surface as untrusted context.
 Values are never echoed to other users, and this endpoint carries no account
 spend/shared-key data.
+
+## Conservative per-user hourly budget (pre-Phase 6)
+
+- **Pricing**: official Ollama rates (verified 2026-11-25) live in
+  `@workforce/core/pricing` — exact ids only (e.g. `deepseek-v4.1-flash:1017`,
+  `deepseek-v4-pro:0813` are the only aliases; `muse-spark` has no
+  `-open` alias; non-chat `clef:27b` and unknown ids stay unpriced).
+  `OLLAMA_MODEL_PRICING_JSON` may override one exact id with `{input,
+  output}`; cached-input rates come ONLY from the official table (never
+  invented). Unpriced models are blocked at model selection AND generation
+  with fixed `400 {"error":"Model is not available."}`; the separate Kimi
+  blocked-prefix policy is unchanged.
+- **Admission**: every top-level chat generation (browser, delegated child,
+  scheduled run → the same postChat handler) reserves
+  request + cost BEFORE provider work in a per-owner advisory-lock
+  transaction. Rolling 60 minutes across all chats: max 10 accepted
+  requests OR a conservative $1.00 (whichever first); the input estimate
+  derives from the actual outgoing content (~1 token per 3 chars,
+  rounded up) and the output cap derives from the remaining budget
+  (bounded). Denial → fixed `429 {"error":"Hourly usage limit reached.",
+  "retryAt":"<ISO>","reason":"requests"|"cost"}` after the duplicate/409
+  idempotency checks (duplicates, resume, branch/rewind/delete and new
+  chats never increment or reset; new chats never reset the window; tool
+  steps inside one generation are part of that turn's event).
+- **Settlement**: at the assistant finish, valid provider usage replaces
+  the reservation with `max(reserved, actual)` as the effective
+  enforcement cost — a cheap actual settle NEVER re-opens reserved
+  dollars (exact token reporting stays separate in the per-model
+  buckets); missing/invalid usage never becomes $0 — the reservation
+  stands until it rolls out of the window (`usageComplete: false`
+  meanwhile). A turn failing BEFORE any provider streaming begins
+  cancels its still-reserved row (idempotent `cancelChatUse`) and
+  releases the idempotency key; a retry then re-admits cleanly.
+  Re-submitting the SAME settle key (chatId + message id) while the
+  original reservation is in-window re-admits IDEMPOTENTLY (no second
+  unsettled row). Compaction contributes DOLLAR usage only (never a
+  request count), attributed through the `UserMemoryScopeLink` bridge;
+  retry deliveries of the SAME logical compaction (scope/path/
+  triggerBlockId) dedupe to one reservation; a denied/unpriced/failed
+  compaction reservation raises the typed fixed
+  `HourlyBudgetDeniedError` (BullMQ retries the job — the provider never
+  runs without a reservation) and the pinned compaction model is
+  asserted explicitly priced at startup. Ledger retention: rolling
+  window only — rows older than 60 minutes are simply ignored (no row
+  deletion/purge implemented; storage grows with usage within the
+  documented retention model). Memory rows older than the window remain
+  in the table (no scheduler/retention process shipped — honest gap). The
+  generation itself throttles its aggregate output to the admitted cap
+  with `prepareStep` (remaining budget ÷ remaining steps).
+- **`GET /api/usage/hourly`** (authenticated, `Cache-Control: no-store`)
+  returns the exact shape `{windowSeconds:3600, requestLimit:10,
+  costLimitUsd:1, requestCount, remainingRequests, estimatedCostUsd,
+  remainingCostUsd, resetAt, usageComplete, models:[{modelId, requests,
+  inputTokens, outputTokens, estimatedCostUsd}]}`; `resetAt` is the next
+  relevant rolling expiry (null with no events). No account-wide or
+  shared-key spend is ever included.
+- **Ledger**: `UserHourlyUsageEvent` (ownerId, kind, status, model,
+  chatId/userMessageId settle key, conservative input/output/est cost,
+  actual usage + settle timestamp, createdAt) plus `UserMemoryScopeLink`
+  (scope → owner). Migration:
+  `packages/core/prisma/migrations/20261126000000_hourly_budget_ledger/`.

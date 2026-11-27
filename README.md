@@ -112,11 +112,13 @@ GITHUB_CLIENT_SECRET=...
 ```
 
 `DATABASE_URL` defaults to
-`postgresql://workforce:workforce@127.0.0.1:55432/workforce`. The local
-compose setup is for development only; do not expose it publicly. Full
+`postgresql://workforce:workforce@127.0.0.1:55432/workforce`. The `dev:infra`
+compose services are for development only; do not expose them publicly. The
+production Docker stack is documented in the next section; the Railway plan
+([ADR-009](docs/decisions/ADR-009-railway-deployment.md), the
+[runbook](docs/deployment/railway.md)) is designed but **not deployed**. Full
 configuration, RLS, and env precedence are documented in
-[`apps/api/README.md`](apps/api/README.md). This project does not ship
-deployment configuration.
+[`apps/api/README.md`](apps/api/README.md).
 
 ## Docker production stack (Phase 6, local)
 
@@ -140,36 +142,41 @@ secret). Migrations NEVER run inside the api/scheduler processes; the
 `packages/core/scripts/prisma-migrate.mjs` wrapper) and the api waits for its
 successful completion.
 
-Local modes (pick ONE coherent pair; switching requires `docker compose up
---build`, see below):
+Local modes (pick ONE coherent pair; only the WEB rewrite is baked — switching
+the web target requires `docker compose up --build`):
 
 - **Direct API (default, no secrets):** web on 3000, API published on 3001;
-  `NEXT_PUBLIC_API_URL=http://localhost:3001`; `BETTER_AUTH_URL=http://localhost:3001`;
-  OAuth callbacks registered on `http://localhost:3001`. The web build's
-  `API_INTERNAL_URL` must then be `http://localhost:3001` at BUILD time:
-  `WORKFORCE_INTERNAL_API_URL=http://localhost:3001 docker compose up --build`
-  (without it, the compose build-arg default is `http://api:3001`, which only
-  matters when traffic flows through the web `/api/*` rewrite).
-- **Single-origin proxy (deployed topology, local):** everything browser-facing
-  uses the public WEB URL (default `http://localhost:3000`):
+  browser-facing URLs
+  `NEXT_PUBLIC_API_URL=http://localhost:3001`, `BETTER_AUTH_URL=http://localhost:3001`,
+  OAuth callbacks registered on `http://localhost:3001`. NO proxy override is
+  needed: the web build's `API_INTERNAL_URL` (compose default
+  `http://api:3001`) is used by the server-side `/api/*` rewrite only, and
+  the client talks to the API directly, so the baked target stays inert.
+  Runtime `WORKFORCE_INTERNAL_API_URL` keeps its default (API loopback,
+  scheduler → `http://api:3001`) — it is a DIFFERENT setting from the web
+  build arg and must NOT point at the web origin inside Compose (the
+  scheduler would call itself).
+- **Single-origin proxy (deployed topology, local):** everything
+  browser-facing uses the public WEB URL (default `http://localhost:3000`):
   `NEXT_PUBLIC_API_URL=http://localhost:3000`, `BETTER_AUTH_URL=http://localhost:3000`,
   callbacks `http://localhost:3000/api/auth/callback/google|github`, and
-  `WORKFORCE_INTERNAL_API_URL=http://api:3001` so the web build bakes
-  `/api/:path* -> http://api:3001/api/:path*`; the API stays private in the
-  deployed topology.
+  `WORKFORCE_WEB_INTERNAL_API_URL=http://api:3001` (the compose default —
+  normally no override needed) so the web build bakes
+  `/api/:path* -> http://api:3001/api/:path*`; the API stays private.
+  Runtime `WORKFORCE_INTERNAL_API_URL` keeps its defaults unchanged.
 
 Facts about the stack:
 
 - Images never bake secrets: every provider/OAuth/auth value arrives at
   runtime from the environment or the optional root `.env`. Changing them
   never triggers a rebuild. The web rewrite authority is the exception in
-  the other direction: `API_INTERNAL_URL` is a build-time arg (resolved by
-  `next.config.ts` into the baked routes manifest) — changing it REQUIRES
-  `docker compose up --build`; runtime values of `WORKFORCE_INTERNAL_API_URL`
-  do not change the baked rewrite (a redundant runtime value is still passed
-  to `api`/`scheduler` as `INTERNAL_API_BASE_URL`, which they read at
-  runtime for their OWN loopback — that is a different setting from the web
-  rewrite).
+  the other direction: the web build arg `API_INTERNAL_URL` comes from
+  `WORKFORCE_WEB_INTERNAL_API_URL` (build-time; resolved by `next.config.ts`
+  into the baked routes manifest) — changing it REQUIRES
+  `docker compose up --build`. Runtime calls use the DISTINCT
+  `WORKFORCE_INTERNAL_API_URL`: API defaults to loopback
+  (`http://127.0.0.1:3001`) and scheduler to `http://api:3001` — two
+  different settings, never bind them to one variable inside Compose.
 - Host ports are loopback-only and env-overridable: `WEB_HOST_PORT`
   (default 3000), `API_HOST_PORT` (default 3001), `REDIS_HOST_PORT`
   (default 6379), `POSTGRES_HOST_PORT` (default 55432). If you move api/web
@@ -198,7 +205,17 @@ asset 200, scheduler starts on the minimal env (verified key list only) and
 runs both processes as uid 1000; SIGTERM stop exits 0 for api/web/scheduler;
 clean teardown removed only the isolated project's resources. Details and
 honest gaps in [`docs/phases/phase-6-deploy.md`](docs/phases/phase-6-deploy.md).
-Phase 6 remains active and not validated; no Railway deploy exists.
+
+Runtime single-origin validation 2026-11-27 (isolated mock stack — local mock
+OpenAI/Ollama, dummy secrets, no real provider/OAuth): same-origin chat
+streams through the baked `/api/:path*` rewrite with idempotent 409 and full
+same-process replay; SSR chat hydration works in the standalone runtime
+(runtime `API_INTERNAL_URL`); the scheduler container completes a MANUAL run
+with deterministic request-id correlation across scheduler and API logs; the
+scheduler healthcheck goes unhealthy when the API stops and recovers on
+restart; graceful stop/restart preserves transcripts, tasks, executions,
+users and sessions. Phase 6 remains active and not validated; no Railway
+deploy exists.
 
 ## Useful commands
 
@@ -256,10 +273,14 @@ docs/decisions/               ADR-001..008 (composition gating, same-REST
 
 ## Status
 
-The local stack and all features above are implemented and covered by the
-offline (1,071 tests) and integration test suites. Phase 6 — production
-packaging (Docker/Compose), structured logging, observability, and a hosted
-deployment target — is active but nothing in it is built or claimed yet.
-Nothing in this repository is deployed or hardened for the public internet.
+The local stack and all features above are implemented and locally validated:
+the Phase 6 production stack (Docker/Compose, one public web origin with the
+API kept private, migrations as a release step, a separate scheduler
+container) passed its local gate on 2026-11-27 — root typecheck +
+**1,095 offline tests** + **62/62 real-integration tests** + full production
+build, with mock providers and no real OAuth. Nothing is deployed: a Railway
+deployment is planned (ADR-009, runbook) but the public URL, real
+Google/GitHub OAuth return, real Ollama traffic, and cross-process replay are
+deliberately deferred — Phase 6 is active and **not validated**.
 Cost figures are estimates derived only from explicitly configured rates; the
 product never fabricates pricing.

@@ -98,6 +98,15 @@ export function isValidSchedulerQueueId(value: unknown): value is string {
 }
 
 /**
+ * Optional per-job correlation hook (observability only, NEVER auth): wraps
+ * ONE job's lifetime — the processor and its completed/failed event logging —
+ * in a per-job async context keyed by the stringified BullMQ job id. Generic
+ * over the callback's return type so async processors/`void` logging both
+ * keep their context (AsyncLocalStorage propagation across awaits).
+ */
+export type SchedulerJobContextHook = <T>(jobId: string, next: () => T) => T;
+
+/**
  * Whether `value` is an unambiguous ISO 8601 UTC instant string
  * (`YYYY-MM-DDTHH:MM:SS[.frac]Z`). A plain `Date` parse alone would accept
  * local-time and vendor formats; the domain boundary is 'Z' only.

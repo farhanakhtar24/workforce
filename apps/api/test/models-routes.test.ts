@@ -15,6 +15,7 @@ import type { ModelCatalogLike } from '../src/models/catalog.js';
 import { pricingForModelId } from '../src/models/routes.js';
 
 const DEFAULT_MODEL = 'glm-5.3-flash';
+const DEFAULT_MODEL_2 = 'gpt-oss:20b';
 
 interface FakeModelRow {
   readonly id: string;
@@ -52,7 +53,7 @@ export function fakeCatalog(
 
 export function catalogAppOptions(
   catalog: ModelCatalogLike,
-  options: { model?: LanguageModel } = {},
+  options: { model?: LanguageModel; modelPricingJson?: string } = {},
 ): TestAppOptions {
   return {
     model: options.model ?? createMockModel({ steps: [textStep()] }),
@@ -61,6 +62,7 @@ export function catalogAppOptions(
       modelFor: () => options.model ?? createMockModel({ steps: [textStep()] }),
       defaultModelId: DEFAULT_MODEL,
     },
+    ...(options.modelPricingJson !== undefined ? { modelPricingJson: options.modelPricingJson } : {}),
   };
 }
 
@@ -120,7 +122,7 @@ test('model details: unknown id pattern fixed 400; miss 404; hit bounded shape (
     capabilities: ['completion'],
     parameterSize: '5.3B',
     thinking: true,
-    pricing: null,
+    pricing: { inputUsdPerMillion: 0.15, outputUsdPerMillion: 0.5, cachedInputUsdPerMillion: 0.03 },
   });
   const miss = await getJson({ port: app.port, path: '/api/models/gpt-oss:20b/details' });
   assert.equal(miss.status, 404);
@@ -151,7 +153,7 @@ test('model details: unknown id pattern fixed 400; miss 404; hit bounded shape (
     capabilities: ['completion'],
     parameterSize: '5.3B',
     thinking: true,
-    pricing: { inputUsdPerMillion: 1.5, outputUsdPerMillion: 2.25 },
+    pricing: { inputUsdPerMillion: 1.5, outputUsdPerMillion: 2.25, cachedInputUsdPerMillion: null },
   });
   // Raw config JSON and account-spend fields stay out of every response.
   assert.equal(JSON.stringify(priced.body).includes('"input"'), false);
@@ -171,16 +173,19 @@ test('model details pricing: partial coverage and unpriced models stay null; a l
     catalogAppOptions(detailsCatalog, { modelPricingJson: JSON.stringify({ 'gpt-oss:20b': { input: 1, output: 2 } }) }),
   );
   try {
-    const unpriced = await getJson({ port: partialApp.port, path: '/api/models/glm-5.3-flash/details' });
-    assert.equal(unpriced.status, 200);
-    assert.deepEqual((unpriced.body as { pricing: unknown }).pricing, null, 'an unpriced model never invents rates');
+    const pricedDefault = await getJson({ port: partialApp.port, path: '/api/models/glm-5.3-flash/details' });
+    assert.equal(pricedDefault.status, 200);
+    // DEFAULT_MODEL keeps its OFFICIAL default rates (override covers only
+    // the OTHER id) — an unpriced id (e.g. inkling-2-small) would 404 here
+    // before pricing: the fake catalog misses, so pricing is never shown.
+    assert.deepEqual((pricedDefault.body as { pricing: unknown }).pricing, {
+      inputUsdPerMillion: 0.15,
+      outputUsdPerMillion: 0.5,
+      cachedInputUsdPerMillion: 0.03,
+    });
     // The priced OTHER model surfaces its own rates.
     const other = await getJson({ port: partialApp.port, path: '/api/models/gpt-oss:20b/details' });
-    if (other.status === 200) {
-      assert.deepEqual((other.body as { pricing: unknown }).pricing, { inputUsdPerMillion: 1, outputUsdPerMillion: 2 });
-    } else {
-      assert.equal(other.status, 404, 'fake catalog miss stays a fixed 404');
-    }
+    assert.equal(other.status, 404, 'fake catalog miss stays a fixed 404');
   } finally {
     await partialApp.close();
   }
@@ -192,7 +197,14 @@ test('model details pricing: partial coverage and unpriced models stay null; a l
   try {
     const zero = await getJson({ port: zeroApp.port, path: '/api/models/glm-5.3-flash/details' });
     assert.equal(zero.status, 200);
-    assert.deepEqual((zero.body as { pricing: unknown }).pricing, { inputUsdPerMillion: 0, outputUsdPerMillion: 0 });
+    // The explicit override (0,0) REPLACES the defaults; cached input is an
+    // override context — never invented (stays null even though the default
+    // table lists .03 for this id).
+    assert.deepEqual((zero.body as { pricing: unknown }).pricing, {
+      inputUsdPerMillion: 0,
+      outputUsdPerMillion: 0,
+      cachedInputUsdPerMillion: null,
+    });
     // No secret/account fields anywhere.
     assert.equal(JSON.stringify(zero.body).includes('apiKey'), false);
   } finally {
@@ -200,17 +212,30 @@ test('model details pricing: partial coverage and unpriced models stay null; a l
   }
 });
 
-test('details pricing helper unit: unconfigured/partial/invalid → null; exact rates → picker shape', () => {
-  assert.equal(pricingForModelId(null, DEFAULT_MODEL), null);
-  assert.deepEqual(pricingForModelId({ [DEFAULT_MODEL]: { input: 3, output: 4 } }, DEFAULT_MODEL), {
+test('details pricing helper unit: unpriced → null; picker shape with cached only when known', () => {
+  const unpriced = (): null => null;
+  assert.equal(pricingForModelId(unpriced, DEFAULT_MODEL), null);
+  const overrideRates = (modelId: string): { input: number; cachedInput: number | null; output: number } | null =>
+    modelId === DEFAULT_MODEL ? { input: 3, cachedInput: null, output: 4 } : null;
+  assert.deepEqual(pricingForModelId(overrideRates, DEFAULT_MODEL), {
     inputUsdPerMillion: 3,
     outputUsdPerMillion: 4,
+    cachedInputUsdPerMillion: null,
   });
-  assert.equal(pricingForModelId({}, DEFAULT_MODEL), null, 'absent entry → null');
-  assert.equal(pricingForModelId({ [DEFAULT_MODEL]: { input: 0, output: 0 } }, DEFAULT_MODEL), {
+  assert.equal(pricingForModelId(unpriced, DEFAULT_MODEL_2), null, 'absent entry → null');
+  assert.deepEqual(pricingForModelId((modelId) => (modelId === DEFAULT_MODEL_2 ? { input: 0, cachedInput: 0, output: 0 } : null), DEFAULT_MODEL_2), {
     inputUsdPerMillion: 0,
     outputUsdPerMillion: 0,
-  } as never, 'a zero rate is legitimate, not null');
-  assert.equal(pricingForModelId({ [DEFAULT_MODEL]: { input: -1, output: 2 } as never }, DEFAULT_MODEL), null, 'invalid (negative) → null');
-  assert.equal(pricingForModelId({ [DEFAULT_MODEL]: { input: Number.POSITIVE_INFINITY, output: 2 } as never }, DEFAULT_MODEL), null, 'invalid (non-finite) → null');
+    cachedInputUsdPerMillion: 0,
+  }, 'a zero rate (even cached 0) is legitimate, not null');
+  assert.equal(
+    pricingForModelId((modelId) => (modelId === DEFAULT_MODEL ? { input: -1, cachedInput: 0, output: 2 } : null), DEFAULT_MODEL),
+    null,
+    'invalid (negative) → null',
+  );
+  assert.equal(
+    pricingForModelId((modelId) => (modelId === DEFAULT_MODEL ? { input: Number.POSITIVE_INFINITY, cachedInput: 0, output: 2 } : null), DEFAULT_MODEL),
+    null,
+    'invalid (non-finite) → null',
+  );
 });

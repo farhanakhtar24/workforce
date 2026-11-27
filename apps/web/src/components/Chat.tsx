@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { GitBranch, Loader2, Send, Sparkles, Undo2, WifiOff } from 'lucide-react';
+import { GitBranch, Info, Loader2, Send, Sparkles, Undo2, WifiOff } from 'lucide-react';
 import {
   buildReconnectRequest,
   buildSendRequest,
@@ -17,6 +17,8 @@ import {
   AGENT_GUIDANCE,
   WEB_AGENT_SLUGS,
   WEB_AGENT_MODES,
+  isAgentMode,
+  modeReplaceHistoryState,
   buildChatUrl,
   buildNewChatUrl,
   modeGuidance,
@@ -55,6 +57,8 @@ import { createSubmissionGate } from '@/lib/submitgate';
 import { AgentAvatar } from '@/components/AgentAvatar';
 import { WorkspaceGate } from '@/components/WorkspaceShell';
 import { MarkdownText } from '@/components/MarkdownText';
+import { ModelPicker } from '@/components/ModelPicker';
+import { SessionRail } from '@/components/SessionRail';
 import { agentLabel, chatSuggestions } from '@/lib/workspace';
 import {
   LONG_WAIT_TEXT,
@@ -67,12 +71,11 @@ import {
   progressLabel,
 } from '@/lib/chat-progress';
 import { CHATS_CHANGED_EVENT } from '@/lib/recent-chats';
+import { railUsageLatest } from '@/lib/session-rail';
 import {
   fetchChatModel,
   fetchModelCatalog,
   fetchModelDetails,
-  formatModelDetailLines,
-  MODEL_CATALOG_UNAVAILABLE,
   MODEL_SELECTION_ERROR,
   MODEL_FIELD_UNKNOWN,
   putChatModel,
@@ -82,9 +85,6 @@ import {
 } from '@/lib/models';
 import {
   fetchChatUsage,
-  formatUsageBucket,
-  formatUsageCost,
-  formatUsageTotals,
   usageFromMetadata,
   type UsageSummary,
 } from '@/lib/chat-usage';
@@ -102,7 +102,6 @@ import {
 } from '@/lib/chat-mutations';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
-import { NativeSelect } from '@/components/ui/native-select';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
 import type {
@@ -120,7 +119,7 @@ export interface ChatProps {
   chatId: string;
   /** Selected agent slug (server-validated; `general` for old URLs). */
   agent: WebAgentSlug;
-  /** Selected mode (server-validated; `action` for old URLs). */
+  /** Initial mode (server-validated from the URL); Plan is the default. */
   mode: WebAgentMode;
   /** Server-hydrated UIMessages (empty on hydration failure). */
   initialMessages: WorkforceUIMessage[];
@@ -151,7 +150,23 @@ export function Chat({
 }: ChatProps): React.ReactElement {
   const apiBaseUrl = resolveApiBaseUrl(process.env.NEXT_PUBLIC_API_URL);
   const router = useRouter();
-  const selection: AgentSelection = { agent, mode };
+  // Mode is client-in-place state (Farhan flicker fix): the page passes the
+  // initial value; switching Plan/Action updates state + shallow URL without
+  // remounting. Agent switches remain real navigation (keyed by slug+chatId).
+  const [activeMode, setActiveMode] = useState<WebAgentMode>(mode);
+  const activeModeRef = useRef<WebAgentMode>(activeMode);
+  useEffect(() => {
+    activeModeRef.current = activeMode;
+  }, [activeMode]);
+  // Genuine navigation (agent switch / deep link) supplies a new initial
+  // mode; adopt it. In-place switches keep state untouched.
+  useEffect(() => {
+    if (mode !== activeModeRef.current && isAgentMode(mode)) {
+      setActiveMode(mode);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+  const selection: AgentSelection = { agent, mode: activeMode };
 
   const transport = useMemo(
     () =>
@@ -169,7 +184,9 @@ export function Chat({
             chatId: id,
             messages,
             slug: agent,
-            mode,
+            // In-place mode state read at send time; the transport stays
+            // stable so useChat never resets across Plan/Action switches.
+            mode: activeModeRef.current,
           });
           return { api: prepared.url, body: prepared.body, headers: prepared.headers };
         },
@@ -181,7 +198,10 @@ export function Chat({
           return { api: prepared.url };
         },
       }),
-    [apiBaseUrl, agent, mode],
+    // Note: `mode` is intentionally NOT a dependency — the prepared request
+    // body reads the in-place ref, so switching mode never recreates the
+    // transport (which would reset useChat state).
+    [apiBaseUrl, agent],
   );
 
   const { messages, sendMessage, setMessages, status, error, clearError } = useChat({
@@ -298,8 +318,31 @@ export function Chat({
     });
   };
 
+  /**
+   * Agent selection is a navigation (server re-hydrates the (slug, chatId)
+   * transcript); the current IN-PLACE mode rides along so the URL stays
+   * canonical. Mode selection is handled separately by setModeInPlace, never
+   * by navigation.
+   */
   const navigateTo = (next: AgentSelection): void => {
-    router.push(buildChatUrl(chatId, next));
+    if (next.agent === agent) {
+      setModeInPlace(next.mode);
+      return;
+    }
+    router.push(buildChatUrl(chatId, { agent: next.agent, mode: activeModeRef.current }));
+  };
+
+  /**
+   * In-place Plan/Action switch: update state, then a shallow URL
+   * replacement that carries the Next.js router state (no RSC fetch, no
+   * Chat remount — draft, messages and scroll survive).
+   */
+  const setModeInPlace = (next: WebAgentMode): void => {
+    if (next === activeMode) return;
+    setActiveMode(next);
+    const url = buildChatUrl(chatId, { agent, mode: next });
+    if (typeof window === 'undefined') return;
+    window.history.replaceState(modeReplaceHistoryState(window.history.state, url), '', url);
   };
 
   const statusText =
@@ -368,6 +411,7 @@ export function Chat({
   }, [busy, status, messages]);
   const stageLine =
     busy && progress !== null ? progressLabel(progress) : statusText;
+
 
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
@@ -462,7 +506,7 @@ export function Chat({
           notifyChatsChanged();
           // Canonical same-agent/same-mode destination; client-side
           // navigation mounts a fresh useChat there (new transcript).
-          void router.push(branchDestinationHref(result.destinationChatId, agent, mode));
+          void router.push(branchDestinationHref(result.destinationChatId, agent, activeMode));
           return;
         }
         // Fixed mutation error surfaced through the existing chat error chip.
@@ -471,7 +515,7 @@ export function Chat({
         setMutating(false);
       }
     },
-    [mutationsAllowed, mutating, messages, apiBaseUrl, agent, chatId, mode, router],
+    [mutationsAllowed, mutating, messages, apiBaseUrl, agent, chatId, activeMode, router],
   );
 
   const confirmRewind = useCallback(async (): Promise<void> => {
@@ -509,12 +553,18 @@ export function Chat({
   }, [rewindTarget, mutating, messages, apiBaseUrl, agent, chatId]);
 
   const [mutationError, setMutationError] = useState<string | null>(null);
+  // Right session-context rail: static column on lg+ screens; labelled toggle
+  // opens it as an overlay drawer below that.
+  const [railOpen, setRailOpen] = useState(false);
+  // Desktop rail (lg+): user-collapsible; default expanded.
+  const [railCollapsed, setRailCollapsed] = useState(false);
 
   /* ------------------------------------------------------------------ */
   /* Model catalog + per-chat model selection                            */
   /* ------------------------------------------------------------------ */
 
   const [catalog, setCatalog] = useState<ModelCatalogResult | null>(null);
+  const [modelsDefaultId, setModelsDefaultId] = useState<string | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const currentModelRef = useRef(0);
   const [currentModel, setCurrentModel] = useState<string | null>(null);
@@ -531,6 +581,7 @@ export function Chat({
     if (seq !== currentModelRef.current) return;
     setCatalogLoading(false);
     setCatalog(result.ok ? result : { ok: false, error: result.error, status: result.status });
+    setModelsDefaultId(result.ok ? result.defaultModelId : null);
   }, [apiBaseUrl]);
 
   const loadCurrentModel = useCallback(async (): Promise<void> => {
@@ -600,19 +651,17 @@ export function Chat({
   );
 
   const activeDetails = detailModelId !== null ? (detailsCacheRef.current.get(detailModelId) ?? null) : null;
+
+  // Prefetch details for the CURRENT model so the rail context % is real.
+  useEffect(() => {
+    if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
+  }, [currentModel, ensureModelDetails]);
   const activeModelInfo: ModelInfo | null =
     detailModelId !== null
       ? (catalog?.ok
           ? (catalog.models.find((m) => m.id === detailModelId) ?? null)
           : null)
       : null;
-  const detailLines = formatModelDetailLines({
-    modelId: detailModelId ?? '',
-    details: activeDetails,
-    locked: activeModelInfo?.locked,
-    lockReason: activeModelInfo?.lockReason ?? null,
-    modifiedAt: activeModelInfo?.modifiedAt ?? null,
-  });
 
   /* ------------------------------------------------------------------ */
   /* Session usage (exact totals, honest cost)                           */
@@ -623,13 +672,30 @@ export function Chat({
   const rewindPreview = rewindTargetMessage !== undefined ? messagePreviewText(rewindTargetMessage.parts) : '';
 
 
+
+  // Quiet header model label (default or selected id; honest when absent).
+  const currentModelLabel =
+    currentModel !== null
+      ? currentModel
+      : catalog?.ok === true && modelsDefaultId !== null
+        ? modelsDefaultId
+        : null;
+  // Details for the rail/context card: the rail's context metric must use
+  // the LATEST ASSISTANT'S ACTUAL model, never the selected next-turn model.
+  const railUsageMeta = railUsageLatest(messages);
+  const railModelId = railUsageMeta?.modelId ?? null;
+  const railDetails =
+    railModelId !== null ? (detailsCacheRef.current.get(railModelId) ?? null) : null;
+  useEffect(() => {
+    if (railModelId !== null) ensureModelDetails(railModelId);
+  }, [railModelId, ensureModelDetails]);
   // THE single composer instance (ids/aria/handlers unchanged): rendered
   // centered inside the greeting block on an empty transcript, and pinned in
   // the bottom dock once the chat is populated. Exactly one of the two is
   // mounted at any time — never two forms.
   const composerForm = (
     <form
-      className="flex flex-col gap-2"
+      className="rounded-2xl border border-input bg-card shadow-xs"
       onSubmit={(event) => {
         event.preventDefault();
         submit();
@@ -653,7 +719,7 @@ export function Chat({
           }
         }}
         rows={3}
-        className="min-h-20 rounded-xl md:min-h-24"
+        className="min-h-20 rounded-2xl rounded-bl-none rounded-br-none border-x-0 border-t-0 border-b bg-transparent px-3.5 py-3 focus-visible:border-b focus-visible:border-input md:min-h-24"
         placeholder={
           pendingAsk !== null
             ? "Answer the agent's question in the form above."
@@ -661,8 +727,74 @@ export function Chat({
         }
         disabled={busy || pendingAsk !== null}
       />
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="m-0 text-[0.75rem] text-muted-foreground">
+      {/* Composer control row (Farhan): model picker + agent + Plan/Action.
+          Same navigation/PUT semantics as before — moving only changed homes. */}
+      <div className="flex flex-wrap items-center gap-1.5 px-2 pt-2">
+        <ModelPicker
+          models={catalog?.ok ? catalog.models : []}
+          catalogError={catalogLoading ? null : catalog?.ok === false ? catalog.error : null}
+          loading={catalogLoading}
+          value={currentModel}
+          disabled={busy || pendingAsk !== null || modelSaving}
+          saving={modelSaving}
+          detailsLoading={detailsLoading}
+          ensureDetails={ensureModelDetails}
+          getDetails={(id) => detailsCacheRef.current.get(id) ?? null}
+          onSelect={(id) => void applyModel(id)}
+        />
+        <AgentAvatar agent={agent} size={22} />
+        <select
+          id="chat-agent"
+          name="chat-agent"
+          aria-label="Agent"
+          title="Agent"
+          value={agent}
+          disabled={busy || pendingAsk !== null}
+          onChange={(event) => {
+            const next = event.target.value;
+            if (next !== agent && (WEB_AGENT_SLUGS as readonly string[]).includes(next)) {
+              navigateTo({ agent: next as WebAgentSlug, mode: activeMode });
+            }
+          }}
+          className="h-8 max-w-[10rem] rounded-md border border-input bg-transparent px-2 text-[0.82rem] text-foreground outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {WEB_AGENT_SLUGS.map((slug) => (
+            <option key={slug} value={slug}>
+              {agentLabel(slug)}
+            </option>
+          ))}
+        </select>
+        <fieldset className="m-0 inline-flex items-center rounded-full border border-input bg-muted p-0.5">
+          <legend className="sr-only">Mode for the next reply</legend>
+          <div className="inline-flex gap-0.5">
+            {WEB_AGENT_MODES.map((candidate) => (
+              <span key={candidate} className="inline-flex">
+                <input
+                  type="radio"
+                  id={`chat-mode-${candidate}`}
+                  name="chat-mode"
+                  value={candidate}
+                  className="peer sr-only"
+                  aria-label={`Mode ${modeLabel(candidate)}`}
+                  checked={activeMode === candidate}
+                  onChange={() => {
+                    if (activeMode !== candidate) setModeInPlace(candidate);
+                  }}
+                />
+                <label
+                  htmlFor={`chat-mode-${candidate}`}
+                  className="cursor-pointer rounded-full px-3 py-0.5 text-[0.8rem] font-medium text-muted-foreground transition-colors peer-checked:bg-background peer-checked:font-semibold peer-checked:text-foreground peer-checked:shadow-xs peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
+                >
+                  {modeLabel(candidate)}
+                </label>
+              </span>
+            ))}
+          </div>
+        </fieldset>
+        <span className="ml-auto" aria-hidden="true" />
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-1.5 border-t border-border px-2 py-1.5">
+        <p className="m-0 pl-1 text-[0.7rem] text-muted-foreground">
           Enter to send · Shift+Enter for a new line
         </p>
         <Button type="submit" size="sm" disabled={!canSend}>
@@ -690,6 +822,14 @@ export function Chat({
       // the nav carries this chat id + agent so scoped filtering survives.
       contextQuery={`chatId=${encodeURIComponent(chatId)}&agent=${agent}`}
     >
+      {/* Three-column workspace: left shell rail (outside), flexible center
+          transcript/composer, right Session context rail (lg+ static, below
+          lg a labelled-toggle overlay drawer). Center keeps transcript-only
+          scrolling with the pinned composer. */}
+      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="mx-auto flex min-h-0 w-full max-w-[52.8rem] flex-1 flex-col px-4 pb-3 md:px-4">
+
       {hydrationError !== undefined && (
         <div
           role="status"
@@ -702,201 +842,45 @@ export function Chat({
         </div>
       )}
 
-      <section aria-label="Agent and mode" className="mb-1 flex shrink-0 flex-wrap items-center gap-2">
-        <div className="inline-flex min-w-0 items-center gap-2">
-          <AgentAvatar agent={agent} size={22} />
-          <NativeSelect
-            id="chat-agent"
-            name="chat-agent"
-            size="sm"
-            className="w-auto max-w-52 rounded-full"
-            aria-label="Agent"
-            value={agent}
-            onChange={(event) => {
-              const next = event.target.value;
-              if (next !== agent && (WEB_AGENT_SLUGS as readonly string[]).includes(next)) {
-                navigateTo({ agent: next as WebAgentSlug, mode });
-              }
-            }}
-          >
-            {WEB_AGENT_SLUGS.map((slug) => (
-              <option key={slug} value={slug}>
-                {agentLabel(slug)}
-              </option>
-            ))}
-          </NativeSelect>
-        </div>
-        <fieldset className="m-0 inline-flex items-center rounded-full border border-input bg-muted p-0.5">
-          <legend className="sr-only">Mode for the next reply</legend>
-          <div className="inline-flex gap-0.5">
-            {WEB_AGENT_MODES.map((candidate) => (
-              <span key={candidate} className="inline-flex">
-                <input
-                  type="radio"
-                  id={`chat-mode-${candidate}`}
-                  name="chat-mode"
-                  value={candidate}
-                  className="peer sr-only"
-                  aria-label={`Mode ${modeLabel(candidate)}`}
-                  checked={mode === candidate}
-                  onChange={() => {
-                    if (mode !== candidate) navigateTo({ agent, mode: candidate });
-                  }}
-                />
-                <label
-                  htmlFor={`chat-mode-${candidate}`}
-                  className="cursor-pointer rounded-full px-3 py-0.5 text-[0.8rem] font-medium text-muted-foreground transition-colors peer-checked:bg-background peer-checked:font-semibold peer-checked:text-foreground peer-checked:shadow-xs peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
-                >
-                  {modeLabel(candidate)}
-                </label>
-              </span>
-            ))}
-          </div>
-        </fieldset>
-        {/* Compact, accessible model picker (per-chat model; applies to the
-            NEXT generation only — running streams keep their started model).
-            Disabled while busy/HITL/saving; locked catalog rows are disabled
-            with the server's value-free lock reason on the row. */}
-        <div className="inline-flex min-w-0 items-center gap-1.5">
-          <NativeSelect
-            id="chat-model"
-            name="chat-model"
-            size="sm"
-            className="w-auto max-w-56 rounded-full"
-            aria-label="Model for the next reply"
-            title="Model for the next reply"
-            value={catalog?.ok && currentModel !== null && catalog.models.some((m) => m.id === currentModel) ? currentModel : (currentModel ?? '')}
-            disabled={busy || pendingAsk !== null || modelSaving || !catalog?.ok}
-            onMouseEnter={() => {
-              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
-            }}
-            onFocus={() => {
-              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
-            }}
-            onChange={(event) => {
-              const next = event.target.value;
-              if (next !== '' && next !== currentModel) void applyModel(next);
-            }}
-          >
-            {!catalog?.ok && catalogLoading === false && !modelSaving ? (
-              <option value="">{catalog?.ok === false ? catalog.error : ''}</option>
-            ) : catalogLoading ? (
-              <option value="">Loading models…</option>
-            ) : (
-              <>
-                <option value="" disabled>
-                  Model for the next reply…
-                </option>
-                {catalog?.ok &&
-                  catalog.models.map((model) => (
-                    <option
-                      key={model.id}
-                      value={model.id}
-                      disabled={model.locked}
-                      title={model.locked ? model.lockReason ?? undefined : undefined}
-                    >
-                      {model.name}
-                      {model.locked ? ' (locked)' : ''}
-                    </option>
-                  ))}
-              </>
-            )}
-          </NativeSelect>
-          {modelSaving && <span className="text-[0.7rem] text-muted-foreground">Saving…</span>}
-        </div>
-        <details
-          className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground"
-          onToggle={(event) => {
-            const open = (event.currentTarget as HTMLDetailsElement).open;
-            if (open && currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
-          }}
+      {/* Quiet center header: identity + right-pane toggle only. All
+          composer controls (agent/plan/action/model) live in the control row
+          of the single composer; session context lives in the right rail. */}
+      <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
+        <p
+          aria-live="polite"
+          className="m-0 min-w-0 truncate text-xs text-muted-foreground"
         >
-          <summary
-            className="cursor-pointer list-none font-medium whitespace-nowrap"
-            onMouseEnter={() => {
-              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
-            }}
-            onFocus={() => {
-              if (currentModel !== null && currentModel !== '') ensureModelDetails(currentModel);
-            }}
-          >
-            Model details
-          </summary>
-          <div className="mt-2 min-w-[20rem] max-w-[24rem] border-t pt-2 text-left text-[0.8rem]">
-            {detailsLoading && <p className="m-0">Loading model details…</p>}
-            {!detailsLoading && (
-              <>
-                <p className="m-0 mb-1 font-medium text-foreground">{detailModelId ?? ''}</p>
-                {activeModelInfo?.locked === true && (
-                  <p className="m-0 mb-1 text-xs text-destructive">{detailLines.lockReason ?? ''}</p>
-                )}
-                <ul className="m-0 list-none p-0" aria-label="Model details">
-                  <li className="m-0 py-0.5">{detailLines.parameterSize}</li>
-                  <li className="m-0 py-0.5">{detailLines.contextLength}</li>
-                  <li className="m-0 py-0.5">{detailLines.capabilities}</li>
-                  {detailLines.modifiedAt !== null && (
-                    <li className="m-0 py-0.5">Modified: {detailLines.modifiedAt}</li>
-                  )}
-                  {detailLines.thinkingText !== null && <li className="m-0 py-0.5">{detailLines.thinkingText}</li>}
-                </ul>
-                <p className="m-0 pb-1">{MODEL_FIELD_UNKNOWN} means the model does not report that statistic.</p>
-              </>
-            )}
-          </div>
-        </details>
-        <details
-          className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground"
-          onToggle={(event) => {
-            const open = (event.currentTarget as HTMLDetailsElement).open;
-            if (open) void loadUsage();
-          }}
+          {agentLabel(agent)} · {activeMode === 'plan' ? 'Plan mode' : 'Action mode'} · {currentModelLabel ?? 'Model: not selected'}
+        </p>
+        {/* Two responsive siblings in the same slot: desktop controls the
+            collapsible rail (railCollapsed), small screens control the
+            drawer (railOpen). Only one renders at any breakpoint, so no
+            duplicate button is visible. */}
+        <button
+          type="button"
+          className="hidden size-7 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground transition-colors hover:bg-accent hover:text-foreground lg:inline-flex"
+          aria-label={railCollapsed ? 'Show session context panel' : 'Hide session context panel'}
+          aria-expanded={railCollapsed ? 'false' : 'true'}
+          aria-controls="ws-session-rail-desktop"
+          title={railCollapsed ? 'Show session context panel' : 'Hide session context panel'}
+          onClick={() => setRailCollapsed((v) => !v)}
         >
-          <summary className="cursor-pointer list-none font-medium whitespace-nowrap">Session usage</summary>
-          <div className="mt-2 min-w-[20rem] max-w-[24rem] border-t pt-2 text-left text-[0.8rem]">
-            {usage !== null ? (
-              <>
-                <p className="m-0 py-0.5" aria-label="Exact token totals">
-                  {formatUsageTotals(usage)}
-                </p>
-                {usage.models.length > 0 && (
-                  <ul className="m-0 list-none p-0">
-                    {usage.models.map((bucket) => (
-                      <li key={bucket.modelId} className="m-0 py-0.5">
-                        {formatUsageBucket(bucket)}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <p className="m-0 py-0.5">
-                  {(() => {
-                    const cost = formatUsageCost(usage);
-                    if (cost.kind === 'estimated') return cost.value;
-                    return cost.text;
-                  })()}
-                </p>
-              </>
-            ) : (
-              <p role="status" aria-live="polite" className="m-0 py-0.5">
-                {usageError !== null ? `${usageError} Retry by reopening.` : 'Loading usage…'}
-              </p>
-            )}
-          </div>
-        </details>
-        <details className="rounded-lg border bg-card px-2.5 py-1 text-[0.82rem] text-muted-foreground">
-          <summary className="cursor-pointer list-none font-medium whitespace-nowrap">
-            What {agentLabel(agent)} can do
-          </summary>
-          <p className="mt-2 max-w-[60ch] border-t pt-2">{AGENT_GUIDANCE[agent]}</p>
-          <p className="max-w-[60ch] pb-1">{modeGuidance(selection)}</p>
-        </details>
-      </section>
-
-      <p
-        aria-live="polite"
-        className="m-0 min-h-5 shrink-0 text-xs text-muted-foreground"
-      >
-        agent {agent} · {mode === 'plan' ? 'Plan mode' : 'Action mode'}
-      </p>
+          <Info size={14} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground transition-colors hover:bg-accent hover:text-foreground lg:hidden"
+          aria-label={
+            railOpen ? 'Close session context panel' : 'Show session context panel'
+          }
+          aria-expanded={railOpen ? 'true' : 'false'}
+          aria-controls="ws-session-rail-drawer"
+          title={railOpen ? 'Close session context panel' : 'Show session context panel'}
+          onClick={() => setRailOpen((v) => !v)}
+        >
+          <Info size={14} aria-hidden="true" />
+        </button>
+      </div>
 
       {resumeNotice && (
         <p
@@ -1261,6 +1245,95 @@ export function Chat({
           </>
         )}
       </dialog>
+        </div>
+        </div>
+        {/* Static right rail on lg+ (user-collapsible; desktop default
+            visible, controlled by the labelled header button). */}
+        {!railCollapsed ? (
+          <div
+            id="ws-session-rail-desktop"
+            aria-label="Session context"
+            className="hidden min-h-0 w-[330px] shrink-0 flex-col overflow-y-auto overscroll-contain lg:flex"
+          >
+            <SessionRail
+              apiBaseUrl={apiBaseUrl}
+              slug={agent}
+              chatId={chatId}
+              mode={activeMode}
+              catalog={catalog}
+              currentModel={currentModel}
+              details={railDetails}
+              usage={usage}
+              usageError={usageError}
+              onReloadUsage={() => void loadUsage()}
+              messages={messages}
+            />
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="hidden lg:inline-flex h-full w-9 shrink-0 flex-col items-center justify-center gap-2 border-l border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            aria-label="Show session context panel"
+            aria-expanded="false"
+            aria-controls="ws-session-rail-desktop"
+            title="Show session context panel"
+            onClick={() => setRailCollapsed(false)}
+          >
+            <Info size={15} aria-hidden="true" />
+            <span
+              className="text-[0.65rem] font-medium tracking-[0.06em] uppercase"
+              style={{ writingMode: 'vertical-rl' }}
+            >
+              Session
+            </span>
+          </button>
+        )}
+        {/* Drawer on <lg (labelled toggle in the center header). */}
+        {railOpen && (
+          <div
+            className="fixed inset-0 z-40 lg:hidden"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Session context"
+          >
+            <button
+              type="button"
+              className="absolute inset-0 h-full w-full cursor-default bg-black/40"
+              aria-label="Close session context panel"
+              onClick={() => setRailOpen(false)}
+            />
+            <div
+              id="ws-session-rail-drawer"
+              tabIndex={-1}
+              className="absolute inset-y-0 right-0 flex w-[21rem] max-w-[92vw] flex-col bg-background shadow-md outline-none"
+            >
+              <button
+                type="button"
+                className="self-end m-2 inline-flex size-7 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-accent"
+                aria-label="Close session context panel"
+                onClick={() => setRailOpen(false)}
+              >
+                ×
+              </button>
+              <SessionRail
+                apiBaseUrl={apiBaseUrl}
+                slug={agent}
+                chatId={chatId}
+                mode={activeMode}
+                catalog={catalog}
+                currentModel={currentModel}
+                details={railDetails}
+                usage={usage}
+                usageError={usageError}
+                onReloadUsage={() => void loadUsage()}
+                messages={messages}
+                className="min-h-0 flex-1 overflow-hidden"
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
     </WorkspaceGate>
   );
 }
@@ -1299,13 +1372,13 @@ function AssistantPartsView({
   const summary = activitySummaryLabel(view.activity);
   return (
     <>
-      {view.response !== null && <MarkdownText text={view.response} className="chat-md-response" />}
-      {view.pendingAsk !== null && view.pendingAsk.type === 'tool-ask_user' && (
-        <AskUserPartView part={view.pendingAsk} />
-      )}
+      {/* Gemini/Claude/GPT order: Thinking (reasoning) FIRST, then the
+          Response, then Tool activity. Each renders exactly once; the live
+          current-turn Thinking stays open while historical Thinking remains
+          collapsed, and the pending HITL question stays top-level. */}
       {view.reasoning !== null &&
         (holdsLiveThinking ? (
-          <div className="mt-1 rounded-md border border-user-bubble-border bg-accent px-2.5 py-2" aria-live="polite">
+          <div className="mb-1 rounded-md border border-user-bubble-border bg-accent px-2.5 py-2" aria-live="polite">
             <p
               className="m-0 mb-1 flex items-center gap-1.5 text-[0.7rem] font-semibold tracking-[0.06em] text-primary uppercase"
               aria-hidden="true"
@@ -1321,6 +1394,10 @@ function AssistantPartsView({
             <MarkdownText text={view.reasoning} className="chat-md-thinking" />
           </details>
         ))}
+      {view.response !== null && <MarkdownText text={view.response} className="chat-md-response" />}
+      {view.pendingAsk !== null && view.pendingAsk.type === 'tool-ask_user' && (
+        <AskUserPartView part={view.pendingAsk} />
+      )}
       {view.activity.length > 0 && (
         <details className="chat-region">
           <summary>

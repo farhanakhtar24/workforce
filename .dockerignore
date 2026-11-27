@@ -1,0 +1,37 @@
+# Phase 6 build context keep-list: images build from source only. Host
+# builds (node_modules/dist/.next), env files, tests and generated Prisma
+# output never enter the context.
+.git
+.gitignore
+.openchamber
+.nvmrc
+.editorconfig
+design-plans
+docs
+/README.md
+/ROADMAP.md
+
+# Dependencies and build outputs (rebuilt inside the image)
+**/node_modules
+**/dist
+**/.next
+**/*.tsbuildinfo
+**/.cache
+packages/core/generated
+packages/core/.prisma
+
+# Env files and secrets (compose images never bake them)
+**/.env*
+**/*.pem
+
+# Tests and local tooling (not part of production images)
+apps/api/test
+apps/api/test-live
+apps/api/test-embedding
+apps/api/fix-live.py
+apps/api/fix-routes2.py
+apps/web/test
+packages/db
+
+# Docker-in-Docker leftovers
+docker-compose.override.yml

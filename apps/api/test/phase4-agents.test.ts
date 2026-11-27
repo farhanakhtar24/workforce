@@ -187,7 +187,12 @@ test('plan mode orchestrator hands the model a toolset WITHOUT write/delegate to
       slug: 'orchestrator',
       body: { id: 'plan-chat-1', message: userMessage('plan, do not act', 'u1'), mode: 'plan' },
     });
-    assert.equal(response.status, 200);
+    assert.equal(
+      response.status,
+      200,
+      'plan-mode POST resolves only with the agent runtime wired (any 404 body is embedded below): ' +
+        (await response.clone().text()),
+    );
     await response.text();
     const tools = capturedToolNames(capturing.calls[0] as CaptureCall);
     assert.equal(tools.includes('write_doc'), false);

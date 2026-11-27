@@ -30,8 +30,8 @@ export interface ModelsRouteDeps {
   /** The server-proxied catalog (upstream origin + API key stay inside). */
   readonly catalog: ModelCatalogLike;
   readonly defaultModelId: string;
-  /** The explicit pricing table (or `null` when unconfigured) for details. */
-  readonly modelPricing: Readonly<Record<string, ConfiguredModelRates>> | null;
+  /** Effective pricing resolver (official defaults ∪ explicit overrides). */
+  readonly resolvePricing: (modelId: string) => { input: number; cachedInput: number | null; output: number } | null;
 }
 
 /**
@@ -41,27 +41,27 @@ export interface ModelsRouteDeps {
  * legitimate `0` rate stays `0` (never a silent default).
  */
 export function pricingForModelId(
-  modelPricing: Readonly<Record<string, ConfiguredModelRates>> | null,
+  resolvePricing: (modelId: string) => { input: number; cachedInput: number | null; output: number } | null,
   modelId: string,
-): { inputUsdPerMillion: number; outputUsdPerMillion: number } | null {
-  if (modelPricing === null) {
-    return null;
-  }
-  const rates = modelPricing[modelId];
-  if (rates === undefined) {
+): { inputUsdPerMillion: number; outputUsdPerMillion: number; cachedInputUsdPerMillion: number | null } | null {
+  const rates = resolvePricing(modelId);
+  if (rates === null) {
     return null;
   }
   const input = rates.input;
   const output = rates.output;
+  const cachedInput = rates.cachedInput;
   if (typeof input !== 'number' || Number.isFinite(input) === false || input < 0) {
     return null;
   }
   if (typeof output !== 'number' || Number.isFinite(output) === false || output < 0) {
     return null;
   }
+  const cached = typeof cachedInput === 'number' && Number.isFinite(cachedInput) && cachedInput >= 0 ? cachedInput : null;
   return {
     inputUsdPerMillion: input,
     outputUsdPerMillion: output,
+    cachedInputUsdPerMillion: cached,
   };
 }
 
@@ -109,7 +109,7 @@ export function createModelsRoutes(deps: ModelsRouteDeps): ModelsRouteHandlers {
         capabilities: result.details?.capabilities ?? null,
         parameterSize: result.details?.parameterSize ?? null,
         thinking: result.details?.thinking ?? null,
-        pricing: pricingForModelId(deps.modelPricing, modelId),
+        pricing: pricingForModelId(deps.resolvePricing, modelId),
       });
     } catch (error) {
       if (error instanceof ModelCatalogUnavailableError) {

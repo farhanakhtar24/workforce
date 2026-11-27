@@ -203,6 +203,15 @@ test('a stale/mismatched answers map to no-op updates (unresolved pending does n
 // ---------------------------------------------------------------------------
 
 class HitlTinyRedis implements RedisLike {
+  async hGetAll(key: string): Promise<Record<string, string> | unknown> {
+    void key;
+    throw new Error('metadata hashes are not part of the HITL script contracts');
+  }
+  async hSet(key: string, value: Record<string, string>): Promise<number | unknown> {
+    void key;
+    void value;
+    throw new Error('metadata hashes are not part of the HITL script contracts');
+  }
   readonly lists = new Map<string, string[]>();
   readonly data = new Map<string, string>();
   lastEval: string | null = null;

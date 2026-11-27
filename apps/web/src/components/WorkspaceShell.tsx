@@ -17,15 +17,18 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  Settings as SettingsIcon,
   X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { resolveApiBaseUrl } from '@/lib/api';
 import { RecentChats } from '@/components/RecentChats';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { WorkspaceSettings } from '@/components/WorkspaceSettings';
 import { AuthGate, hasSessionUser } from '@/components/AuthGate';
 import { authClient, useSession } from '@/lib/auth-client';
 import { cn } from '@/lib/utils';
-import { CHAT_CONTENT_CLASS, desktopSidebarWidthClass } from '@/lib/layout-controls';
+import { desktopSidebarWidthClass } from '@/lib/layout-controls';
 import {
   WORKSPACE_NAV,
   activeWorkspaceNavId,
@@ -113,6 +116,8 @@ function WorkspaceShellInner({
 
   // Desktop collapse preference: read after mount (no SSR mismatch).
   const [collapsed, setCollapsed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsOpenerRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = window.localStorage.getItem(COLLAPSE_KEY);
@@ -162,8 +167,12 @@ function WorkspaceShellInner({
       ? `${item.href}?${contextQuery}`
       : item.href;
 
+  // Operational pages render the eyebrow/title header. The chat keeps ONE
+  // quiet identity header of its own (inside the center column), so the
+  // shell never adds a second header above it.
   const hasHeader =
-    eyebrow !== undefined || title !== undefined || description !== undefined || context !== undefined;
+    variant !== 'chat' &&
+    (eyebrow !== undefined || title !== undefined || description !== undefined || context !== undefined);
 
   return (
     <div
@@ -261,7 +270,21 @@ function WorkspaceShellInner({
             <NavList activeId={activeId} navHref={navHref} />
             <RecentChats />
             <UserBlock />
-            <div className="mt-auto flex shrink-0 flex-col gap-2 border-t border-sidebar-border pt-2">
+            <div className="mt-auto flex flex-col gap-2 border-t border-sidebar-border pt-2">
+              <button
+                type="button"
+                aria-haspopup="dialog"
+                aria-label="Open workspace settings"
+                className="inline-flex h-8 w-full items-center justify-center gap-2 rounded-md border border-sidebar-border text-[0.78rem] font-medium text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground"
+                onClick={(event) => {
+                  settingsOpenerRef.current =
+                    event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+                  setSettingsOpen(true);
+                }}
+              >
+                <SettingsIcon size={14} aria-hidden="true" />
+                Settings
+              </button>
               <ThemeToggle />
               <div className="text-center text-[0.7rem] text-sidebar-foreground/55">Local workspace</div>
             </div>
@@ -306,8 +329,9 @@ function WorkspaceShellInner({
         <NavList activeId={activeId} navHref={navHref} collapsed={collapsed} />
         {!collapsed && <RecentChats />}
         {!collapsed && <UserBlock />}
+        {collapsed && <CollapsedSignOut />}
         {collapsed && (
-          <div className="mt-auto flex shrink-0 flex-col justify-center" aria-hidden="true">
+          <div className="flex shrink-0 flex-col justify-center">
             <AvatarSlot />
           </div>
         )}
@@ -322,12 +346,36 @@ function WorkspaceShellInner({
           >
             {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
           </button>
-          <ThemeToggle compact={collapsed} className={cn(collapsed ? 'w-full justify-center' : 'w-full justify-center')} />
+          <button
+            type="button"
+            aria-haspopup="dialog"
+            aria-label="Open workspace settings"
+            title={collapsed ? 'Settings' : 'Workspace settings — hourly usage, archived chats'}
+            className={cn(
+              'inline-flex h-8 w-full items-center justify-center gap-2 rounded-md border border-sidebar-border text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground',
+              collapsed && 'px-0',
+            )}
+            onClick={(event) => {
+              settingsOpenerRef.current =
+                event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+              setSettingsOpen(true);
+            }}
+          >
+            <SettingsIcon size={15} aria-hidden="true" />
+            {!collapsed && <span className="text-[0.78rem] font-medium">Settings</span>}
+          </button>
+          <ThemeToggle compact={collapsed} className="w-full justify-center" />
           {!collapsed && (
             <div className="text-center text-[0.7rem] text-sidebar-foreground/55">Local workspace</div>
           )}
         </div>
       </aside>
+      <WorkspaceSettings
+        apiBaseUrl={resolveApiBaseUrl(process.env.NEXT_PUBLIC_API_URL)}
+        open={settingsOpen}
+        openerElement={settingsOpenerRef}
+        onClose={() => setSettingsOpen(false)}
+      />
 
       <main
         className={cn(
@@ -336,13 +384,8 @@ function WorkspaceShellInner({
         )}
       >
         {hasHeader && (
-          <header
-            className={cn(
-              'mx-auto w-full max-w-[70rem] px-4 pt-5 md:px-7 md:pt-6',
-              variant === 'chat' && 'shrink-0',
-            )}
-          >
-            <div className={cn(variant === 'chat' && `mx-auto ${CHAT_CONTENT_CLASS}`)}>
+          <header className="mx-auto w-full max-w-[70rem] px-4 pt-5 md:px-7 md:pt-6">
+            <div>
               {eyebrow !== undefined && (
                 <p className="mb-0.5 text-[0.68rem] font-medium tracking-[0.07em] text-muted-foreground uppercase">
                   {eyebrow}
@@ -363,10 +406,7 @@ function WorkspaceShellInner({
         {variant === 'chat' ? (
           <div
             id="ws-content"
-            className={cn(
-              'mx-auto flex w-full min-h-0 flex-1 flex-col px-4 pt-1 md:px-4',
-              CHAT_CONTENT_CLASS,
-            )}
+            className="flex w-full min-h-0 flex-1 flex-col px-4 pt-1 md:px-4"
           >
             {children}
           </div>
@@ -416,6 +456,38 @@ function UserBlock(): React.ReactElement {
       >
         <LogOut size={12} aria-hidden="true" />
         Sign out
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Collapsed-rail sign-out: a real accessible button (an avatar alone inside a
+ * noninteractive container would leave Sign out unreachable), invoking the
+ * same safe sign-out handler as the expanded rail. Data/history stay.
+ */
+function CollapsedSignOut(): React.ReactElement | null {
+  const { data: session } = useSession();
+  if (!hasSessionUser(session)) return null;
+  const { user } = session;
+  const name = user.name !== null && user.name !== '' ? user.name : user.email;
+  return (
+    <div
+      className="flex shrink-0 justify-center border-t border-sidebar-border px-1 pt-2"
+      data-testid="workspace-user-collapsed"
+    >
+      <button
+        type="button"
+        className="flex w-full items-center justify-center rounded-md py-2 text-[0.68rem] font-semibold text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground"
+        aria-label={`Sign out of the Workforce workspace. Signed in as ${name}. Your data and history stay.`}
+        title={`Sign out (signed in as ${name}) — your data and history stay`}
+        onClick={() => {
+          void authClient.signOut().finally(() => {
+            window.location.assign('/sign-in');
+          });
+        }}
+      >
+        {name.slice(0, 1).toUpperCase()}
       </button>
     </div>
   );

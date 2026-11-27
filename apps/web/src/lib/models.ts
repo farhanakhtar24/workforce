@@ -293,6 +293,33 @@ export async function putChatModel(options: {
 /* Pure display helpers                                                */
 /* ------------------------------------------------------------------ */
 
+export interface ModelTooltipLines {
+  capabilities: string;
+  input: string;
+  output: string;
+  cost: string;
+}
+
+/** OpenChamber tooltip: EXACTLY five fields, honest fallbacks, no extras. */
+export function formatModelTooltipLines(
+  details: ModelDetailsInfo | null,
+): ModelTooltipLines {
+  const caps =
+    details === null || details.capabilities === null || details.capabilities.length === 0
+      ? MODEL_FIELD_UNKNOWN
+      : details.capabilities.join(', ');
+  const price = details !== null ? details.pricing : null;
+  return {
+    capabilities: caps,
+    input: inputModality(details),
+    output: 'text',
+    cost:
+      price !== null
+        ? `$${price.inputUsdPerMillion} in / $${price.outputUsdPerMillion} out per 1M tokens`
+        : 'Not configured',
+  };
+}
+
 /** Bounded "unknown" label — never a guessed value. */
 export const MODEL_FIELD_UNKNOWN = 'Not reported';
 

@@ -32,8 +32,9 @@ import {
 
 import { loadApiConfig } from './config.js';
 import { loadProjectEnvFiles } from './env.js';
-import { consoleLogger, type SafeLogger } from './logging.js';
+import { consoleLogger, createSafeLogger, withRequestLogContext, type SafeLogger } from './logging.js';
 import { createDelegationContextSigner } from './agents/delegation-context.js';
+import { schedulerRequestId } from '@workforce/queue/scheduler';
 import { createSchedulerRestRunClient } from './scheduler/run-client.js';
 
 /** Bounded budget for the startup PING (matches the API's connect budget). */
@@ -75,9 +76,11 @@ function startupFailureReason(error: unknown): string {
 }
 
 async function main(): Promise<void> {
-  const logger: SafeLogger = consoleLogger;
   loadProjectEnvFiles();
   const config = loadApiConfig();
+  // Same SafeLogger contract as the API server: the configured
+  // (already-validated, allowlisted) LOG_LEVEL — no more hardcoded level.
+  const logger: SafeLogger = createSafeLogger(config.logLevel);
 
   // Queue name: the fixed default, overridden ONLY by a bounded
   // SCHEDULER_QUEUE_NAME (run-scoped integration tests / dedicated stacks).
@@ -132,6 +135,12 @@ async function main(): Promise<void> {
     redisUrl: config.redisUrl,
     queueName,
     logger,
+    // Job correlation (observability only): each BullMQ job occurrence gets
+    // ONE deterministic safe request id; the worker's processor, its
+    // completed/failed log lines, AND the run client's outgoing API calls all
+    // observe it via the request-log AsyncLocalStorage.
+    withJobContext: <T,>(jobId: string, next: () => T): T =>
+      withRequestLogContext(schedulerRequestId(jobId), next),
   });
 
   console.log(JSON.stringify({

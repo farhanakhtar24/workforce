@@ -25,6 +25,8 @@ function validRow(overrides: Record<string, unknown> = {}): Record<string, unkno
     preview: '  Returned row: 1. **Task**  ',
     messageCount: 5,
     lastActivityAt: '2026-11-24T10:00:00.000Z',
+    pinned: false,
+    archived: false,
     ...overrides,
   };
 }

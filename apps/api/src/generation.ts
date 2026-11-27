@@ -29,6 +29,7 @@ import type { StreamContext } from './stream-context/types.js';
 import type { BackgroundTaskTracker } from './background.js';
 import type { SafeLogger } from './logging.js';
 import { agentTools, MAX_MODEL_STEPS, validateAndConvertMessages } from './messages.js';
+import type { PrepareStepFunction } from 'ai';
 import { createMessageId, createStreamId } from './ids.js';
 
 /** Fixed safe text used whenever generation fails — nothing else ships. */
@@ -130,6 +131,14 @@ export interface CreateChatTurnStreamOptions {
    */
   memoryContext?: string;
   /**
+   * Pre-Phase 6 hourly budget: the AGGREGATE output-token budget for this
+   * generation across up to MAX_MODEL_STEPS steps (the admission's derived
+   * output cap). Enforced with a prepareStep hook that divides the REMAINING
+   * budget (reservation minus actual emitted output observed so far) over
+   * the REMAINING possible steps. Absent = normal unbounded generation.
+   */
+  outputTokenBudget?: number;
+  /**
    * Pre-Phase 6 opt-in personal capture hook, invoked ON THE ASSISTANT FINISH
    * after the response message was persisted (with content). The hook
    * internally checks the enablement + schedules the ONE deterministic
@@ -154,6 +163,13 @@ export interface AssistantTurnFinished {
   readonly userMessageId: string;
   /** False when the generation produced no content (nothing persisted). */
   readonly hasContent: boolean;
+  /**
+   * The ACTUAL provider usage this finish reported (the same object attached
+   * as `metadata.usage`); absent when the provider supplied none. The hourly
+   * budget settlement consumes it (missing/invalid usage retains the
+   * conservative reservation).
+   */
+  readonly usage?: { readonly inputTokens?: number; readonly outputTokens?: number; readonly totalTokens?: number };
 }
 
 export interface ChatTurn {
@@ -195,6 +211,59 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
     typeof systemPrompt === 'string' && systemPrompt.length > 0 ? systemPrompt : null,
     typeof memoryContext === 'string' && memoryContext.length > 0 ? memoryContext : null,
   ].filter((part): part is string => part !== null);
+  // Hourly budget: AGGREGATE output cap across model steps, enforced BOTH
+  // by per-step prepareStep(maxOutputTokens) and by a custom stopWhen.
+  // - emittedTotals counts each completed step's ACTUAL output tokens (AI
+  //   SDK v6: `step.usage.outputTokens` is a total number — reasoning
+  //   included — or undefined when the provider did not report it).
+  // - A step WITHOUT usable output usage FAILS CLOSED: no further model
+  //   steps run (the reservation absorbs that step's unknown spend); the
+  //   generation completes with what it streamed.
+  // - Remaining allocation: each step receive an exact divisor of the
+  //   remaining budget over the remaining possible steps; the final allowed
+  //   step receives the EXACT remainder. The only deliberate slack is a
+  //   documented 1-token floor per capped step (the provider rejects a 0
+  //   cap), bounded at MAX_MODEL_STEPS − 1 extra tokens overall.
+  const outputBudget = typeof options.outputTokenBudget === 'number' && Number.isFinite(options.outputTokenBudget) ? Math.max(0, Math.floor(options.outputTokenBudget)) : null;
+
+  function emittedOutputTokens(steps: ReadonlyArray<{ readonly usage?: { readonly outputTokens?: number | undefined } }>): { total: number; sawInvalid: boolean } {
+    let total = 0;
+    let sawInvalid = false;
+    for (const step of steps) {
+      const outputTokens = step.usage?.outputTokens;
+      if (typeof outputTokens === 'number' && Number.isFinite(outputTokens) && outputTokens >= 0) {
+        total += Math.floor(outputTokens);
+      } else {
+        sawInvalid = true;
+      }
+    }
+    return { total, sawInvalid };
+  }
+
+  const prepareStep: PrepareStepFunction<ToolSet> | undefined =
+    outputBudget === null
+      ? undefined
+      : async ({ steps }) => {
+          const { total, sawInvalid } = emittedOutputTokens(steps);
+          if (sawInvalid || total >= outputBudget) {
+            // Fail-closed: this residual step (only reached on client-tool
+            // continuation despite an exhausted/unknown budget) gets a 1
+            // token allowance — the documented rounding bound.
+            return { maxOutputTokens: 1 };
+          }
+          const remainingSteps = Math.max(1, MAX_MODEL_STEPS - steps.length);
+          const budgetLeft = Math.max(0, outputBudget - total);
+          return { maxOutputTokens: Math.max(1, Math.floor(budgetLeft / remainingSteps)) };
+        };
+
+  const budgetStopWhen =
+    outputBudget === null
+      ? undefined
+      : ({ steps }: { steps: ReadonlyArray<{ readonly usage?: { readonly outputTokens?: number | undefined } }> }): boolean => {
+          const { total, sawInvalid } = emittedOutputTokens(steps);
+          return sawInvalid || total >= outputBudget;
+        };
+
   const generation = {
     model,
     messages: modelMessages,
@@ -215,7 +284,13 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
     execute: ({ writer }) => {
       const result = streamText({
         ...generation,
-        stopWhen: stepCountIs(MAX_MODEL_STEPS),
+        // Budget-capable stop condition: the step cap PLUS the aggregate
+        // output budget (fail-closed on missing/invalid step usage). Without
+        // a budget this is exactly the legacy stepCountIs(10).
+        stopWhen: budgetStopWhen === undefined ? stepCountIs(MAX_MODEL_STEPS) : ({ steps }): boolean => steps.length >= MAX_MODEL_STEPS || budgetStopWhen({ steps }),
+        // Hourly budget: per-step maxOutputTokens divided over remaining
+        // steps so the AGGREGATE stays within the admitted reservation.
+        ...(prepareStep !== undefined ? { prepareStep } : {}),
         onError: (event) => {
           logger.error('provider-stream-failure', event.error);
         },
@@ -241,6 +316,17 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
         // message was already appended separately).
         const hasContent = responseMessage.parts.some((part) => part.type !== 'step-start');
         if (hasContent) {
+          // Output-capped partial tool-call protection: parts that never
+          // finished STREAMING their input (`input-streaming`, state of a
+          // part whose tool-call chunk never arrived) are OMITTED before
+          // persistence so the stored transcript can never hold a
+          // malformed/incomplete tool call fragment that would brick future
+          // validate/convert. The HITL `input-available` ask_user state IS a
+          // valid persisted terminal (resolved later by the byte-CAS route)
+          // and `output-available`/`output-error` cards are untouched.
+          if (responseMessage.parts.some((part) => isNonTerminalToolPart(part))) {
+            responseMessage.parts = responseMessage.parts.filter((part) => isNonTerminalToolPart(part) === false);
+          }
           await store.appendMessage(ref, responseMessage);
         }
         await store.clearActiveStreamId(ref, streamId);
@@ -251,11 +337,22 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
           // The user message may not be the very last entry on HITL-resume
           // turns; scan backwards for role 'user'.
           const userMessageId = [...messages].reverse().find((entry) => entry.role === 'user')?.id ?? '';
+          const finishedUsage = responseMessage.metadata ?? {};
+          const usageRecord = (finishedUsage as { usage?: Record<string, unknown> }).usage ?? {};
+          const usage =
+            typeof usageRecord['inputTokens'] === 'number' || typeof usageRecord['outputTokens'] === 'number'
+              ? {
+                  inputTokens: typeof usageRecord['inputTokens'] === 'number' ? usageRecord['inputTokens'] : undefined,
+                  outputTokens: typeof usageRecord['outputTokens'] === 'number' ? usageRecord['outputTokens'] : undefined,
+                  totalTokens: typeof usageRecord['totalTokens'] === 'number' ? usageRecord['totalTokens'] : undefined,
+                }
+              : undefined;
           onAssistantFinished({
             chat: ref,
             assistantMessageId: responseMessage.id,
             userMessageId,
             hasContent,
+            usage,
           });
         }
       } catch (error) {
@@ -281,6 +378,23 @@ export async function createChatTurnStream(options: CreateChatTurnStreamOptions)
   });
 
   return { streamId, response };
+}
+
+/**
+ * True for tool parts whose input never finished streaming (a budget-cut
+ * tool call fragment). `input-available` is the VALID persisted HITL
+ * terminal state for ask_user (resolved later by the byte-CAS route), so it
+ * is preserved; `output-available`/`output-error` cards are untouched.
+ */
+function isNonTerminalToolPart(part: unknown): boolean {
+  if (part === null || typeof part !== 'object') {
+    return false;
+  }
+  const record = part as { type?: unknown; state?: unknown };
+  if (typeof record.type !== 'string' || record.type.startsWith('tool-') === false) {
+    return false;
+  }
+  return record.state === 'input-streaming';
 }
 
 /** Stored chat state failed re-validation; surfaced as a plain 503. */

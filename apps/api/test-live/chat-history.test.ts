@@ -465,6 +465,8 @@ test('live: store-level listRecentChats over real Redis — clamps, timestamp, s
       zAdd: boom,
       zRangeWithScores: boom,
       zScore: boom,
+      hGetAll: boom,
+      hSet: boom,
       scan: boom,
       eval: boom,
     });

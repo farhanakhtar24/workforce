@@ -21,6 +21,10 @@ export interface RecentChat {
   preview: string;
   messageCount: number;
   lastActivityAt: string | null;
+  /** Sidebar metadata (server defaults `false`); pinned rows list first. */
+  pinned: boolean;
+  /** Archived rows are hidden from the default recents list. */
+  archived: boolean;
 }
 
 export type RecentChatsResult =
@@ -32,12 +36,17 @@ export const RECENT_CHATS_MAP_ERROR = 'The recent-chats list could not be read.'
 export const RECENT_CHATS_UNREACHABLE = 'The recent-chats service is unreachable right now.';
 export const RECENT_CHAT_UNTITLED = 'Untitled chat';
 
-export function recentChatsEndpoint(apiBaseUrl: string, limit: number = RECENT_CHATS_DEFAULT_LIMIT): string {
+export function recentChatsEndpoint(
+  apiBaseUrl: string,
+  limit: number = RECENT_CHATS_DEFAULT_LIMIT,
+  includeArchived: boolean = false,
+): string {
   const bounded =
     Number.isInteger(limit) && limit > 0
       ? Math.min(limit, RECENT_CHATS_MAX_LIMIT)
       : RECENT_CHATS_DEFAULT_LIMIT;
-  return `${apiBaseUrl}/api/chats?limit=${bounded}`;
+  const archiveParam = includeArchived ? '&includeArchived=true' : '';
+  return `${apiBaseUrl}/api/chats?limit=${bounded}${archiveParam}`;
 }
 
 function boundedPlain(value: unknown, maxLength: number): string | null {
@@ -92,12 +101,16 @@ export function mapRecentChats(payload: unknown): RecentChatsResult {
       typeof record['lastActivityAt'] === 'string' && !Number.isNaN(Date.parse(record['lastActivityAt']))
         ? (record['lastActivityAt'] as string)
         : null;
+    const pinned = record['pinned'];
+    const archived = record['archived'];
     if (
       !isSafeChatId(chatId) ||
       !isAgentSlug(agentRaw) ||
       title === null ||
       preview === null ||
-      messageCount === null
+      messageCount === null ||
+      typeof pinned !== 'boolean' ||
+      typeof archived !== 'boolean'
     ) {
       return { ok: false, error: RECENT_CHATS_MAP_ERROR, status: 502 };
     }
@@ -108,6 +121,8 @@ export function mapRecentChats(payload: unknown): RecentChatsResult {
       preview,
       messageCount,
       lastActivityAt,
+      pinned,
+      archived,
     });
   }
   return { ok: true, chats: mapped };
@@ -116,9 +131,10 @@ export function mapRecentChats(payload: unknown): RecentChatsResult {
 export async function fetchRecentChats(options: {
   apiBaseUrl: string;
   limit?: number;
+  includeArchived?: boolean;
   signal?: AbortSignal;
 }): Promise<RecentChatsResult> {
-  const url = recentChatsEndpoint(options.apiBaseUrl, options.limit);
+  const url = recentChatsEndpoint(options.apiBaseUrl, options.limit, options.includeArchived === true);
   try {
     const response = await browserApiFetch(url, {
       headers: { Accept: 'application/json' },

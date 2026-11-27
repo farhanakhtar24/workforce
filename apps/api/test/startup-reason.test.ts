@@ -89,3 +89,10 @@ test('invalid API configuration maps to generic fixed config text without echoin
   assert.ok(!reason.includes('127.0.0.1'));
   assert.ok(!reason.includes('REDIS_URL:'));
 });
+
+test('unpriced compaction model maps to the dedicated fixed reason (never the model id or config JSON)', () => {
+  const reason = startupFailureReason(
+    new Error('Compaction model is not priced; set OLLAMA_MODEL to a priced model or add an override rate.'),
+  );
+  assert.equal(reason, 'Compaction model is not priced');
+});
